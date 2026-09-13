@@ -42,7 +42,9 @@ actual fun MailWebView(
     onOpenImage: (String) -> Unit,
     onLinkLongPress: (String, DpOffset) -> Unit,
     fitWideContent: Boolean,
+    onQuoteToggle: (Boolean) -> Unit,
 ) {
+    val latestOnQuoteToggle = rememberUpdatedState(onQuoteToggle)
     val latestOnHeight = rememberUpdatedState(onContentHeight)
     val latestOnOpenUrl = rememberUpdatedState(onOpenUrl)
     val latestOnOpenImage = rememberUpdatedState(onOpenImage)
@@ -160,6 +162,15 @@ actual fun MailWebView(
                         }
                     },
                     "MeronImage",
+                )
+                addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun toggle(open: Boolean) {
+                            post { latestOnQuoteToggle.value(open) }
+                        }
+                    },
+                    "MeronQuote",
                 )
             }
         },

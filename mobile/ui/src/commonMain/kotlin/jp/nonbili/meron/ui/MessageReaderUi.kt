@@ -338,6 +338,7 @@ internal fun MessageReaderScreen(
                     // same mail as an unreadable thumbnail.
                     HtmlMessageBody(
                         html = message.bodyHtml,
+                        quoteKey = message.id,
                         allowRemote = remoteContent.allowRemote,
                         onOpenUrl = onOpenUrl,
                         onOpenImage = onOpenHtmlImage,

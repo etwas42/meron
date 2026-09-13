@@ -192,6 +192,9 @@ data class MessageBody(
     val subject: String,
     val body: String,
     val bodyHtml: String = "",
+    // UTF-16 offset where the plain body's quoted tail starts, so it can be
+    // folded; null when there is none. HTML bodies mark theirs inline.
+    val bodyQuoteStart: Int? = null,
     val dateEpochSeconds: Long = 0,
     val fromAddr: String = "",
     val replyTo: String = "",

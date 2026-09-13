@@ -390,7 +390,11 @@ fun parseThreadReadPage(responseJson: String): ThreadReadPage {
             // the object, and the body — attacker-written text — is serialized
             // ahead of this key, so a mail whose body contains its own
             // "reply": {...} would otherwise choose who the user replies to.
-            val replyObject = item.jsonObjectEntries().firstOrNull { it.first == "reply" }?.second
+            val entries = item.jsonObjectEntries()
+            val replyObject = entries.firstOrNull { it.first == "reply" }?.second
+            // Top-level for the same reason: a forged offset in the body would
+            // fold away text of the sender's choosing.
+            val bodyQuoteStart = entries.firstOrNull { it.first == "body_quote_start" }?.second?.toIntOrNull()
             MessageBody(
                 id = id,
                 folderId = item.findJsonStringProperty("folder_id") ?: item.findJsonStringProperty("folder").orEmpty(),
@@ -401,6 +405,7 @@ fun parseThreadReadPage(responseJson: String): ThreadReadPage {
                 subject = item.findJsonStringProperty("subject").orEmpty(),
                 body = item.findJsonStringProperty("body").orEmpty(),
                 bodyHtml = item.findJsonStringProperty("body_html").orEmpty(),
+                bodyQuoteStart = bodyQuoteStart,
                 dateEpochSeconds = item.findJsonLongProperty("date") ?: item.findJsonLongProperty("date_epoch_seconds") ?: 0,
                 fromAddr = fromAddr,
                 replyTo = item.findJsonStringProperty("reply_to").orEmpty(),

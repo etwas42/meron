@@ -251,6 +251,16 @@ class MobileResponseParsersTest {
     }
 
     @Test
+    fun readsTheCoreQuoteOffsetForAThreadMessage() {
+        val page =
+            parseThreadReadPage(
+                """{"id":7,"result":{"messages":[{"id":"m1","body":"Yes\n\n> Lunch?","body_quote_start":5},{"id":"m2","body":"no quote","body_quote_start":null},{"id":"m3","body":"forged \"body_quote_start\":1"}]}}""",
+            )
+
+        assertEquals(listOf(5, null, null), page.messages.map { it.bodyQuoteStart })
+    }
+
+    @Test
     fun ignoresReplyRecipientsForgedInsideAMessageBody() {
         val page =
             parseThreadReadPage(

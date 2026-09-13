@@ -1,6 +1,7 @@
 package jp.nonbili.meron.ui
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.Dp
@@ -31,10 +32,16 @@ actual fun MailWebView(
     // is gated on the same flag and stays off here, so iOS keeps reflow-only
     // rendering and the height bridge's scale-1 assumption holds.
     @Suppress("UNUSED_PARAMETER") fitWideContent: Boolean,
+    onQuoteToggle: (Boolean) -> Unit,
 ) {
     val latestOnHeight = rememberUpdatedState(onContentHeight)
     val latestOnOpenUrl = rememberUpdatedState(onOpenUrl)
     val latestOnOpenImage = rememberUpdatedState(onOpenImage)
+    val latestOnQuoteToggle = rememberUpdatedState(onQuoteToggle)
+    // The document last handed to this web view. `update` runs again on
+    // recomposition (every height report recomposes), and reloading the same
+    // page would reset what the reader did in it — an opened quote, for one.
+    val loadedHtml = remember { LoadedHtml() }
     UIKitView(
         modifier = modifier,
         factory = {
@@ -54,6 +61,10 @@ actual fun MailWebView(
                 scriptMessageHandler = ImageMessageHandler { src -> latestOnOpenImage.value(src) },
                 name = "meronImage",
             )
+            config.userContentController.addScriptMessageHandler(
+                scriptMessageHandler = QuoteMessageHandler { open -> latestOnQuoteToggle.value(open) },
+                name = "meronQuote",
+            )
             WKWebView(frame = CGRectMake(0.0, 0.0, 0.0, 0.0), configuration = config).apply {
                 // Compose owns capped bubble scrolling; the web view is measured
                 // to its full content height so its native scroll view would fight
@@ -63,9 +74,28 @@ actual fun MailWebView(
             }
         },
         update = { webView ->
-            webView.loadHTMLString(html, baseURL = null)
+            if (loadedHtml.value != html) {
+                loadedHtml.value = html
+                webView.loadHTMLString(html, baseURL = null)
+            }
         },
     )
+}
+
+private class LoadedHtml(
+    var value: String? = null,
+)
+
+private class QuoteMessageHandler(
+    private val onToggle: (Boolean) -> Unit,
+) : NSObject(),
+    WKScriptMessageHandlerProtocol {
+    override fun userContentController(
+        userContentController: WKUserContentController,
+        didReceiveScriptMessage: WKScriptMessage,
+    ) {
+        (didReceiveScriptMessage.body as? NSNumber)?.let { onToggle(it.boolValue) }
+    }
 }
 
 private class HeightMessageHandler(

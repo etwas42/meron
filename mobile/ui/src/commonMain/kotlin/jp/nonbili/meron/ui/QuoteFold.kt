@@ -1,0 +1,121 @@
+package jp.nonbili.meron.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+
+// Folding a message's quoted tail — the conversation a reply pastes under its
+// new text — behind a "•••" toggle, the way Gmail does (and the desktop app,
+// see desktop/frontend/src/components/chat/quoteFold.ts). The core finds the
+// quote: HTML bodies arrive with it marked by `data-meron-quote`, plain bodies
+// with the UTF-16 offset it starts at (`body_quote_start`), which is also how
+// Kotlin indexes strings.
+
+/** A plain body split at the core's quote offset; [quote] is empty when there
+ *  is nothing to fold. */
+internal data class QuotedBody(
+    val reply: String,
+    val quote: String,
+)
+
+internal fun splitQuotedBody(
+    body: String,
+    quoteStart: Int?,
+): QuotedBody =
+    if (quoteStart == null || quoteStart <= 0 || quoteStart >= body.length) {
+        QuotedBody(body, "")
+    } else {
+        QuotedBody(body.substring(0, quoteStart).trimEnd(), body.substring(quoteStart).trimEnd())
+    }
+
+/** Which messages' quotes the reader opened this session, so a bubble that
+ *  scrolls out of the list and back — or whose web view is rebuilt — comes back
+ *  the way it was left. Touched from the main thread only. */
+internal object QuoteFoldMemory {
+    private val open = mutableSetOf<String>()
+
+    fun isOpen(key: String): Boolean = key in open
+
+    fun setOpen(
+        key: String,
+        value: Boolean,
+    ) {
+        if (value) open.add(key) else open.remove(key)
+    }
+}
+
+/** Whether an in-thread search should open the quote: it matches inside it,
+ *  by the same case-insensitive rule the highlighter marks with. */
+internal fun quoteMatchesSearch(
+    quote: String,
+    searchQuery: String,
+): Boolean {
+    val query = searchQuery.trim()
+    return quote.isNotEmpty() && query.isNotEmpty() && quote.lowercase().contains(query.lowercase())
+}
+
+/** The attribute the core marks an HTML body's quoted tail with. */
+internal const val HTML_QUOTE_ATTR = "data-meron-quote"
+
+/** A JavaScript string literal for [value], safe to splice into an inline
+ *  script: `<` is escaped so the text can never close the script element. */
+internal fun jsStringLiteral(value: String): String =
+    buildString {
+        append('"')
+        value.forEach { char ->
+            when (char) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '<' -> append("\\u003c")
+                '\u2028' -> append("\\u2028")
+                '\u2029' -> append("\\u2029")
+                else -> append(char)
+            }
+        }
+        append('"')
+    }
+
+/** The "•••" chip between a plain body's reply and its quoted tail. */
+@Composable
+internal fun QuoteToggle(
+    open: Boolean,
+    color: Color,
+    onToggle: () -> Unit,
+) {
+    val label = if (open) tr("chat.hideQuotedText") else tr("chat.showQuotedText")
+    val shape = RoundedCornerShape(50)
+    Box(
+        Modifier
+            .padding(vertical = 6.dp)
+            .clip(shape)
+            .border(1.dp, color.copy(alpha = 0.25f), shape)
+            .background(color.copy(alpha = 0.06f))
+            .clickable(onClickLabel = label, onClick = onToggle)
+            .semantics { contentDescription = label }
+            .padding(horizontal = 10.dp, vertical = 2.dp),
+    ) {
+        Text(
+            text = "•••",
+            color = color.copy(alpha = 0.65f),
+            fontSize = 11.sp,
+            lineHeight = 12.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.sp,
+        )
+    }
+}

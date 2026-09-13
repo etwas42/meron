@@ -31,6 +31,8 @@ expect fun MailWebView(
     onOpenImage: (String) -> Unit = {},
     onLinkLongPress: (String, DpOffset) -> Unit = { _, _ -> },
     fitWideContent: Boolean = false,
+    /** The document's quote toggle was tapped: true when the quote is now open. */
+    onQuoteToggle: (Boolean) -> Unit = {},
 )
 
 /**

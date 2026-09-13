@@ -480,6 +480,7 @@ internal fun ColumnScope.MessageBodyContent(
     if (htmlBody) {
         HtmlMessageBody(
             html = message.bodyHtml,
+            quoteKey = message.id,
             allowRemote = remoteContent.allowRemote,
             maxHeight = bodyMaxHeight,
             onOpenUrl = onOpenUrl,
@@ -503,21 +504,49 @@ internal fun ColumnScope.MessageBodyContent(
     } else {
         // Subject is the conversation title (top bar); the body shows the
         // message text, matching the desktop chat reader.
-        val bodyText: @Composable () -> Unit = {
-            SelectableMessageText(
-                text = message.body.ifBlank { "(no content)" },
-                onOpenUrl = onOpenUrl,
-                searchQuery = searchQuery,
-                activeSearchMatch = activeSearchMatch,
-                color = if (message.body.isBlank()) textColor.copy(alpha = 0.6f) else textColor,
-                style =
-                    messageBodyTextStyle(
-                        MaterialTheme.typography.bodyLarge.copy(
-                            fontSize = 15.5.sp,
-                            lineHeight = 21.sp,
-                        ),
-                    ),
+        // The quoted tail folds behind a toggle (see QuoteFold), and opens on its
+        // own while the in-thread search matches inside it.
+        val quoted = remember(message.body, message.bodyQuoteStart) { splitQuotedBody(message.body, message.bodyQuoteStart) }
+        var quoteOpen by remember(message.id) { mutableStateOf(QuoteFoldMemory.isOpen(message.id)) }
+        val showQuote = quoteOpen || quoteMatchesSearch(quoted.quote, searchQuery)
+        val bodyStyle =
+            messageBodyTextStyle(
+                MaterialTheme.typography.bodyLarge.copy(
+                    fontSize = 15.5.sp,
+                    lineHeight = 21.sp,
+                ),
             )
+        val bodyText: @Composable () -> Unit = {
+            Column {
+                SelectableMessageText(
+                    text = quoted.reply.ifBlank { "(no content)" },
+                    onOpenUrl = onOpenUrl,
+                    searchQuery = searchQuery,
+                    activeSearchMatch = activeSearchMatch,
+                    color = if (message.body.isBlank()) textColor.copy(alpha = 0.6f) else textColor,
+                    style = bodyStyle,
+                )
+                if (quoted.quote.isNotEmpty()) {
+                    QuoteToggle(
+                        open = showQuote,
+                        color = textColor,
+                        onToggle = {
+                            quoteOpen = !showQuote
+                            QuoteFoldMemory.setOpen(message.id, quoteOpen)
+                        },
+                    )
+                    if (showQuote) {
+                        SelectableMessageText(
+                            text = quoted.quote,
+                            onOpenUrl = onOpenUrl,
+                            searchQuery = searchQuery,
+                            activeSearchMatch = activeSearchMatch,
+                            color = textColor,
+                            style = bodyStyle,
+                        )
+                    }
+                }
+            }
         }
         if (bodyMaxHeight == Dp.Unspecified) {
             // Uncapped (the traditional layout): the message is as tall as it
@@ -697,6 +726,9 @@ private fun randomScriptNonce(): String = buildString { repeat(4) { append(Rando
 @Composable
 internal fun HtmlMessageBody(
     html: String,
+    // What remembers whether this body's quote was opened (see QuoteFoldMemory):
+    // the message id, so the bubble and the reader agree.
+    quoteKey: String = html.hashCode().toString(),
     // Whether this message's remote content may load. The mail is spliced into
     // the document below, so its own baked CSP meta ends up outside that
     // document's head, where a meta policy is ignored: the head built here is
@@ -727,9 +759,18 @@ internal fun HtmlMessageBody(
     // else: the mail is spliced into this page, so a script of its own that
     // survived the core's sanitiser would still have no way to name the token.
     val scriptNonce = remember(html, allowRemote) { randomScriptNonce() }
+    val showQuotedLabel = tr("chat.showQuotedText")
+    val hideQuotedLabel = tr("chat.hideQuotedText")
     val mobileHtml =
-        remember(html, allowRemote, scriptNonce, fitWideContent, bodyFontSize) {
+        remember(html, quoteKey, allowRemote, scriptNonce, fitWideContent, bodyFontSize, showQuotedLabel, hideQuotedLabel) {
             val body = applyRemoteContentPolicy(html, allowRemote)
+            // The state the reader left the quote in, read once per document:
+            // toggles inside the page don't rebuild (and so reload) it, they
+            // are reported back through onQuoteToggle instead. A folded quote
+            // is folded from the first paint — the class is on the root before
+            // the body parses, and the script below only places the toggle.
+            val quoteOpen = QuoteFoldMemory.isOpen(quoteKey)
+            val quoteClass = if (html.contains(HTML_QUOTE_ATTR) && !quoteOpen) "meron-quote-folded" else ""
             """
             <!doctype html>
             <!-- The self-sizing WebView needs its document boxes to follow the
@@ -740,7 +781,7 @@ internal fun HtmlMessageBody(
                  specific !important rules the later one wins, while an inline
                  declaration outranks every stylesheet rule of the same
                  importance wherever the sender's <style> sits. -->
-            <html style="height: auto !important; min-height: 0 !important;">
+            <html class="$quoteClass" style="height: auto !important; min-height: 0 !important;">
             <head>
               <meta http-equiv="Content-Security-Policy" content="${mailBodyCsp(allowRemote, scriptNonce)}">
               <meta id="meron-viewport" name="viewport" content="width=device-width, initial-scale=1.0">
@@ -823,6 +864,29 @@ internal fun HtmlMessageBody(
                   max-width: calc(33.333% - 3px) !important;
                   box-sizing: border-box !important;
                   margin: 0 !important;
+                }
+                /* The folded quoted tail and its toggle (see QuoteFold.kt). The
+                   core strips sender `data-*` attributes and meron- classes, so
+                   both are ours. */
+                html.meron-quote-folded [data-meron-quote] {
+                  display: none !important;
+                }
+                button.meron-quote-toggle {
+                  display: block;
+                  width: 32px;
+                  height: 16px;
+                  margin: 6px 0;
+                  padding: 0;
+                  border: 1px solid currentColor;
+                  border-radius: 8px;
+                  background: transparent;
+                  color: inherit;
+                  opacity: 0.5;
+                  font: 700 11px/1 sans-serif;
+                  letter-spacing: 1px;
+                }
+                button.meron-quote-toggle::before {
+                  content: '•••';
                 }
               </style>
             </head>
@@ -1054,6 +1118,47 @@ internal fun HtmlMessageBody(
                       window.webkit.messageHandlers.meronLink.postMessage(url);
                     }
                   });
+                  // Put the "•••" toggle where the core-marked quote starts. The
+                  // root already carries the folded class; opening it grows the
+                  // document, which the ResizeObserver below reports.
+                  var showQuotedLabel = ${jsStringLiteral(showQuotedLabel)};
+                  var hideQuotedLabel = ${jsStringLiteral(hideQuotedLabel)};
+                  var quoteInitiallyOpen = $quoteOpen;
+                  function reportQuoteToggle(open) {
+                    if (window.MeronQuote && window.MeronQuote.toggle) {
+                      window.MeronQuote.toggle(open);
+                    } else if (
+                      window.webkit &&
+                      window.webkit.messageHandlers &&
+                      window.webkit.messageHandlers.meronQuote
+                    ) {
+                      window.webkit.messageHandlers.meronQuote.postMessage(open);
+                    }
+                  }
+                  function installQuoteFold() {
+                    var first = document.querySelector('[data-meron-quote]');
+                    if (!first || !first.parentNode) return;
+                    var root = document.documentElement;
+                    var toggle = document.createElement('button');
+                    toggle.type = 'button';
+                    toggle.className = 'meron-quote-toggle';
+                    first.parentNode.insertBefore(toggle, first);
+                    function apply(open) {
+                      root.classList.toggle('meron-quote-folded', !open);
+                      toggle.setAttribute('aria-label', open ? hideQuotedLabel : showQuotedLabel);
+                      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+                    }
+                    toggle.addEventListener('click', function (event) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      var open = root.classList.contains('meron-quote-folded');
+                      apply(open);
+                      reportQuoteToggle(open);
+                      report();
+                    });
+                    apply(quoteInitiallyOpen);
+                  }
+                  installQuoteFold();
                   // Before the first report: every width the script measures,
                   // and the view height derived from them, is read under the
                   // viewport this leaves in place.
@@ -1084,30 +1189,31 @@ internal fun HtmlMessageBody(
                 },
             )
 
-    if (capped) {
-        val htmlScrollState = rememberScrollState()
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .height(maxHeight)
-                .appScrollbar(htmlScrollState, endOffset = HtmlBubbleHorizontalPadding)
-                .verticalScroll(htmlScrollState),
-        ) {
-            MailWebViewWithLinkMenu(
-                html = mobileHtml,
-                onContentHeight = { contentHeight = clampMailBodyHeight(it) },
-                onOpenUrl = onOpenUrl,
-                onOpenImage = onOpenImage,
-                modifier = webViewModifier,
-                fitWideContent = fitWideContent,
-            )
-        }
-    } else {
+    // One call site whichever way the height falls: crossing the cap only swaps
+    // the wrapper's modifiers. Were the web view composed in two places, growing
+    // past the cap (opening a long quote does) would build a new one and reload
+    // the page, losing whatever the reader just did in it.
+    val htmlScrollState = rememberScrollState()
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .then(
+                if (capped) {
+                    Modifier
+                        .height(maxHeight)
+                        .appScrollbar(htmlScrollState, endOffset = HtmlBubbleHorizontalPadding)
+                        .verticalScroll(htmlScrollState)
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
         MailWebViewWithLinkMenu(
             html = mobileHtml,
             onContentHeight = { contentHeight = clampMailBodyHeight(it) },
             onOpenUrl = onOpenUrl,
             onOpenImage = onOpenImage,
+            onQuoteToggle = { open -> QuoteFoldMemory.setOpen(quoteKey, open) },
             modifier = webViewModifier,
             fitWideContent = fitWideContent,
         )
@@ -1122,6 +1228,7 @@ private fun MailWebViewWithLinkMenu(
     onContentHeight: (Dp) -> Unit,
     onOpenUrl: (String) -> Unit,
     onOpenImage: (String) -> Unit,
+    onQuoteToggle: (Boolean) -> Unit,
     modifier: Modifier,
     fitWideContent: Boolean,
 ) {
@@ -1134,6 +1241,7 @@ private fun MailWebViewWithLinkMenu(
             onOpenImage = onOpenImage,
             onLinkLongPress = { url, offset -> menuTarget = MessageLinkMenuTarget(url, offset) },
             fitWideContent = fitWideContent,
+            onQuoteToggle = onQuoteToggle,
             modifier = Modifier.fillMaxSize(),
         )
         MessageLinkContextMenu(
