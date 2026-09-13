@@ -63,6 +63,15 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.6" date="2026-09-13">
+      <description>
+        <ul>
+          <li>Show other recipients in collapsed message headers</li>
+          <li>Make kanban mark all columns read optimistic</li>
+          <li>Fold quoted text in conversation bubbles</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.5" date="2026-09-10">
       <description>
         <ul>

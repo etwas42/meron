@@ -1,0 +1,3 @@
+- Show other recipients in collapsed message headers
+- Make kanban mark all columns read optimistic
+- Fold quoted text in conversation bubbles
