@@ -1,231 +1,16 @@
 package jp.nonbili.meron.ui
 
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.RowScope
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.automirrored.filled.Reply
-import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Archive
-import androidx.compose.material.icons.filled.AttachFile
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.ErrorOutline
-import androidx.compose.material.icons.filled.FilterList
-import androidx.compose.material.icons.filled.Inbox
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.MarkEmailUnread
-import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.OpenInFull
-import androidx.compose.material.icons.filled.PersonAdd
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.RssFeed
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.filled.StarBorder
-import androidx.compose.material.icons.filled.ViewKanban
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.outlined.Drafts
-import androidx.compose.material.icons.outlined.FolderOpen
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DrawerValue
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
-import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationDrawerItem
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarDuration
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.SnackbarResult
-import androidx.compose.material3.Surface
-import androidx.compose.material3.SwipeToDismissBox
-import androidx.compose.material3.SwipeToDismissBoxValue
-import androidx.compose.material3.Switch
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
-import androidx.compose.material3.rememberDrawerState
-import androidx.compose.material3.rememberSwipeToDismissBoxState
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.onFocusChanged
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEvent
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.isCtrlPressed
-import androidx.compose.ui.input.key.isMetaPressed
-import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onPreviewKeyEvent
-import androidx.compose.ui.input.key.type
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import jp.nonbili.meron.shared.AccountAliasParams
-import jp.nonbili.meron.shared.AccountAliasesParams
-import jp.nonbili.meron.shared.AccountAvatarParams
-import jp.nonbili.meron.shared.AccountChatWallpaperParams
-import jp.nonbili.meron.shared.AccountFlagParams
-import jp.nonbili.meron.shared.AccountIdParams
-import jp.nonbili.meron.shared.AccountMediaFileParams
-import jp.nonbili.meron.shared.AccountNameParams
-import jp.nonbili.meron.shared.AccountReorderParams
-import jp.nonbili.meron.shared.AccountRssSyncIntervalParams
 import jp.nonbili.meron.shared.AccountSummary
-import jp.nonbili.meron.shared.AddOAuthAccountParams
-import jp.nonbili.meron.shared.AddPasswordAccountParams
-import jp.nonbili.meron.shared.AddRssAccountParams
-import jp.nonbili.meron.shared.AddRssFeedParams
-import jp.nonbili.meron.shared.AttachmentReadParams
-import jp.nonbili.meron.shared.AutodiscoverAccountParams
-import jp.nonbili.meron.shared.ComposeDraft
-import jp.nonbili.meron.shared.ContactSuggestParams
-import jp.nonbili.meron.shared.ContactSuggestion
-import jp.nonbili.meron.shared.CopyThreadParams
-import jp.nonbili.meron.shared.DiscardDraftParams
-import jp.nonbili.meron.shared.DraftAttachment
-import jp.nonbili.meron.shared.ExchangeOAuthCodeParams
-import jp.nonbili.meron.shared.ExportOpmlParams
 import jp.nonbili.meron.shared.FolderCreateParams
-import jp.nonbili.meron.shared.FolderListParams
-import jp.nonbili.meron.shared.FolderSummary
-import jp.nonbili.meron.shared.ImportOpmlParams
-import jp.nonbili.meron.shared.MarkAllReadParams
-import jp.nonbili.meron.shared.MarkReadParams
-import jp.nonbili.meron.shared.MarkStarredParams
-import jp.nonbili.meron.shared.MessageAttachment
-import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.MobileMailCommandClient
-import jp.nonbili.meron.shared.MoveRssFeedParams
-import jp.nonbili.meron.shared.MoveThreadParams
-import jp.nonbili.meron.shared.OAuthAuthorizationRequest
-import jp.nonbili.meron.shared.RemoveRssFeedParams
-import jp.nonbili.meron.shared.RssMarkReadParams
-import jp.nonbili.meron.shared.RssMarkStarredParams
-import jp.nonbili.meron.shared.RssThreadParams
-import jp.nonbili.meron.shared.SendIdentity
-import jp.nonbili.meron.shared.SharedMobileContract
 import jp.nonbili.meron.shared.StarredItemSummary
-import jp.nonbili.meron.shared.StarredItemsParams
-import jp.nonbili.meron.shared.StorageUsage
-import jp.nonbili.meron.shared.ThreadActionParams
-import jp.nonbili.meron.shared.ThreadReadParams
+import jp.nonbili.meron.shared.SyncMailParams
 import jp.nonbili.meron.shared.ThreadSummary
-import jp.nonbili.meron.shared.accountSendIdentities
 import jp.nonbili.meron.shared.accountSummaryIsRss
-import jp.nonbili.meron.shared.attachmentToDraftAttachment
-import jp.nonbili.meron.shared.buildOAuthAuthorizationUrl
-import jp.nonbili.meron.shared.defaultOAuthRedirectUri
-import jp.nonbili.meron.shared.detectReplyFromIdentity
-import jp.nonbili.meron.shared.folderIsDrafts
-import jp.nonbili.meron.shared.folderIsTrash
-import jp.nonbili.meron.shared.formatContactSuggestion
-import jp.nonbili.meron.shared.formatSendIdentity
-import jp.nonbili.meron.shared.forwardableAttachments
-import jp.nonbili.meron.shared.isOAuthCallbackUrl
-import jp.nonbili.meron.shared.isPotentialOAuthCallbackUrl
-import jp.nonbili.meron.shared.messageEditAsNewDraft
-import jp.nonbili.meron.shared.messageForwardDraft
-import jp.nonbili.meron.shared.newDraftMessageId
-import jp.nonbili.meron.shared.ownAddressList
-import jp.nonbili.meron.shared.parseAccountListResponse
-import jp.nonbili.meron.shared.parseAttachmentDataResponse
-import jp.nonbili.meron.shared.parseAutodiscoverResponse
-import jp.nonbili.meron.shared.parseContactSuggestResponse
-import jp.nonbili.meron.shared.parseFolderListResponse
-import jp.nonbili.meron.shared.parseMailtoUrl
-import jp.nonbili.meron.shared.parseMediaFileUrlResponse
-import jp.nonbili.meron.shared.parseOAuthCallbackUrlForRedirect
-import jp.nonbili.meron.shared.parseOpmlExportResponse
-import jp.nonbili.meron.shared.parseOpmlImportCountResponse
-import jp.nonbili.meron.shared.parseStarredItemsPage
-import jp.nonbili.meron.shared.parseStorageUsageResponse
-import jp.nonbili.meron.shared.parseThreadListResponse
-import jp.nonbili.meron.shared.parseThreadReadPage
-import jp.nonbili.meron.shared.recipientTail
-import jp.nonbili.meron.shared.replaceRecipientTail
-import jp.nonbili.meron.shared.threadIdIsRss
-import jp.nonbili.meron.shared.toReplyMailParams
-import jp.nonbili.meron.shared.toSaveDraftParams
-import jp.nonbili.meron.shared.toSendMailParams
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlin.math.abs
 
 internal fun MeronMobileState.persistKanbanBoards(next: List<KanbanBoardSpec>) {
     kanbanBoards = next
@@ -542,4 +327,257 @@ internal fun MeronMobileState.loadKanbanBoard(refresh: Boolean = false) {
         persistKanbanSearchScope("all")
     }
     board.columns.forEach { column -> loadKanbanColumn(column, refresh) }
+}
+
+/** Append a board holding [columns] and make it the active one. */
+private fun MeronMobileState.addKanbanBoard(columns: List<KanbanColumnSpec>): KanbanBoardSpec {
+    val board =
+        defaultKanbanBoard(coreAccounts).copy(
+            name = "Kanban board ${kanbanBoards.size + 1}",
+            columns = columns,
+        )
+    persistKanbanBoards(kanbanBoards + board)
+    activeKanbanBoardId = board.id
+    saveActiveKanbanBoardId(kanbanPrefs, board.id)
+    return board
+}
+
+internal fun MeronMobileState.createKanbanBoard(): String {
+    val board = addKanbanBoard(defaultKanbanBoard(coreAccounts).columns)
+    loadKanbanBoard(refresh = false)
+    return board.id
+}
+
+internal fun MeronMobileState.updateKanbanBoard(
+    boardId: String,
+    name: String,
+    avatarUrl: String,
+    wallpaperPresetId: String,
+    wallpaperUrl: String,
+) {
+    val trimmedName = name.trim()
+    if (trimmedName.isBlank()) return
+    persistKanbanBoards(
+        kanbanBoards.map { board ->
+            if (board.id == boardId) {
+                board.copy(
+                    name = trimmedName,
+                    avatarUrl = avatarUrl.trim(),
+                    wallpaperPresetId = wallpaperPresetId.trim(),
+                    wallpaperUrl = wallpaperUrl.trim(),
+                )
+            } else {
+                board
+            }
+        },
+    )
+}
+
+internal fun MeronMobileState.deleteKanbanBoard(boardId: String) {
+    // Deleting the last board leaves no board at all; the kanban screen and the
+    // drawer both render that empty state, and reseeding a default here would
+    // make the delete look like it did nothing.
+    val wasActive = boardId == activeKanbanBoardId
+    persistKanbanBoards(kanbanBoards.filterNot { it.id == boardId })
+    // persistKanbanBoards has already moved the selection off the deleted board,
+    // so drop the cached columns and load whatever it landed on (if anything).
+    if (wasActive) {
+        kanbanColumns = emptyMap()
+        loadKanbanBoard(refresh = false)
+    }
+}
+
+internal fun MeronMobileState.addKanbanColumn(column: KanbanColumnSpec) {
+    val board = kanbanBoards.firstOrNull { it.id == activeKanbanBoardId } ?: return
+    if (board.columns.any { kanbanColumnKey(it) == kanbanColumnKey(column) }) return
+    persistKanbanBoards(
+        kanbanBoards.map {
+            if (it.id == board.id) it.copy(columns = it.columns + column) else it
+        },
+    )
+    loadKanbanColumn(column, refresh = true)
+}
+
+/**
+ * Replace the active board's columns with [columns] (the selection from the add-column
+ * dialog), preserving the relative order of existing columns and appending new ones.
+ * Loads any newly added column and drops cached data for removed ones. With no board
+ * left at all, the selection creates one.
+ */
+internal fun MeronMobileState.applyKanbanColumns(columns: List<KanbanColumnSpec>) {
+    val deduped = columns.distinctBy(::kanbanColumnKey)
+    // Every board can be deleted, and the empty kanban screen still offers "Add
+    // column", so a selection made with no board left has to bring one with it.
+    val active = kanbanBoards.firstOrNull { it.id == activeKanbanBoardId }
+    if (active == null && deduped.isEmpty()) return
+    val board = active ?: addKanbanBoard(emptyList())
+    val nextKeys = deduped.map(::kanbanColumnKey).toSet()
+    val existingKeys = board.columns.map(::kanbanColumnKey).toSet()
+    if (nextKeys == existingKeys) return
+    // Keep existing columns in their current order, then append newly selected ones.
+    val ordered =
+        board.columns.filter { kanbanColumnKey(it) in nextKeys } +
+            deduped.filter { kanbanColumnKey(it) !in existingKeys }
+    persistKanbanBoards(
+        kanbanBoards.map { if (it.id == board.id) it.copy(columns = ordered) else it },
+    )
+    (existingKeys - nextKeys).forEach { kanbanColumns = kanbanColumns - it }
+    ordered
+        .filter { kanbanColumnKey(it) !in existingKeys }
+        .forEach { loadKanbanColumn(it, refresh = true) }
+}
+
+internal fun MeronMobileState.removeKanbanColumn(column: KanbanColumnSpec) {
+    val key = kanbanColumnKey(column)
+    persistKanbanBoards(
+        kanbanBoards.map {
+            if (it.id ==
+                activeKanbanBoardId
+            ) {
+                it.copy(columns = it.columns.filterNot { existing -> kanbanColumnKey(existing) == key })
+            } else {
+                it
+            }
+        },
+    )
+    kanbanColumns = kanbanColumns - key
+}
+
+/**
+ * Drop every column showing a folder, on all boards. Used once the folder is gone
+ * from the server: a column left behind would only fail to load.
+ */
+internal fun MeronMobileState.removeKanbanColumnsForFolder(
+    accountId: String,
+    folderId: String,
+) {
+    val key = kanbanColumnKey(KanbanColumnSpec(accountId, folderId))
+    persistKanbanBoards(
+        kanbanBoards.map { board ->
+            board.copy(columns = board.columns.filterNot { kanbanColumnKey(it) == key })
+        },
+    )
+    kanbanColumns = kanbanColumns - key
+}
+
+/**
+ * Point an existing column at another folder of the same account, keeping its slot
+ * on the board. Does nothing when the folder is unchanged or already has its own
+ * column here — the board must not end up with duplicates.
+ */
+internal fun MeronMobileState.switchKanbanColumnFolder(
+    column: KanbanColumnSpec,
+    folderId: String,
+) {
+    if (folderId.isBlank() || kanbanFolderIdsEqual(folderId, column.folderId)) return
+    val board = kanbanBoards.firstOrNull { it.id == activeKanbanBoardId } ?: return
+    val fromKey = kanbanColumnKey(column)
+    val target = KanbanColumnSpec(column.accountId, folderId)
+    val toKey = kanbanColumnKey(target)
+    if (board.columns.none { kanbanColumnKey(it) == fromKey }) return
+    if (board.columns.any { it.accountId == target.accountId && kanbanFolderIdsEqual(it.folderId, target.folderId) }) return
+    persistKanbanBoards(
+        kanbanBoards.map { existing ->
+            if (existing.id != board.id) {
+                existing
+            } else {
+                existing.copy(columns = existing.columns.map { if (kanbanColumnKey(it) == fromKey) target else it })
+            }
+        },
+    )
+    if (kanbanSearchScope == fromKey) persistKanbanSearchScope(toKey)
+    // Keep the old folder's cached page only while another board still shows it.
+    if (kanbanBoards.none { it.columns.any { existing -> kanbanColumnKey(existing) == fromKey } }) {
+        kanbanColumns = kanbanColumns - fromKey
+    }
+    loadKanbanColumn(target, refresh = true)
+}
+
+/**
+ * Fetch an account's folder list for a folder picker (a kanban column's or the
+ * mail list's) when only the bootstrap inbox is cached, so the picker isn't
+ * limited to what a sync happened to surface.
+ */
+internal fun MeronMobileState.ensureAccountFolders(accountId: String) {
+    if (!coreLoaded || accountId == UNIFIED_ACCOUNT_ID) return
+    val account = coreAccounts.firstOrNull { it.id == accountId } ?: return
+    if (accountSummaryIsRss(account)) return
+    if (foldersByAccount[accountId].orEmpty().size > 1) return
+    scope.launch {
+        runCatching {
+            withContext(ioDispatcher) {
+                val client = MobileMailCommandClient(core)
+                withManagedGoogleAuth(client, account.id) {
+                    client.sync(
+                        SyncMailParams(
+                            accountId = account.id,
+                            folderId = INBOX_FOLDER,
+                            limit = 1,
+                            folders = true,
+                            deferTail = true,
+                        ),
+                    )
+                }
+                loadAccountFolders(client, account)
+            }
+        }.onSuccess { folders ->
+            if (folders.isNotEmpty()) foldersByAccount = foldersByAccount + (accountId to folders)
+        }
+    }
+}
+
+internal fun MeronMobileState.moveKanbanColumn(
+    column: KanbanColumnSpec,
+    delta: Int,
+) {
+    persistKanbanBoards(
+        kanbanBoards.map { board ->
+            if (board.id != activeKanbanBoardId) return@map board
+            val columns = board.columns.toMutableList()
+            val index = columns.indexOfFirst { kanbanColumnKey(it) == kanbanColumnKey(column) }
+            val target = (index + delta).coerceIn(0, columns.lastIndex)
+            if (index < 0 || index == target) {
+                board
+            } else {
+                val item = columns.removeAt(index)
+                columns.add(target, item)
+                board.copy(columns = columns)
+            }
+        },
+    )
+}
+
+internal fun MeronMobileState.createFolderForKanban(
+    account: AccountSummary,
+    name: String,
+) {
+    val trimmed = name.trim()
+    if (trimmed.isBlank()) {
+        status = "Folder name is required."
+        return
+    }
+    if (!coreLoaded) {
+        status = coreUnavailableMessage
+        return
+    }
+    scope.launch {
+        runCatching {
+            withContext(ioDispatcher) {
+                val client = MobileMailCommandClient(core)
+                withManagedGoogleAuth(client, account.id) {
+                    client.createFolder(FolderCreateParams(accountId = account.id, name = trimmed))
+                }
+                loadAccountFolders(client, account)
+            }
+        }.onSuccess { folders ->
+            foldersByAccount = foldersByAccount + (account.id to folders)
+            val created = folders.folderCreatedAs(trimmed)?.name ?: trimmed
+            addKanbanColumn(KanbanColumnSpec(account.id, created))
+            showKanbanCreateFolderDialog = null
+            kanbanFolderNameInput = ""
+            status = "Folder created"
+        }.onFailure {
+            status = "Create folder failed: ${it.message}"
+        }
+    }
 }
