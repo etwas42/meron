@@ -1,4 +1,5 @@
 import { BUBBLE_CODE_BASE_PX, BUBBLE_HTML_BASE_PX, type MessageFrameFont } from '../../lib/fonts'
+import { QUOTE_FOLDED_CLASS, QUOTE_TOGGLE_CLASS } from './quoteFold'
 import { allowRemoteContent, blockRemoteContent } from './remoteContentCsp'
 import {
   DEFAULT_BUBBLE_THEME,
@@ -200,6 +201,31 @@ export function prepareBubbleHtml(
       .meron-copy-code svg {
         width: 15px;
         height: 15px;
+      }
+      /* The folded quoted tail and its toggle (see quoteFold). */
+      html.${QUOTE_FOLDED_CLASS} [data-meron-quote] {
+        display: none !important;
+      }
+      .${QUOTE_TOGGLE_CLASS} {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 14px;
+        margin: 8px 0;
+        padding: 0;
+        border: 1px solid var(${v('border')}, ${DEFAULT_BUBBLE_THEME.border});
+        border-radius: 7px;
+        background: var(${v('surface')}, ${DEFAULT_BUBBLE_THEME.surface});
+        color: var(${v('muted')}, ${DEFAULT_BUBBLE_THEME.muted});
+        font: 700 10px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        letter-spacing: 1px;
+        cursor: pointer;
+      }
+      .${QUOTE_TOGGLE_CLASS}::before { content: '•••'; }
+      .${QUOTE_TOGGLE_CLASS}:hover {
+        background: var(${v('raised-hover')}, ${DEFAULT_BUBBLE_THEME.raisedHover});
+        color: var(${v('text')}, ${DEFAULT_BUBBLE_THEME.text});
       }
       /* In-thread search hits, applied to the live document by BubbleHtmlFrame. */
       mark.meron-search-hit {

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::engine::{Engine, attach_html};
 use crate::reply::ReplyTarget;
-use crate::{imap, mail_model, parse, reply, store};
+use crate::{imap, mail_model, parse, quote, reply, store};
 
 /// Called after a background body fetch stored at least one new message, so
 /// the platform can tell its UI to re-read the open thread.
@@ -500,6 +500,9 @@ pub fn thread_message_json(
         "preview": cached.map(|message| message.preview.as_str()).unwrap_or(""),
         "body": cached.map(|message| message.body.as_str()).unwrap_or(""),
         "body_html": cached.and_then(|message| message.body_html.as_deref()).unwrap_or(""),
+        // Where the plain body's quoted tail starts (UTF-16 offset), so clients
+        // can fold it; null when there is none. HTML bodies mark theirs inline.
+        "body_quote_start": cached.and_then(|message| quote::plain_quote_start(&message.body)),
         // No cached body means the on-demand IMAP fetch failed (auth/network)
         // or is still filling in the background — not that the message is
         // empty. Clients offer a retry / re-read for these.

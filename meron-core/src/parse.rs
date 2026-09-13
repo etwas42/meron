@@ -440,6 +440,9 @@ fn sanitize_email_html(source: &str) -> String {
             "cellspacing",
             "nowrap",
         ])
+        // Apple Mail and Thunderbird mark a reply's quote as
+        // `<blockquote type="cite">`; quote folding looks for it (see quote.rs).
+        .add_tag_attributes("blockquote", ["type"])
         // `data:` is allowed through the scheme filter but then constrained to
         // image sources by the attribute filter below.
         .url_schemes(
@@ -728,7 +731,9 @@ pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
     // injected, so a CSP bypass alone can't run the email's JS. CSS is kept (the
     // CSP allows `style-src 'unsafe-inline'`); only script vectors are removed.
     let raw_source = source;
-    let source = &sanitize_email_html(source);
+    // Marked after sanitizing, which drops every sender `data-*` attribute, so
+    // the quote marker the frames fold on is always ours.
+    let source = &crate::quote::mark_html_quote(&sanitize_email_html(source));
     let (img, media) = if load_remote_images {
         (
             "'self' data: http: https:",
@@ -1780,6 +1785,35 @@ AQID\r\n\
         assert!(out.contains("color:red"));
         assert!(out.contains("font-weight:bold"));
         assert!(out.contains("https://example.com"));
+    }
+
+    #[test]
+    fn prepare_html_marks_only_its_own_quotes() {
+        // A sender can't fold part of a message by writing the marker itself.
+        let forged = prepare_html(r#"<p data-meron-quote="">hidden?</p><p>tail</p>"#, false);
+        assert!(!forged.contains("data-meron-quote"), "{forged}");
+        let reply = prepare_html(
+            r#"<p>Yes</p><div class="gmail_quote">On Mon, Jane wrote:<blockquote>Lunch?</blockquote></div>"#,
+            false,
+        );
+        assert!(
+            reply.contains(r#"class="gmail_quote" data-meron-quote="""#),
+            "{reply}"
+        );
+        // Apple Mail / Thunderbird: the `type="cite"` the detector keys on has
+        // to survive sanitizing.
+        let cite = prepare_html(
+            r#"<p>Yes</p><div class="moz-cite-prefix">On 9/1/25 Jane wrote:</div><blockquote type="cite"><p>Lunch?</p></blockquote>"#,
+            false,
+        );
+        assert!(
+            cite.contains(r#"<blockquote type="cite" data-meron-quote="">"#),
+            "{cite}"
+        );
+        assert!(
+            cite.contains(r#"class="moz-cite-prefix" data-meron-quote="""#),
+            "{cite}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ import type { ComponentType } from 'react'
 import type { Account, Attachment, Message } from '../../types'
 import { normalizeSenderAddr } from '../../states/settings'
 import { PdfIcon, type IconProps } from '../icons/Icons'
+import { splitQuotedBody } from './quoteFold'
 
 /** Any icon usable in attachment rows: a lucide icon or our custom SVGs. */
 export type FileIconComponent = ComponentType<IconProps>
@@ -394,7 +395,14 @@ export function splitInlineMarkup(content: string): InlineMarkupChunk[] {
  * marked, so they are left out — counting them would make the search bar
  * promise matches no <mark> ever lands on.
  */
-export function plainHighlightTexts(body: string): string[] {
+export function plainHighlightTexts(body: string, quoteStart?: number | null): string[] {
+  // The reply and its quoted tail are normalized and rendered as two sections
+  // (MessageBubbleBody), so they are walked the same way here.
+  const { reply, quote } = splitQuotedBody(body, quoteStart)
+  return quote ? [...sectionHighlightTexts(reply), ...sectionHighlightTexts(quote)] : sectionHighlightTexts(reply)
+}
+
+function sectionHighlightTexts(body: string): string[] {
   const blocks = messageContentBlocks(normalizeBodyText(body))
 
   const texts: string[] = []

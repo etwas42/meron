@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Copy } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
@@ -6,13 +6,16 @@ import { openExternal } from '../../lib/native'
 import type { Message } from '../../types'
 import {
   MESSAGE_BODY_MAX_HEIGHT,
+  bodyContentKey,
   getShortenedLinkText,
   messageContentBlocks,
   normalizeBodyText,
+  plainHighlightTexts,
   splitInlineMarkup,
 } from './messageHelpers'
 import { BubbleHtmlFrame } from './BubbleHtmlFrame'
 import { matchRanges } from './frameSearchHighlight'
+import { isQuoteUnfolded, setQuoteUnfolded, splitQuotedBody } from './quoteFold'
 
 // The message body: the sandboxed HTML view, or the plain/markdown renderer with
 // inline bold/italic/code, fenced code blocks (with copy buttons) and links,
@@ -58,6 +61,11 @@ export function MessageBubbleBody({
     mark?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   }, [activeSearchOffset, normalizedSearchQuery, message.id])
 
+  // The plain body's quoted tail folds behind a toggle (see quoteFold).
+  const quoteKey = bodyContentKey(message.body)
+  const [quoteUnfolded, setQuoteUnfoldedState] = useState(() => isQuoteUnfolded(quoteKey))
+  useEffect(() => setQuoteUnfoldedState(isQuoteUnfolded(quoteKey)), [quoteKey])
+
   const boxStyle = fullHeight ? undefined : { maxHeight: MESSAGE_BODY_MAX_HEIGHT }
   const boxClass = fullHeight ? 'relative' : 'relative overflow-y-auto'
   if (useHtmlBody) {
@@ -76,8 +84,14 @@ export function MessageBubbleBody({
     )
   }
 
-  const bodyText = normalizeBodyText(message.body)
-  const blocks = messageContentBlocks(bodyText)
+  const { reply, quote } = splitQuotedBody(message.body, message.body_quote_start)
+  // A search parked on a match inside the folded quote opens it: the reply's
+  // matches come first in the count, so any later occurrence is in the quote.
+  const replyHits =
+    quote && activeSearchOffset >= 0
+      ? plainHighlightTexts(reply).reduce((sum, text) => sum + matchRanges([text], normalizedSearchQuery).hits, 0)
+      : 0
+  const showQuote = !!quote && (quoteUnfolded || (activeSearchOffset >= 0 && activeSearchOffset >= replyHits))
   // Matches are numbered as they are rendered, in the same order the search bar
   // counted them (plainHighlightTexts walks these blocks), so occurrence n here
   // is occurrence n there. Reset on every render pass.
@@ -146,61 +160,87 @@ export function MessageBubbleBody({
     })
   }
 
+  // Reply and quote are normalized apart, the way plainHighlightTexts counts them.
+  function renderSection(text: string, section: string) {
+    return messageContentBlocks(normalizeBodyText(text)).map((block, blockIndex) => {
+      if (block.type === 'code') {
+        return (
+          <div key={`${section}-code-${blockIndex}`} className="group relative my-2 max-w-full">
+            <button
+              type="button"
+              onClick={() => navigator.clipboard?.writeText(block.content).catch(() => undefined)}
+              className="absolute right-1.5 top-1.5 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-chats/90 text-secondary opacity-0 shadow-sm transition-opacity hover:text-primary group-hover:opacity-100"
+              title={t('chat.copyCode')}
+            >
+              <Copy size={13} />
+            </button>
+            <pre className="m-0 max-w-full overflow-x-auto rounded-lg border border-border/60 bg-black/5 px-3 py-2.5 pr-11 pb-2 font-mono text-[calc(0.8125rem*var(--me-message-scale))] leading-relaxed text-primary shadow-inner dark:bg-white/10">
+              <code className="block min-w-max whitespace-pre">{block.content}</code>
+            </pre>
+          </div>
+        )
+      }
+
+      return (
+        <span key={`${section}-inline-${blockIndex}`}>
+          {block.parts.map((part, index) => {
+            if (part.type === 'link') {
+              return (
+                <a
+                  key={index}
+                  href={part.content}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    openExternal(part.content)
+                  }}
+                  onMouseEnter={() => onLinkHover?.(part.content)}
+                  onMouseLeave={() => onLinkHover?.(null)}
+                  onFocus={() => onLinkHover?.(part.content)}
+                  onBlur={() => onLinkHover?.(null)}
+                  title={part.content}
+                  className="text-accent hover:underline break-all font-semibold cursor-pointer"
+                >
+                  {part.label
+                    ? renderText(part.label, `${section}-link-${blockIndex}-${index}`)
+                    : getShortenedLinkText(part.content)}
+                </a>
+              )
+            }
+            return renderText(part.content, `${section}-text-${blockIndex}-${index}`)
+          })}
+        </span>
+      )
+    })
+  }
+
+  const quoteLabel = showQuote ? t('chat.hideQuotedText') : t('chat.showQuotedText')
   return (
     <div
       ref={bodyRef}
       className={`${boxClass} -mr-3.5 pr-3.5 font-message text-[calc(0.9375rem*var(--me-message-scale))] leading-relaxed break-words whitespace-pre-wrap select-text font-normal tracking-[0.01em]`}
       style={boxStyle}
     >
-      {blocks.map((block, blockIndex) => {
-        if (block.type === 'code') {
-          return (
-            <div key={`code-${blockIndex}`} className="group relative my-2 max-w-full">
-              <button
-                type="button"
-                onClick={() => navigator.clipboard?.writeText(block.content).catch(() => undefined)}
-                className="absolute right-1.5 top-1.5 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-chats/90 text-secondary opacity-0 shadow-sm transition-opacity hover:text-primary group-hover:opacity-100"
-                title={t('chat.copyCode')}
-              >
-                <Copy size={13} />
-              </button>
-              <pre className="m-0 max-w-full overflow-x-auto rounded-lg border border-border/60 bg-black/5 px-3 py-2.5 pr-11 pb-2 font-mono text-[calc(0.8125rem*var(--me-message-scale))] leading-relaxed text-primary shadow-inner dark:bg-white/10">
-                <code className="block min-w-max whitespace-pre">{block.content}</code>
-              </pre>
-            </div>
-          )
-        }
-
-        return (
-          <span key={`inline-${blockIndex}`}>
-            {block.parts.map((part, index) => {
-              if (part.type === 'link') {
-                return (
-                  <a
-                    key={index}
-                    href={part.content}
-                    onClick={(e) => {
-                      e.preventDefault()
-                      openExternal(part.content)
-                    }}
-                    onMouseEnter={() => onLinkHover?.(part.content)}
-                    onMouseLeave={() => onLinkHover?.(null)}
-                    onFocus={() => onLinkHover?.(part.content)}
-                    onBlur={() => onLinkHover?.(null)}
-                    title={part.content}
-                    className="text-accent hover:underline break-all font-semibold cursor-pointer"
-                  >
-                    {part.label
-                      ? renderText(part.label, `link-${blockIndex}-${index}`)
-                      : getShortenedLinkText(part.content)}
-                  </a>
-                )
-              }
-              return renderText(part.content, `text-${blockIndex}-${index}`)
-            })}
+      {renderSection(reply, 'reply')}
+      {quote && (
+        <>
+          <span className="my-1.5 block">
+            <button
+              type="button"
+              onClick={() => {
+                setQuoteUnfolded(quoteKey, !showQuote)
+                setQuoteUnfoldedState(!showQuote)
+              }}
+              title={quoteLabel}
+              aria-label={quoteLabel}
+              aria-expanded={showQuote}
+              className="flex h-3.5 w-7 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-black/5 font-sans text-[10px] leading-none font-bold tracking-[1px] text-secondary hover:bg-black/10 hover:text-primary dark:bg-white/10 dark:hover:bg-white/15"
+            >
+              •••
+            </button>
           </span>
-        )
-      })}
+          {showQuote && renderSection(quote, 'quote')}
+        </>
+      )}
     </div>
   )
 }

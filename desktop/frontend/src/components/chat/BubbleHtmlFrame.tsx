@@ -7,6 +7,7 @@ import { bodyContentKey } from './messageHelpers'
 import { applyFrameHighlights, clearFrameHighlights } from './frameSearchHighlight'
 import { frameMetrics, measureFrameHeight } from './frameHeight'
 import { useMessageFrameFont } from './useMessageFrameFont'
+import { installFrameQuoteFold, isInFoldedQuote } from './quoteFold'
 import { useBubbleTheme } from './useFrameTheme'
 
 const DEFAULT_FRAME_HEIGHT = 120
@@ -81,6 +82,9 @@ export function BubbleHtmlFrame({
   bubbleThemeRef.current = bubbleTheme
   const [galleryItems, setGalleryItems] = useState<GalleryItem[]>([])
   const [galleryIndex, setGalleryIndex] = useState<number | null>(null)
+  // Folds or unfolds the live document's quoted tail; null while it has none.
+  const quoteKey = useMemo(() => bodyContentKey(html), [html])
+  const foldQuoteRef = useRef<((open: boolean) => void) | null>(null)
 
   const openImage = useCallback((doc: Document, img: HTMLImageElement, event: Event) => {
     event.preventDefault()
@@ -238,6 +242,16 @@ export function BubbleHtmlFrame({
         wrapper.appendChild(button)
       }
 
+      // Before the first measurement, so a folded quote never flashes open.
+      const foldQuote = installFrameQuoteFold(doc, quoteKey, {
+        show: t('chat.showQuotedText'),
+        hide: t('chat.hideQuotedText'),
+      })
+      foldQuoteRef.current = foldQuote
+      cleanupFns.push(() => {
+        if (foldQuoteRef.current === foldQuote) foldQuoteRef.current = null
+      })
+
       applyBubbleTheme(doc, bubbleThemeRef.current)
       setFrameDoc(doc)
       cleanupFns.push(() => setFrameDoc((current) => (current === doc ? null : current)))
@@ -279,7 +293,7 @@ export function BubbleHtmlFrame({
         cleanupFns.forEach((cleanup) => cleanup())
       }
     },
-    [documentKey, generation],
+    [documentKey, generation, quoteKey],
   )
 
   // Repaint a live frame when the theme changes under it: the document isn't
@@ -294,6 +308,8 @@ export function BubbleHtmlFrame({
   useEffect(() => {
     if (!frameDoc) return
     const { activeMark } = applyFrameHighlights(frameDoc, searchQuery, activeSearchOffset)
+    // A hit inside the folded quote has nothing to scroll to: unfold it first.
+    if (activeMark && isInFoldedQuote(activeMark)) foldQuoteRef.current?.(true)
     // The frame doesn't scroll (it's sized to its content), so scrolling the
     // mark into view moves the conversation container around it — which is how
     // stepping between two hits inside one long message goes anywhere.

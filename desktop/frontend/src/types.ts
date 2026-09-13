@@ -155,6 +155,9 @@ export type Message = {
   body: string
   /** Iframe-ready original email HTML for "HTML mode"; absent for plain-text messages. */
   body_html?: string
+  /** UTF-16 offset where the plain body's quoted tail starts, so it can be
+   * folded; null/absent when there is none. HTML bodies mark theirs inline. */
+  body_quote_start?: number | null
   /** True when the body isn't cached yet — the on-demand fetch failed or is
    * still filling in the background (a `mail.synced` re-read delivers it). */
   body_missing?: boolean

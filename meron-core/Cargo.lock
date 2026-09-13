@@ -1861,6 +1861,7 @@ dependencies = [
  "async-smtp",
  "base64",
  "chrono",
+ "ego-tree",
  "feed-rs",
  "futures",
  "hickory-resolver",
