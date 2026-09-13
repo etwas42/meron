@@ -432,26 +432,49 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest) {
           thread.account_id,
         ),
       )
-  const results = await Promise.allSettled([
+  const writes = [
     ...(mailAccountIds.length
-      ? [request('mail.markAllRead', { account_id: column.accountId, folder_id: column.folderId })]
+      ? [() => request('mail.markAllRead', { account_id: column.accountId, folder_id: column.folderId })]
       : []),
-    ...itemTargets.map((thread) => request('mail.markRead', { thread_id: thread.thread_id })),
-  ])
+    ...itemTargets.map((thread) => () => request('mail.markRead', { thread_id: thread.thread_id })),
+  ]
+  // Optimistic: clear the cards before any await, so a board-wide mark flips
+  // every column at once. A failure puts back only the rows cleared here (by id,
+  // so a page load that landed meanwhile survives) and this column's badge.
+  const previousById = new Map(unread.map((thread) => [thread.thread_id, thread]))
+  const previousUnreadCount = kanban$.unreadCounts[key].get()
+  const clearsBadge = !starred && writes.length > 0
+  kanban$.threads[key].set(
+    threads.map((thread) =>
+      previousById.has(thread.thread_id) ? { ...thread, unread: false, unread_count: 0 } : thread,
+    ),
+  )
+  if (clearsBadge) kanban$.unreadCounts[key].set(0)
+  const results = await Promise.allSettled(writes.map((write) => write()))
   await Promise.all(
     Array.from(new Set([...mailAccountIds, ...itemTargets.map((thread) => thread.account_id)]))
       .filter(Boolean)
       .map((accountId) => refreshAccountFoldersCache(accountId, false)),
   )
   const failure = results.find((result) => result.status === 'rejected')
-  if (failure?.status === 'rejected') throw failure.reason
-  const readIds = new Set(unread.map((thread) => thread.thread_id))
+  if (failure?.status === 'rejected') {
+    kanban$.threads[key].set(
+      (kanban$.threads[key].get() ?? []).map((thread) => {
+        const previous = previousById.get(thread.thread_id)
+        return previous ? { ...thread, unread: previous.unread, unread_count: previous.unread_count } : thread
+      }),
+    )
+    if (clearsBadge) kanban$.unreadCounts[key].set(previousUnreadCount)
+    throw failure.reason
+  }
+  // Reapply on success: a column reload that raced the write may have put the
+  // pre-write rows and badge back over the optimistic clear.
   kanban$.threads[key].set(
     (kanban$.threads[key].get() ?? []).map((thread) =>
-      readIds.has(thread.thread_id) ? { ...thread, unread: false, unread_count: 0 } : thread,
+      previousById.has(thread.thread_id) ? { ...thread, unread: false, unread_count: 0 } : thread,
     ),
   )
-  if (!starred && results.length) kanban$.unreadCounts[key].set(0)
+  if (clearsBadge) kanban$.unreadCounts[key].set(0)
 }
 
 export async function markColumnAllRead(column: KanbanColumn) {

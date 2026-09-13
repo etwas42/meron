@@ -1,10 +1,24 @@
 package jp.nonbili.meron.ui
 
+import jp.nonbili.meron.shared.AccountSummary
+import jp.nonbili.meron.shared.ThreadSummary
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+
+// A column's mark-read targets, captured before the optimistic clear so a failed
+// write can restore exactly what it cleared.
+internal data class KanbanMarkReadPlan(
+    val column: KanbanColumnSpec,
+    val key: String,
+    val unread: List<ThreadSummary>,
+    val starred: Boolean,
+    val mailAccounts: List<AccountSummary>,
+    val writes: Boolean,
+    val unreadCountBefore: Int?,
+)
 
 // One board action executes sequentially and shares both successful and failed
 // writes across overlapping columns, so a failed target is not retried implicitly.

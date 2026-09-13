@@ -165,6 +165,44 @@ describe('markColumnAllRead', () => {
     ])
   })
 
+  it('clears every column before the backend answers', async () => {
+    settings$.kanbanBoards.set([
+      {
+        id: 'board',
+        name: 'Board',
+        columns: [
+          { accountId: 'acc1', folderId: 'INBOX' },
+          { accountId: 'acc2', folderId: 'Archive' },
+        ],
+      },
+    ])
+    kanban$.threads['acc1\nINBOX'].set([message()])
+    kanban$.unreadCounts['acc1\nINBOX'].set(3)
+    kanban$.threads['acc2\nArchive'].set([message({ account_id: 'acc2', folder_id: 'Archive' })])
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const original = (window as any).go.main.App.Invoke
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      if (command === 'mail.markAllRead') await gate
+      return original(command, payload)
+    }
+
+    const pending = markBoardAllRead('board')
+
+    expect(kanban$.threads['acc1\nINBOX'].get()[0].unread).toBe(false)
+    expect(kanban$.unreadCounts['acc1\nINBOX'].get()).toBe(0)
+    expect(kanban$.threads['acc2\nArchive'].get()[0].unread).toBe(false)
+    // A column reload racing the write brings back pre-write rows and badge.
+    kanban$.threads['acc1\nINBOX'].set([message()])
+    kanban$.unreadCounts['acc1\nINBOX'].set(3)
+    kanban$.threads['acc2\nArchive'].set([message({ account_id: 'acc2', folder_id: 'Archive' })])
+    release()
+    await pending
+    expect(kanban$.unreadCounts['acc1\nINBOX'].get()).toBe(0)
+    expect(kanban$.threads['acc1\nINBOX'].get()[0].unread).toBe(false)
+    expect(kanban$.threads['acc2\nArchive'].get()[0].unread).toBe(false)
+  })
+
   it('keeps failed columns unread while completing other columns and reporting a partial failure', async () => {
     settings$.kanbanBoards.set([
       {

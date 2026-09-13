@@ -26,7 +26,10 @@ kotlin {
         namespace = "jp.nonbili.meron.ui"
         compileSdk = 36
         minSdk = 23
-        withHostTest {}
+        withHostTest {
+            // android.util.Log (via Log.w on failure paths) is a throwing stub on the host.
+            returnDefaultValues = true
+        }
     }
 
     iosArm64()

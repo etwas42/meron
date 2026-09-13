@@ -1942,25 +1942,55 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
     }
     if (kanbanMarkingRead || columns.isEmpty()) return
     kanbanMarkingRead = true
+    val accounts = coreAccounts
+    // Capture every column's targets up front, then clear them all optimistically
+    // so the board flips at once. A failed column puts back only its own rows and
+    // badge; other columns are never rolled back.
+    val plans =
+        columns.map { column ->
+            val key = kanbanColumnKey(column)
+            val state = kanbanColumns[key]
+            val unread = state?.threads.orEmpty().filter { it.unread }
+            val starred = isUnifiedStarredColumn(column)
+            val mailAccounts =
+                if (starred) {
+                    emptyList()
+                } else if (column.accountId == UNIFIED_ACCOUNT_ID) {
+                    accounts.filter { it.includedInUnified && !accountSummaryIsRss(it) }
+                } else {
+                    accounts.filter { it.id == column.accountId && !accountSummaryIsRss(it) }
+                }
+            val writes =
+                mailAccounts.isNotEmpty() ||
+                    (starred && unread.any { !threadIdIsRss(it.id) }) ||
+                    unread.any { threadIdIsRss(it.backendThreadId()) }
+            KanbanMarkReadPlan(column, key, unread, starred, mailAccounts, writes, state?.unreadCount)
+        }
+    for (plan in plans) {
+        val readIds = plan.unread.map { it.id }.toSet()
+        updateKanbanColumn(plan.key) { state ->
+            state.copy(
+                threads = state.threads.map { if (it.id in readIds) it.copy(unread = false) else it },
+                unreadCount = if (plan.writes) 0 else state.unreadCount,
+            )
+        }
+    }
+    val optimisticIds = plans.flatMap { plan -> plan.unread.map { it.id } }.toSet()
+    val coreUnreadBefore = coreThreads.filter { it.id in optimisticIds }.associate { it.id to it.unread }
+    coreThreads = coreThreads.map { if (it.id in optimisticIds) it.copy(unread = false) else it }
     scope.launch {
+        val succeededIds = mutableSetOf<String>()
+        val failedIds = mutableSetOf<String>()
         try {
             val requests = KanbanReadRequests()
             var failures = 0
             val marked = mutableSetOf<Pair<String, String>>()
-            for (column in columns) {
-                // Capture targets before each write, and never roll back other columns.
-                val key = kanbanColumnKey(column)
-                val unread = kanbanColumns[key]?.threads.orEmpty().filter { it.unread }
-                val starred = isUnifiedStarredColumn(column)
-                val accounts = coreAccounts
-                val mailAccounts =
-                    if (starred) {
-                        emptyList()
-                    } else if (column.accountId == UNIFIED_ACCOUNT_ID) {
-                        accounts.filter { it.includedInUnified && !accountSummaryIsRss(it) }
-                    } else {
-                        accounts.filter { it.id == column.accountId && !accountSummaryIsRss(it) }
-                    }
+            for (plan in plans) {
+                val column = plan.column
+                val key = plan.key
+                val unread = plan.unread
+                val starred = plan.starred
+                val mailAccounts = plan.mailAccounts
                 val unifiedTarget =
                     if (column.accountId != UNIFIED_ACCOUNT_ID && mailAccounts.any { it.includedInUnified }) {
                         columns.firstOrNull {
@@ -2015,21 +2045,37 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                     }
                 result
                     .onSuccess { responses ->
+                        // Reapply: a column reload that raced the write may have put
+                        // the pre-write rows and badge back over the optimistic clear.
                         val readIds = unread.map { it.id }.toSet()
                         updateKanbanColumn(key) { state ->
                             state.copy(
                                 threads = state.threads.map { if (it.id in readIds) it.copy(unread = false) else it },
-                                unreadCount = if (responses.isNotEmpty()) 0 else state.unreadCount,
+                                unreadCount = if (plan.writes) 0 else state.unreadCount,
                             )
                         }
                         coreThreads = coreThreads.map { if (it.id in readIds) it.copy(unread = false) else it }
                         responses.forEach(::applyCoreFolderUnreadChanges)
+                        succeededIds += readIds
                         marked += unread.map { it.accountId to it.backendThreadId() }
                     }.onFailure {
                         if (it is kotlinx.coroutines.CancellationException) throw it
                         Log.w("Mail", "kanban mark all read failed", it)
                         failures++
+                        val readIds = unread.map { it.id }.toSet()
+                        failedIds += readIds
+                        updateKanbanColumn(key) { state ->
+                            state.copy(
+                                threads = state.threads.map { if (it.id in readIds) it.copy(unread = true) else it },
+                                unreadCount = if (plan.writes) plan.unreadCountBefore else state.unreadCount,
+                            )
+                        }
                     }
+            }
+            // A row shared with a column that did succeed is read on the server.
+            val revertIds = failedIds - succeededIds
+            if (revertIds.isNotEmpty()) {
+                coreThreads = coreThreads.map { thread -> coreUnreadBefore[thread.id]?.takeIf { thread.id in revertIds }?.let { thread.copy(unread = it) } ?: thread }
             }
             val language = loadAppLanguageTag(prefs).ifBlank { "en" }
             status =

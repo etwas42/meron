@@ -9,6 +9,7 @@ import jp.nonbili.meron.shared.MobileCommand
 import jp.nonbili.meron.shared.MobileMailCommandClient
 import jp.nonbili.meron.shared.ThreadActionParams
 import jp.nonbili.meron.shared.ThreadSummary
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -67,6 +68,77 @@ class ManagedGoogleAuthTest {
             assertEquals(1, core.commands.count { it == MobileCommand.MarkAllRead })
             assertEquals(localizedString("ja", "mail.toast.markedReadCount", mapOf("count" to 1)), state.status)
             assertTrue(state.kanbanColumns.values.all { column -> column.threads.none { it.unread } })
+        }
+
+    @Test
+    fun kanbanBoardClearsEveryColumnBeforeTheCoreAnswers() =
+        runBlocking {
+            val core = GatedCore()
+            val state = testState(core, ManagedHost(), this)
+            state.coreAccounts =
+                listOf(
+                    AccountSummary(id = "acc1", email = "one@example.com"),
+                    AccountSummary(id = "acc2", email = "two@example.com"),
+                )
+            val first = KanbanColumnSpec("acc1", "INBOX")
+            val second = KanbanColumnSpec("acc2", "Archive")
+            state.kanbanBoards = listOf(KanbanBoardSpec(id = "board", name = "Board", columns = listOf(first, second)))
+            state.activeKanbanBoardId = "board"
+            val thread = ThreadSummary(id = "row1", threadId = "acc1#thread", accountId = "acc1", folder = "INBOX", subject = "Subject", sender = "Sender", unread = true)
+            state.kanbanColumns =
+                mapOf(
+                    kanbanColumnKey(first) to KanbanColumnState(threads = listOf(thread), unreadCount = 3),
+                    kanbanColumnKey(second) to KanbanColumnState(threads = listOf(thread.copy(id = "row2", accountId = "acc2", folder = "Archive")), unreadCount = 2),
+                )
+
+            state.markKanbanBoardAllRead()
+            withTimeout(5_000) { core.started.await() }
+
+            assertTrue(state.kanbanMarkingRead)
+            assertTrue(state.kanbanColumns.values.all { column -> column.threads.none { it.unread } })
+            assertTrue(state.kanbanColumns.values.all { it.unreadCount == 0 })
+            // A column reload racing the write brings back pre-write rows and badge.
+            state.kanbanColumns =
+                state.kanbanColumns.mapValues { (_, column) ->
+                    column.copy(threads = column.threads.map { it.copy(unread = true) }, unreadCount = 5)
+                }
+            core.release.complete(Unit)
+            withTimeout(5_000) { while (state.kanbanMarkingRead) delay(10) }
+            assertTrue(state.kanbanColumns.values.all { column -> column.threads.none { it.unread } })
+            assertTrue(state.kanbanColumns.values.all { it.unreadCount == 0 })
+        }
+
+    @Test
+    fun kanbanBoardRollsBackOnlyTheFailedColumn() =
+        runBlocking {
+            val core = ScriptedCore(failCount = 1, failureMessage = "Offline", failureCommand = MobileCommand.MarkAllRead)
+            val state = testState(core, ManagedHost(), this)
+            state.coreAccounts =
+                listOf(
+                    AccountSummary(id = "acc1", email = "one@example.com"),
+                    AccountSummary(id = "acc2", email = "two@example.com"),
+                )
+            val failed = KanbanColumnSpec("acc1", "INBOX")
+            val succeeded = KanbanColumnSpec("acc2", "Archive")
+            state.kanbanBoards = listOf(KanbanBoardSpec(id = "board", name = "Board", columns = listOf(failed, succeeded)))
+            state.activeKanbanBoardId = "board"
+            val thread = ThreadSummary(id = "row1", threadId = "acc1#thread", accountId = "acc1", folder = "INBOX", subject = "Subject", sender = "Sender", unread = true)
+            state.kanbanColumns =
+                mapOf(
+                    kanbanColumnKey(failed) to KanbanColumnState(threads = listOf(thread), unreadCount = 4),
+                    kanbanColumnKey(succeeded) to KanbanColumnState(threads = listOf(thread.copy(id = "row2", accountId = "acc2", folder = "Archive")), unreadCount = 2),
+                )
+
+            state.markKanbanBoardAllRead()
+            withTimeout(5_000) { while (state.kanbanMarkingRead) delay(10) }
+
+            val failedState = state.kanbanColumns.getValue(kanbanColumnKey(failed))
+            val succeededState = state.kanbanColumns.getValue(kanbanColumnKey(succeeded))
+            assertTrue(failedState.threads.single().unread)
+            assertEquals(4, failedState.unreadCount)
+            assertTrue(succeededState.threads.none { it.unread })
+            assertEquals(0, succeededState.unreadCount)
+            assertEquals(localizedString("en", "notification.markReadFailed"), state.status)
         }
 
     @Test
@@ -223,6 +295,30 @@ class ManagedGoogleAuthTest {
                 softRefreshes++
                 ManagedTokenRefresh.StillFresh
             }
+    }
+
+    /** Holds every mark-all-read write until [release] completes. */
+    private class GatedCore : MeronCore {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+
+        override suspend fun invoke(
+            command: String,
+            payloadJson: String,
+        ): String {
+            if (command == MobileCommand.MarkAllRead) {
+                started.complete(Unit)
+                release.await()
+            }
+            return """{"id":1,"result":{}}"""
+        }
+
+        override fun events(): CoreEventStream =
+            object : CoreEventStream {
+                override fun subscribe(listener: (CoreEvent) -> Unit): CloseableHandle = CloseableHandle {}
+            }
+
+        override suspend fun protocolVersion(): Int = 0
     }
 
     /** Fails the first [failCount] [failureCommand] calls, as an error payload or a throw. */
