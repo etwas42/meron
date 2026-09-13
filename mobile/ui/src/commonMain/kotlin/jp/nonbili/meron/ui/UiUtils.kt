@@ -490,3 +490,9 @@ internal fun FilterModeSegmentedControl(
         }
     }
 }
+
+// Unified starred contains starred cards only, including after optimistic flag changes.
+internal fun List<ThreadSummary>.forStarredView(
+    accountId: String,
+    folderId: String,
+): List<ThreadSummary> = if (accountId == UNIFIED_ACCOUNT_ID && isUnifiedStarredFolder(folderId)) filter { it.starred } else this

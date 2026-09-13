@@ -9,6 +9,7 @@ import {
   bulkArchiveSelected,
   bulkDeleteSelected,
   bulkMarkSelectedUnread,
+  bulkStarSelected,
   copyThreadToFolder,
   deleteThread,
   discardSavedDraftCopy,
@@ -21,6 +22,8 @@ import {
   markMessagesRead,
   mergeRefreshedThreadMessages,
   requestThreadReselect,
+  starThread,
+  toggleStarWithUndo,
   threadListViewKey,
   moveThreadToFolder,
 } from './mail'
@@ -1767,6 +1770,194 @@ describe('thread list view identity', () => {
     ui$.query.set('')
     ui$.filterMode.set('all')
     mail$.threadsLoadedKey.set('')
+  })
+
+  it('replaces a starred conversation when its representative folder changes', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    ui$.filterMode.set('starred')
+    const old = thread({ starred: false })
+    const replacement = thread({
+      id: 'archive:1',
+      thread_id: 'acc:archive:thread:1',
+      folder_id: 'archive',
+      starred: true,
+    })
+    ui$.selectedThread.set(old.thread_id)
+    mail$.threads.set([old])
+    ;(window as any).go.main.App.Invoke = async () => ({ items: [replacement] })
+
+    await loadThreads(false)
+
+    expect(mail$.threads.get()).toEqual([replacement])
+  })
+
+  it('keeps the selected starred conversation after opening clears unread', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    ui$.filterMode.set('unread')
+    const row = thread({ thread_id: 'acc#INBOX#t.cm9vdA', starred: true, unread: false })
+    ui$.selectedThread.set(row.thread_id)
+    mail$.threads.set([row])
+    ;(window as any).go.main.App.Invoke = async () => ({ items: [] })
+    await loadThreads(false)
+    expect(mail$.threads.get()).toEqual([row])
+  })
+
+  it('does not retain the selected copy when another folder represents its conversation', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    ui$.filterMode.set('unread')
+    const row = thread({ thread_id: 'acc#INBOX#t.cm9vdA', starred: true })
+    const replacement = thread({
+      id: 'copy',
+      thread_id: 'acc#Archive#t.cm9vdA',
+      folder_id: 'Archive',
+      starred: true,
+      unread: true,
+    })
+    ui$.selectedThread.set(row.thread_id)
+    mail$.threads.set([row])
+    ;(window as any).go.main.App.Invoke = async () => ({ items: [replacement] })
+    await loadThreads(false)
+    expect(mail$.threads.get()).toEqual([replacement])
+  })
+
+  it('keeps selected UID-based conversations distinct across folders', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    ui$.filterMode.set('unread')
+    const row = thread({ thread_id: 'acc#INBOX#1', starred: true })
+    const other = thread({ id: 'other', thread_id: 'acc#Archive#1', folder_id: 'Archive', starred: true })
+    ui$.selectedThread.set(row.thread_id)
+    mail$.threads.set([row])
+    ;(window as any).go.main.App.Invoke = async () => ({ items: [other] })
+    await loadThreads(false)
+    expect(mail$.threads.get()).toEqual([other, row])
+  })
+
+  it('restores a failed unstar without reverting a concurrent successful action', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    const row = thread({ starred: true })
+    const other = thread({ id: 'other', thread_id: 'other', starred: true })
+    mail$.threads.set([row, other])
+    mail$.messages.set([row, other])
+    kanban$.threads.set({ test: [row, other] })
+    let reject!: (error: Error) => void
+    ;(window as any).go.main.App.Invoke = async (_command: string, payload: any) => {
+      if (payload.thread_id === row.thread_id)
+        await new Promise((_resolve, fail) => {
+          reject = fail
+        })
+      return { ok: true }
+    }
+    const failed = starThread(row.thread_id, false, { refresh: false })
+    await starThread(other.thread_id, false, { refresh: false })
+    reject(new Error('Unstar rejected'))
+    expect(await failed).toBe(false)
+    expect(ui$.toastTone.get()).toBe('error')
+    expect(ui$.toast.get()).toBe('Unstar rejected')
+    expect(mail$.threads.get()).toEqual([row])
+    expect(mail$.messages.get()).toEqual([row, { ...other, starred: false }])
+    expect(kanban$.threads.get().test).toEqual([row, { ...other, starred: false }])
+  })
+
+  it('refreshes bulk star once after every mutation settles, including failures', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    const rows = [thread({ starred: true }), thread({ id: 'other', thread_id: 'other', starred: true })]
+    mail$.threads.set(rows)
+    for (const row of rows) toggleBulkSelection(bulkItem(row))
+    let finish!: () => void
+    const calls: string[] = []
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      calls.push(command)
+      if (command === 'mail.starredItems') return { items: [rows[0]] }
+      if (payload.thread_id === rows[0].thread_id) throw new Error('Unstar rejected')
+      await new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      return { ok: true }
+    }
+    const result = bulkStarSelected(
+      rows.map((row) => bulkItem(row)),
+      false,
+    )
+    await nextTick()
+    expect(calls.filter((command) => command === 'mail.starredItems')).toHaveLength(0)
+    finish()
+    await result
+    expect(ui$.toastTone.get()).toBe('error')
+    expect(ui$.toast.get()).toBe('Unstar rejected')
+    expect(ui$.bulkSelection.get()).toEqual({})
+    expect(calls.filter((command) => command === 'mail.starredItems')).toHaveLength(1)
+    expect(mail$.threads.get()).toEqual([rows[0]])
+  })
+
+  it('shows an error instead of an undo toast when the star shortcut fails', async () => {
+    const row = thread()
+    mail$.threads.set([row])
+    ;(window as any).go.main.App.Invoke = async () => {
+      throw new Error('Star rejected')
+    }
+    toggleStarWithUndo(row.thread_id)
+    await nextTick()
+    expect(mail$.threads.get()).toEqual([row])
+    expect(ui$.toastTone.get()).toBe('error')
+    expect(ui$.toast.get()).toBe('Star rejected')
+    expect(ui$.toastUndo.peek()).toBeNull()
+  })
+
+  it('refreshes every loaded starred row and uses the fresh cursor', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    const rows = Array.from({ length: 75 }, (_, i) => thread({ id: `m${i}`, thread_id: `t${i}`, starred: true }))
+    mail$.threads.set(rows)
+    mail$.threadsCursor.set('old-cursor')
+    const calls: any[] = []
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      calls.push({ command, payload })
+      return { items: rows.slice(1), next_cursor: 'new-cursor' }
+    }
+
+    await loadThreads(false)
+
+    expect(calls).toEqual([{ command: 'mail.starredItems', payload: { query: '', filter: 'all', limit: 75 } }])
+    expect(mail$.threads.get()).toEqual(rows.slice(1))
+    expect(mail$.threadsCursor.get()).toBe('new-cursor')
+  })
+
+  it('removes an unstarred thread immediately and restores it on undo', async () => {
+    ui$.selectedAccount.set('unified')
+    ui$.selectedFolder.set('starred')
+    const row = thread({ starred: true })
+    mail$.threads.set([row])
+    mail$.messages.set([row])
+    let storedStar = true
+    let finishMutation!: () => void
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      if (command === 'mail.markStarred') {
+        await new Promise<void>((resolve) => {
+          finishMutation = resolve
+        })
+        storedStar = payload.starred
+        return { ok: true }
+      }
+      return { items: storedStar ? [row] : [] }
+    }
+
+    const unstar = starThread(row.thread_id, false)
+    expect(mail$.threads.get()).toEqual([])
+    expect(mail$.messages.get()[0].starred).toBe(false)
+    finishMutation()
+    await unstar
+    expect(mail$.threads.get()).toEqual([])
+
+    const undo = starThread(row.thread_id, true)
+    finishMutation()
+    await undo
+    expect(mail$.threads.get()).toEqual([row])
   })
 
   it('does not call a folder loaded until its load lands', async () => {

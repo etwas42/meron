@@ -7,6 +7,7 @@ import jp.nonbili.meron.shared.CoreEventStream
 import jp.nonbili.meron.shared.MeronCore
 import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.MobileCommand
+import jp.nonbili.meron.shared.ThreadSummary
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
@@ -101,6 +102,97 @@ class MailboxReloadDeferralTest {
             assertEquals(1, core.threadListCalls)
         }
 
+    @Test
+    fun unstarRemovesOnlyStarredViewRowsAndRollsBackOnFailure() =
+        runBlocking {
+            val core = GatedCore()
+            val state = state(core, this)
+            val row = ThreadSummary(id = "a#INBOX#root", accountId = "a", folder = "INBOX", subject = "Release", sender = "Sender", starred = true)
+            state.selectedCoreAccountId = UNIFIED_ACCOUNT_ID
+            state.selectedCoreFolder = STARRED_FOLDER
+            state.coreThreads = listOf(row)
+            val starredKey = "$UNIFIED_ACCOUNT_ID\n$STARRED_FOLDER"
+            val inboxKey = "a\nINBOX"
+            state.kanbanColumns = mapOf(starredKey to KanbanColumnState(threads = listOf(row)), inboxKey to KanbanColumnState(threads = listOf(row)))
+            core.starFailure = true
+
+            state.toggleStar(row)
+
+            assertEquals(emptyList(), state.coreThreads)
+            assertEquals(emptyList(), state.kanbanColumns[starredKey]?.threads)
+            assertEquals(listOf(row.copy(starred = false)), state.kanbanColumns[inboxKey]?.threads)
+            waitUntil { state.status.startsWith("Unstar failed") }
+            assertEquals(listOf(row), state.coreThreads)
+            assertEquals(listOf(row), state.kanbanColumns[starredKey]?.threads)
+            assertEquals(listOf(row), state.kanbanColumns[inboxKey]?.threads)
+        }
+
+    @Test
+    fun unstarReloadsUnifiedStarredAfterCommit() =
+        runBlocking {
+            val core = GatedCore()
+            val state = state(core, this)
+            val row = ThreadSummary(id = "a#INBOX#root", accountId = "a", folder = "INBOX", subject = "Release", sender = "Sender", starred = true)
+            state.selectedCoreAccountId = UNIFIED_ACCOUNT_ID
+            state.selectedCoreFolder = STARRED_FOLDER
+            state.coreThreads = listOf(row)
+
+            state.toggleStar(row)
+            assertEquals(emptyList(), state.coreThreads)
+            waitUntil { core.starredListCalls == 1 && !state.syncing }
+            assertEquals(emptyList(), state.coreThreads)
+        }
+
+    @Test
+    fun unstarLastMessageRemovesRowAndRestoresItOnFailure() =
+        runBlocking {
+            val core = GatedCore().apply { starFailure = true }
+            val state = state(core, this)
+            val row = ThreadSummary(id = "a#INBOX#root", accountId = "a", folder = "INBOX", subject = "Release", sender = "Sender", starred = true)
+            val message = MessageBody(id = "a#INBOX#1", folderId = "INBOX", from = "Sender", to = "Me", subject = "Release", body = "", starred = true)
+            state.selectedCoreAccountId = UNIFIED_ACCOUNT_ID
+            state.selectedCoreFolder = STARRED_FOLDER
+            state.coreThreads = listOf(row)
+            state.selectedCoreThread = row
+            state.messages = listOf(message)
+
+            state.toggleMessageStarred(message)
+
+            assertEquals(emptyList(), state.coreThreads)
+            assertEquals(false, state.messages.single().starred)
+            assertEquals(false, state.selectedCoreThread?.starred)
+            waitUntil { state.status.startsWith("Star failed") }
+            assertEquals(listOf(row), state.coreThreads)
+            assertEquals(listOf(message), state.messages)
+            assertEquals(row, state.selectedCoreThread)
+        }
+
+    @Test
+    fun starInInboxKeepsOtherMailboxCachesAndDoesNotReload() =
+        runBlocking {
+            val core = GatedCore().apply { gate.complete(Unit) }
+            val state = state(core, this)
+            val row = ThreadSummary(id = "a#INBOX#root", accountId = "a", folder = "INBOX", subject = "Release", sender = "Sender", starred = true)
+            val message = MessageBody(id = "a#INBOX#1", folderId = "INBOX", from = "Sender", to = "Me", subject = "Release", body = "", starred = true)
+            val cached = mapOf(mailboxCacheKey("a", "Archive", "", FilterMode.All) to MailboxLoadResult(folders = emptyList(), folder = "Archive", threads = listOf(row)))
+            state.mailboxCache = cached
+            state.coreThreads = listOf(row)
+            state.selectedCoreThread = row
+            state.messages = listOf(message)
+
+            state.toggleStar(row)
+            waitUntil { state.status == "Unstar complete" }
+            assertEquals(cached, state.mailboxCache)
+            assertEquals(0, core.threadListCalls)
+            assertEquals(0, core.starredListCalls)
+
+            state.toggleMessageStarred(message)
+            waitUntil { state.status == "Unstarred" }
+            assertEquals(cached, state.mailboxCache)
+            assertEquals(0, core.threadListCalls)
+            assertEquals(0, core.starredListCalls)
+        }
+
     private suspend fun waitUntil(condition: () -> Boolean) {
         withTimeout(5_000) {
             while (!condition()) delay(5)
@@ -147,12 +239,24 @@ class MailboxReloadDeferralTest {
         val gate = CompletableDeferred<Unit>()
         var threadListCalls = 0
         var liveSearchCalls = 0
+        var starredListCalls = 0
+        var starFailure = false
 
         override suspend fun invoke(
             command: String,
             payloadJson: String,
         ): String =
             when (command) {
+                MobileCommand.MarkStarred -> {
+                    if (starFailure) error("Star rejected")
+                    "{\"ok\":true}"
+                }
+
+                MobileCommand.StarredItems -> {
+                    starredListCalls += 1
+                    "{\"items\":[]}"
+                }
+
                 MobileCommand.FolderList -> {
                     """{"folders":[{"account_id":"a","name":"INBOX","role":"inbox"}]}"""
                 }

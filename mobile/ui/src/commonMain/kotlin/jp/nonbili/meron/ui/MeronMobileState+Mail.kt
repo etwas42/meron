@@ -1412,10 +1412,10 @@ internal fun MeronMobileState.runCoreThreadAction(
     // call fails. Snapshots taken here back the failure rollback.
     val threadsBefore = coreThreads
     val kanbanBefore = kanbanColumns
-    coreThreads = update(coreThreads)
+    coreThreads = update(coreThreads).forStarredView(selectedCoreAccountId, selectedCoreFolder)
     kanbanColumns =
-        kanbanColumns.mapValues { (_, state) ->
-            val nextThreads = update(state.threads)
+        kanbanColumns.mapValues { (key, state) ->
+            val nextThreads = update(state.threads).forStarredView(key.substringBefore("\n"), key.substringAfter("\n"))
             val unreadDelta = loadedUnreadCount(nextThreads) - loadedUnreadCount(state.threads)
             state.copy(
                 threads = nextThreads,
@@ -1535,6 +1535,12 @@ private fun undoSourceThreadId(
     return "${thread.accountId}#${location.folder}#$threadKey"
 }
 
+private fun MeronMobileState.refreshUnifiedStarredAfterFlagChange() {
+    mailboxCache = mailboxCache.filterKeys { it.accountId != UNIFIED_ACCOUNT_ID || !isUnifiedStarredFolder(it.folderId) }
+    if (selectedCoreAccountId != UNIFIED_ACCOUNT_ID || !isUnifiedStarredFolder(selectedCoreFolder)) return
+    syncCoreThreads(syncFirst = false)
+}
+
 internal fun MeronMobileState.toggleStar(thread: ThreadSummary) {
     val backendThreadId = thread.backendThreadId()
     val isRssThread = threadIdIsRss(backendThreadId)
@@ -1556,6 +1562,9 @@ internal fun MeronMobileState.toggleStar(thread: ThreadSummary) {
             }
         },
         update = { threads -> threads.map { if (it.id == thread.id) it.copy(starred = !thread.starred) else it } },
+        afterSuccess = {
+            refreshUnifiedStarredAfterFlagChange()
+        },
     )
 }
 
@@ -1747,35 +1756,44 @@ internal fun MeronMobileState.toggleMessageStarred(message: MessageBody) {
     val thread = selectedCoreThread ?: return
     val backendThreadId = thread.backendThreadId()
     val starred = !message.starred
+    val messagesBefore = messages
+    val threadsBefore = coreThreads
+    val kanbanBefore = kanbanColumns
+    val selectedBefore = selectedCoreThread
+    updateMessageEverywhere(message.id) { it.copy(starred = starred) }
+    updateThreadEverywhere(thread) { it.copy(starred = messages.any { message -> message.starred }) }
     status = if (starred) "Starring..." else "Unstarring..."
     scope.launch {
         runCatching {
-            withContext(ioDispatcher) {
-                val client = MobileMailCommandClient(core)
-                if (threadIdIsRss(backendThreadId)) {
-                    client.markRssStarred(
-                        RssMarkStarredParams(threadId = backendThreadId, starred = starred, itemKeys = listOf(message.id)),
-                    )
-                } else {
-                    withManagedGoogleAuth(client, thread.accountId) {
-                        client.markStarred(
-                            MarkStarredParams(
-                                threadId = backendThreadId,
-                                starred = starred,
-                                messageIds = listOf(message.id),
-                                folderId = message.folderId,
-                            ),
+            requireCoreOk(
+                withContext(ioDispatcher) {
+                    val client = MobileMailCommandClient(core)
+                    if (threadIdIsRss(backendThreadId)) {
+                        client.markRssStarred(
+                            RssMarkStarredParams(threadId = backendThreadId, starred = starred, itemKeys = listOf(message.id)),
                         )
+                    } else {
+                        withManagedGoogleAuth(client, thread.accountId) {
+                            client.markStarred(
+                                MarkStarredParams(
+                                    threadId = backendThreadId,
+                                    starred = starred,
+                                    messageIds = listOf(message.id),
+                                    folderId = message.folderId,
+                                ),
+                            )
+                        }
                     }
-                }
-            }
+                },
+            )
         }.onSuccess {
-            updateMessageEverywhere(message.id) { it.copy(starred = starred) }
-            val updatedStarred = messages.any { it.starred }
-            updateThreadEverywhere(thread) { it.copy(starred = updatedStarred) }
-            selectedCoreThread = selectedCoreThread?.copy(starred = updatedStarred)
+            refreshUnifiedStarredAfterFlagChange()
             status = if (starred) "Starred" else "Unstarred"
         }.onFailure {
+            messages = messagesBefore
+            coreThreads = threadsBefore
+            kanbanColumns = kanbanBefore
+            selectedCoreThread = selectedBefore
             status = "Star failed: ${it.message}"
         }
     }

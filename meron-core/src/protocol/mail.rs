@@ -1565,49 +1565,32 @@ pub(crate) fn mark_mobile_thread_starred(data_dir: &str, params: &Value) -> Resu
     let engine = crate::ffi::engine_for(data_dir)?;
     with_mobile_db(data_dir, |conn| {
         let uids = requested_mobile_uids(&conn, &parsed, params)?;
-        if !uids.is_empty() {
+        let key = parsed
+            .subject_filter
+            .as_deref()
+            .map(|subject| store::branch_compound_key(&parsed.thread_key, subject))
+            .unwrap_or_else(|| parsed.thread_key.clone());
+        let message_scoped = has_requested_mobile_message_ids(params) || parsed.uid.is_some();
+        let targets = store::starred_mutation_targets(
+            &conn,
+            &parsed.account,
+            &parsed.folder,
+            (!message_scoped).then_some(key.as_str()),
+            &uids,
+            starred,
+        )
+        .map_err(|err| err.to_string())?;
+        if !targets.is_empty() {
             let creds = load_mobile_account_creds(&conn, &parsed.account)?;
             if account_needs_reconnect(&creds) {
                 return Err(format!("account needs reconnect: {}", parsed.account));
             }
-            let folder = parsed.folder.clone();
-            let server_uids = uids.clone();
-            crate::ffi::engine_block_on(engine.with_preflighted_write_session(
+            crate::ffi::engine_block_on(crate::engine::mark_starred_copies(
+                &engine,
                 &parsed.account,
-                move |session| {
-                    let folder = folder.clone();
-                    Box::pin(async move { imap::prepare_flag_update(session, &folder).await })
-                },
-                move |session| {
-                    let uids = server_uids.clone();
-                    Box::pin(async move {
-                        imap::store_starred(session, &uids, starred).await?;
-                        anyhow::Ok(())
-                    })
-                },
-            ))?;
-        }
-        if has_requested_mobile_message_ids(params) || parsed.subject_filter.is_some() {
-            // Explicit message ids, or a subject-branched card: `uids` is
-            // already scoped to exactly the acted-on messages. The
-            // whole-thread update below would star sibling branches sharing
-            // the root thread_key.
-            for uid in uids {
-                store::update_message_starred(&conn, &parsed.account, &parsed.folder, uid, starred)
-                    .map_err(|err| err.to_string())?;
-            }
-        } else if let Some(uid) = parsed.uid {
-            store::update_message_starred(&conn, &parsed.account, &parsed.folder, uid, starred)
-                .map_err(|err| err.to_string())?;
-        } else {
-            store::update_thread_starred(
-                &conn,
-                &parsed.account,
-                &parsed.folder,
-                &parsed.thread_key,
+                &targets,
                 starred,
-            )
-            .map_err(|err| err.to_string())?;
+            ))?;
         }
         crate::mail_model::mutation_result(
             json!({ "ok": true }),

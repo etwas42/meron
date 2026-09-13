@@ -303,15 +303,15 @@ internal fun MeronMobileState.updateThreadEverywhere(
     val beforeUnread = if (thread.unread) thread.unreadCount.coerceAtLeast(1) else 0
     val afterUnread = if (next.unread) next.unreadCount.coerceAtLeast(1) else 0
     val unreadDelta = afterUnread - beforeUnread
-    coreThreads = coreThreads.map { if (it.id == thread.id) next else it }
+    coreThreads = coreThreads.map { if (it.id == thread.id) next else it }.forStarredView(selectedCoreAccountId, selectedCoreFolder)
     selectedCoreThread = selectedCoreThread?.let { if (it.id == thread.id) next else it }
     kanbanColumns =
-        kanbanColumns.mapValues { (_, state) ->
+        kanbanColumns.mapValues { (key, state) ->
             if (state.threads.none { it.id == thread.id }) {
                 state
             } else {
                 state.copy(
-                    threads = state.threads.map { if (it.id == thread.id) next else it },
+                    threads = state.threads.map { if (it.id == thread.id) next else it }.forStarredView(key.substringBefore("\n"), key.substringAfter("\n")),
                     unreadCount = state.unreadCount?.let { (it + unreadDelta).coerceAtLeast(0) },
                 )
             }

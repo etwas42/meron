@@ -2404,8 +2404,8 @@ async fn dispatch(engine: &Arc<Engine>, req: &Request, out: &Writer) -> anyhow::
             let account = req_str(p, "account")?;
             let folder =
                 canon_folder(&req_str(p, "folder").unwrap_or_else(|_| "INBOX".to_string()));
-            let (thread_key, subject_filter) =
-                store::split_thread_key(&req_str(p, "thread_key").unwrap_or_default());
+            let full_key = req_str(p, "thread_key").unwrap_or_default();
+            let (thread_key, subject_filter) = store::split_thread_key(&full_key);
             let uid = p.get("uid").and_then(Value::as_u64).map(|n| n as u32);
             // Defaults to true (mark starred); pass starred:false to unstar.
             let starred = p.get("starred").and_then(Value::as_bool).unwrap_or(true);
@@ -2422,62 +2422,24 @@ async fn dispatch(engine: &Arc<Engine>, req: &Request, out: &Writer) -> anyhow::
                 })
                 .unwrap_or_default();
 
-            let uids = if !explicit_uids.is_empty() {
-                explicit_uids
-            } else if thread_key.is_empty() {
-                uid.into_iter().collect::<Vec<_>>()
-            } else {
-                // Only touch the thread's messages whose flag actually differs.
+            let targets = {
                 let db = engine.db.lock().unwrap();
-                store::get_thread_headers(&db, &account, &folder, &thread_key)?
-                    .into_iter()
-                    .filter(|header| header.starred != starred)
-                    .filter(|header| match subject_filter.as_deref() {
-                        Some(filter) => store::thread_grouping_subject(&header.subject) == filter,
-                        None => true,
-                    })
-                    .map(|header| header.uid)
-                    .collect::<Vec<_>>()
-            };
-
-            if !uids.is_empty() {
-                engine
-                    .with_preflighted_write_session(
-                        &account,
-                        |session| {
-                            let folder = folder.clone();
-                            Box::pin(
-                                async move { imap::prepare_flag_update(session, &folder).await },
-                            )
-                        },
-                        |session| {
-                            let uids = uids.clone();
-                            Box::pin(
-                                async move { imap::store_starred(session, &uids, starred).await },
-                            )
-                        },
-                    )
-                    .await?;
-            }
-
-            {
-                let db = engine.db.lock().unwrap();
-                if thread_key.is_empty() || subject_filter.is_some() {
-                    // Branch-scoped: a whole-thread update would star sibling
-                    // subject branches sharing the root thread_key.
-                    for marked_uid in &uids {
-                        store::update_message_starred(
-                            &db,
-                            &account,
-                            &folder,
-                            *marked_uid,
-                            starred,
-                        )?;
-                    }
+                let message_scoped = p.get("uids").is_some() || full_key.is_empty();
+                let uids = if p.get("uids").is_some() {
+                    explicit_uids
                 } else {
-                    store::update_thread_starred(&db, &account, &folder, &thread_key, starred)?;
-                }
-            }
+                    uid.into_iter().collect()
+                };
+                store::starred_mutation_targets(
+                    &db,
+                    &account,
+                    &folder,
+                    (!message_scoped).then_some(full_key.as_str()),
+                    &uids,
+                    starred,
+                )?
+            };
+            mark_starred_copies(&engine, &account, &targets, starred).await?;
             let changed_thread_id = if thread_key.is_empty() {
                 uid.map(|uid| format!("{account}#{folder}#{uid}"))
                     .unwrap_or_default()

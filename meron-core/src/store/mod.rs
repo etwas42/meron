@@ -2087,6 +2087,129 @@ pub fn update_message_seen(
     Ok(())
 }
 
+/// Resolve differing flags to physical mailbox copies. Unstar uses the same
+/// conversation identity as starred cards; star follows the source mailbox's
+/// messages and their duplicates. Message actions follow only those messages'
+/// copies. Never equate unrelated folder-local UIDs.
+pub fn starred_mutation_targets(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    thread_key: Option<&str>,
+    uids: &[u32],
+    starred: bool,
+) -> Result<BTreeMap<String, Vec<u32>>> {
+    let mut targets: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    if let Some(key) = thread_key {
+        let (root, subject) = split_thread_key(key);
+        let matches_branch = |header: &MessageHeader| {
+            header.uid != 0
+                && subject
+                    .as_deref()
+                    .is_none_or(|subject| thread_grouping_subject(&header.subject) == subject)
+        };
+        if starred {
+            // Star the source mailbox's messages and their physical duplicates,
+            // not other replies (e.g. Sent) merely sharing the conversation root.
+            let ids = get_thread_headers(conn, account, folder, &root)?
+                .into_iter()
+                .filter(matches_branch)
+                .map(|header| header.uid)
+                .collect::<Vec<_>>();
+            return starred_mutation_targets(conn, account, folder, None, &ids, starred);
+        }
+        // Unstar must clear the whole conversation admitted by unified Starred.
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT folder FROM messages WHERE account = ?1 AND uid <> 0
+             AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) = ?2
+             AND (?3 = 0 OR folder = ?4) AND starred <> ?5",
+        )?;
+        let folders = stmt
+            .query_map(
+                params![account, root, root.starts_with("uid:"), folder, starred],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for location in folders {
+            let ids = get_thread_headers(conn, account, &location, &root)?
+                .into_iter()
+                .filter(|header| matches_branch(header) && header.starred != starred)
+                .map(|header| header.uid)
+                .collect::<Vec<_>>();
+            if !ids.is_empty() {
+                targets.insert(location, ids);
+            }
+        }
+    } else if !uids.is_empty() {
+        // Fetch all originals with the mailbox/UID index, then scan candidate
+        // copies once per action instead of joining the entire account per UID.
+        let placeholders = uids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT uid, starred, CAST(json_extract(json, '$.gmail_msg_id') AS TEXT),
+                    lower(trim(COALESCE(json_extract(json, '$.message_id'), ''), ' <>'))
+             FROM messages WHERE account = ? AND folder = ? AND uid IN ({placeholders})"
+        ))?;
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&account, &folder];
+        args.extend(uids.iter().map(|uid| uid as &dyn rusqlite::ToSql));
+        let mut originals = HashSet::new();
+        let mut gmail_ids = HashSet::new();
+        let mut message_ids = HashSet::new();
+        for row in stmt.query_map(params_from_iter(args), |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })? {
+            let (uid, current, gmail_id, message_id) = row?;
+            originals.insert(uid);
+            if current != starred {
+                targets.entry(folder.to_string()).or_default().push(uid);
+            }
+            if let Some(id) = gmail_id {
+                gmail_ids.insert(id);
+            }
+            if !message_id.is_empty() {
+                message_ids.insert(message_id);
+            }
+        }
+        // Explicit UIDs can be actionable before their headers are cached.
+        targets
+            .entry(folder.to_string())
+            .or_default()
+            .extend(uids.iter().filter(|uid| !originals.contains(uid)).copied());
+        if !gmail_ids.is_empty() || !message_ids.is_empty() {
+            let mut copies = conn.prepare(
+                "SELECT folder, uid, CAST(json_extract(json, '$.gmail_msg_id') AS TEXT),
+                        lower(trim(COALESCE(json_extract(json, '$.message_id'), ''), ' <>'))
+                 FROM messages WHERE account = ?1 AND uid <> 0 AND starred <> ?2",
+            )?;
+            for row in copies.query_map(params![account, starred], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })? {
+                let (location, uid, gmail_id, message_id) = row?;
+                if gmail_id.is_some_and(|id| gmail_ids.contains(&id))
+                    || message_ids.contains(&message_id)
+                {
+                    targets.entry(location).or_default().push(uid);
+                }
+            }
+        }
+    }
+    targets.retain(|_, ids| {
+        ids.sort_unstable();
+        ids.dedup();
+        !ids.is_empty()
+    });
+    Ok(targets)
+}
+
 pub fn update_message_starred(
     conn: &Connection,
     account: &str,

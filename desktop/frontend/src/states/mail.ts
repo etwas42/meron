@@ -799,6 +799,14 @@ export function threadListViewKey(account: string, folder: string, query: string
   return [account, folder, query, filter].join('\n')
 }
 
+// Encoded t. keys include the subject branch and are stable across folders.
+// Numeric IMAP UIDs and RSS item ids remain tied to their original location.
+function starredConversationIdentity(thread: Message): string {
+  if (thread.thread_id.includes('#rss#')) return thread.thread_id
+  const key = thread.thread_id.slice(thread.thread_id.lastIndexOf('#') + 1)
+  return key.startsWith('t.') ? `${thread.account_id}#${key}` : thread.thread_id
+}
+
 export async function loadThreads(refresh = true, searchStage: ThreadSearchStage = 'auto') {
   // A Kanban card temporarily points selectedFolder at the card's real mailbox
   // so thread actions have the right context. The normal mail list is hidden,
@@ -907,7 +915,9 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   // scrolled the list and loaded extra pages, replacing the whole array with just
   // the first page collapses it and resets the scroll position. In that case we
   // merge the fresh page into the list we already have instead.
-  const mergeBackground = !refresh && searchStage !== 'cache' && previousThreads.length > 0
+  const backgroundRefresh = !refresh && searchStage !== 'cache' && previousThreads.length > 0
+  const unifiedStarred = isUnifiedStarred(selectedAcc, selectedFol)
+  const mergeBackground = backgroundRefresh && !unifiedStarred
 
   let allThreads: Message[] = []
 
@@ -919,7 +929,11 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
       const res = await invoke<{ items: Message[]; next_cursor?: string }>('mail.starredItems', {
         query: q,
         filter,
-        limit: 50,
+        // Re-fetch every loaded row: stars can disappear and the core can pick
+        // a different folder copy of the same conversation after a flag change.
+        // Keeping absent rows or merging by folder-specific thread_id duplicates it.
+        // Optimistically removed rows no longer count toward this loaded window.
+        limit: backgroundRefresh ? Math.max(50, previousThreads.length) : 50,
       })
       if (superseded()) return
       allThreads = res.items ?? []
@@ -996,7 +1010,12 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
 
   if (filter !== 'all' && currentSelected && !allThreads.some((thread) => thread.thread_id === currentSelected)) {
     const selectedThread = previousThreads.find((thread) => thread.thread_id === currentSelected)
-    if (selectedThread) {
+    const replacement =
+      selectedThread &&
+      allThreads.some((thread) => starredConversationIdentity(thread) === starredConversationIdentity(selectedThread))
+    // Keep the conversation while reading clears its unread flag, but never
+    // retain an unstarred row or duplicate a freshly chosen folder copy.
+    if (selectedThread && (!unifiedStarred || (filter === 'unread' && selectedThread.starred && !replacement))) {
       allThreads = [...allThreads, selectedThread]
       allThreads.sort((a, b) => b.date - a.date)
     }
@@ -1453,19 +1472,70 @@ export async function markThreadUnread(threadId: string) {
   refreshFoldersAfterFlagChange(findLocalThread(threadId)?.account_id)
 }
 
-export async function starThread(threadId: string, starred: boolean) {
+export async function starThread(threadId: string, starred: boolean, options: { refresh?: boolean } = {}) {
+  try {
+    await setThreadStar(threadId, starred, options)
+    return true
+  } catch (error) {
+    showStarError(error, starred)
+    return false
+  }
+}
+
+function showStarError(error: unknown, starred: boolean) {
+  showToast(error instanceof Error ? error.message : starred ? 'Star failed' : 'Unstar failed', 'error')
+}
+
+async function setThreadStar(threadId: string, starred: boolean, options: { refresh?: boolean } = {}) {
   if (!threadId) return
+
+  const previousThreads = mail$.threads.get()
+  const previousMessages = mail$.messages.get()
+  const previousKanban = captureKeys(kanban$.threads.get(), kanbanKeysWithThread(threadId))
+  const viewKey = () =>
+    threadListViewKey(ui$.selectedAccount.peek(), ui$.selectedFolder.peek(), ui$.query.peek(), ui$.filterMode.peek())
+  const previousView = viewKey()
+  // Restore only this action's stars, preserving concurrent changes to other
+  // threads (including successful actions in the same bulk operation).
+  const restore = (rows: Message[], before: Message[], missing = false) => {
+    const saved = before.filter((row) => row.thread_id === threadId)
+    const byId = new Map(saved.map((row) => [row.id, row]))
+    const restored = rows.map((row) => (byId.has(row.id) ? { ...row, starred: byId.get(row.id)!.starred } : row))
+    if (missing) {
+      for (const row of saved) {
+        if (!restored.some((item) => item.id === row.id))
+          restored.splice(Math.min(before.indexOf(row), restored.length), 0, row)
+      }
+    }
+    return restored
+  }
 
   // Optimistic update
   mail$.threads.set(
-    mail$.threads.get().map((thread) => (thread.thread_id === threadId ? { ...thread, starred } : thread)),
+    mail$.threads.get().flatMap((thread) => {
+      if (thread.thread_id !== threadId) return [thread]
+      if (!starred && isUnifiedStarred(ui$.selectedAccount.peek(), ui$.selectedFolder.peek())) return []
+      return [{ ...thread, starred }]
+    }),
   )
   mail$.messages.set(
     mail$.messages.get().map((message) => (message.thread_id === threadId ? { ...message, starred } : message)),
   )
   updateKanbanThread(threadId, (thread) => ({ ...thread, starred }))
 
-  applyMutationFolderUnreads(await invoke<MutationResult>('mail.markStarred', { thread_id: threadId, starred }))
+  try {
+    applyMutationFolderUnreads(await invoke<MutationResult>('mail.markStarred', { thread_id: threadId, starred }))
+  } catch (error) {
+    if (viewKey() === previousView) mail$.threads.set(restore(mail$.threads.get(), previousThreads, true))
+    mail$.messages.set(restore(mail$.messages.get(), previousMessages))
+    for (const [key, rows] of previousKanban) {
+      if (rows && kanban$.threads[key].peek()) kanban$.threads[key].set(restore(kanban$.threads[key].get(), rows, true))
+    }
+    throw error
+  }
+  if (options.refresh !== false && isUnifiedStarred(ui$.selectedAccount.peek(), ui$.selectedFolder.peek())) {
+    await loadThreads(false)
+  }
 }
 
 // Flip a thread's star and show an undo toast — used by the keyboard shortcut,
@@ -1475,8 +1545,9 @@ export function toggleStarWithUndo(threadId: string) {
   const thread = findLocalThread(threadId)
   if (!thread) return
   const next = !thread.starred
-  void starThread(threadId, next)
-  showUndoToast(next ? 'Starred' : 'Unstarred', () => void starThread(threadId, !next))
+  void starThread(threadId, next).then((success) => {
+    if (success) showUndoToast(next ? 'Starred' : 'Unstarred', () => void starThread(threadId, !next))
+  })
 }
 
 // Mark a thread unread and show an undo toast (revert = mark read again).
@@ -1643,9 +1714,20 @@ export async function bulkMarkSelectedUnread(items: BulkSelectionItem[]) {
 
 export async function bulkStarSelected(items: BulkSelectionItem[], starred: boolean) {
   const targets = uniqueThreadItems(items)
-  await Promise.all(targets.map((item) => starThread(item.threadId, starred)))
-  clearBulkSelection()
-  showToast(starred ? t('mail.toast.starredSelected') : t('mail.toast.unstarredSelected'))
+  if (targets.length === 0) return
+  try {
+    const results = await Promise.allSettled(
+      targets.map((item) => setThreadStar(item.threadId, starred, { refresh: false })),
+    )
+    if (isUnifiedStarred(ui$.selectedAccount.peek(), ui$.selectedFolder.peek())) await loadThreads(false)
+    const failure = results.find((result) => result.status === 'rejected')
+    if (failure?.status === 'rejected') throw failure.reason
+    showToast(starred ? t('mail.toast.starredSelected') : t('mail.toast.unstarredSelected'))
+  } catch (error) {
+    showStarError(error, starred)
+  } finally {
+    clearBulkSelection()
+  }
 }
 
 export async function bulkArchiveSelected(items: BulkSelectionItem[]) {

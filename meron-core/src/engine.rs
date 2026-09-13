@@ -746,6 +746,36 @@ pub async fn sync_folders(
     Ok(folders)
 }
 
+/// Update every physical copy selected by a star action. Commit each mailbox to
+/// the cache only after its server write succeeds, including on partial failure.
+pub async fn mark_starred_copies(
+    engine: &Engine,
+    account: &str,
+    targets: &std::collections::BTreeMap<String, Vec<u32>>,
+    starred: bool,
+) -> anyhow::Result<()> {
+    for (folder, uids) in targets {
+        engine
+            .with_preflighted_write_session(
+                account,
+                |session| {
+                    let folder = folder.clone();
+                    Box::pin(async move { imap::prepare_flag_update(session, &folder).await })
+                },
+                |session| {
+                    let uids = uids.clone();
+                    Box::pin(async move { imap::store_starred(session, &uids, starred).await })
+                },
+            )
+            .await?;
+        let db = engine.db.lock().unwrap();
+        for uid in uids {
+            store::update_message_starred(&db, account, folder, *uid, starred)?;
+        }
+    }
+    Ok(())
+}
+
 /// Delete messages on the server. Returns `None` for a permanent expunge
 /// (Drafts, or items already in Trash), or `Some(trash)` when moved to Trash.
 pub async fn delete_to_trash(
