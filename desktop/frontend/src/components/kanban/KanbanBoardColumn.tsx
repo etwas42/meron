@@ -7,7 +7,8 @@ import { Loader2, Minus, Pause, Rss } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { clsx } from '../../lib/utils'
 import { accounts$ } from '../../states/accounts'
-import { deletableFolder, deleteFolder, emptiableFolder, emptyFolder, isDraftFolder, mail$ } from '../../states/mail'
+import { mail$ } from '../../states/mail'
+import { deletableFolder, deleteFolder, emptiableFolder, emptyFolder, isDraftFolder } from '../../states/mailFolders'
 import {
   clearBulkSelection,
   isWailsDesktopRuntime,

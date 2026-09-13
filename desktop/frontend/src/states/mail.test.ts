@@ -3,30 +3,32 @@ import type { Folder, Message } from '../types'
 import { accounts$ } from './accounts'
 import { kanban$ } from './kanban'
 import {
-  archiveThread,
-  deletableFolder,
-  deleteFolder,
-  bulkArchiveSelected,
-  bulkDeleteSelected,
-  bulkMarkSelectedUnread,
-  bulkStarSelected,
-  copyThreadToFolder,
-  deleteThread,
-  discardSavedDraftCopy,
-  ensureAccountFolders,
   loadMoreThreads,
   loadThread,
   loadThreads,
   mail$,
-  markAllRead,
-  markMessagesRead,
   mergeRefreshedThreadMessages,
   requestThreadReselect,
+  threadListViewKey,
+} from './mail'
+import {
+  bulkMarkSelectedUnread,
+  bulkStarSelected,
+  markAllRead,
+  markMessagesRead,
   starThread,
   toggleStarWithUndo,
-  threadListViewKey,
+} from './mailFlags'
+import { deletableFolder, deleteFolder, ensureAccountFolders } from './mailFolders'
+import {
+  archiveThread,
+  bulkArchiveSelected,
+  bulkDeleteSelected,
+  copyThreadToFolder,
+  deleteThread,
+  discardSavedDraftCopy,
   moveThreadToFolder,
-} from './mail'
+} from './mailMoves'
 import { settings$ } from './settings'
 import { runToastUndo, settleConfirm, toggleBulkSelection, ui$, type BulkSelectionItem } from './ui'
 

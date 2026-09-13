@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
+import { compose$ } from '../../states/composeState'
 import {
   cancelQuickReplyDraftSave,
   clearQuickReplyDraftOwnership,
-  compose$,
   discardQuickReplyDraftIfEmpty,
   isQuickReplyBlank,
   quickReplyCaretOffset,
@@ -12,8 +12,8 @@ import {
   saveQuickReplyDraft,
   scheduleQuickReplyDraftSave,
   seedQuickReplySignature,
-  sendReply,
-} from '../../states/compose'
+} from '../../states/quickReply'
+import { sendReply } from '../../states/quickReplySend'
 import { showToast, ui$ } from '../../states/ui'
 import { settings$, isSendKey } from '../../states/settings'
 import type { ComposerAttachment } from '../../types'

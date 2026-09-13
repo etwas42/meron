@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test'
 import { certTrust$, dismissCertificatePrompt, trustPromptedCertificate } from './certificateTrust'
-import { retrySend } from './compose'
+import { retrySend } from './quickReplySend'
 import { setPendingSend, getPendingSend, type PendingSend } from './pendingSends'
 import { accounts$ } from './accounts'
 import { mail$ } from './mail'

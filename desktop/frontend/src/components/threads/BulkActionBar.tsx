@@ -18,17 +18,15 @@ import { clsx } from '../../lib/utils'
 import type { BulkSelectionItem } from '../../states/ui'
 import { clearBulkSelection, setBulkSelection } from '../../states/ui'
 import { accounts$, isSendableAccount } from '../../states/accounts'
+import { mail$ } from '../../states/mail'
+import { bulkMarkSelectedRead, bulkMarkSelectedUnread, bulkStarSelected } from '../../states/mailFlags'
+import { ensureAccountFolders } from '../../states/mailFolders'
 import {
   bulkArchiveSelected,
   bulkCopySelectedToFolder,
   bulkDeleteSelected,
-  bulkMarkSelectedRead,
-  bulkMarkSelectedUnread,
   bulkMoveSelectedToFolder,
-  bulkStarSelected,
-  ensureAccountFolders,
-  mail$,
-} from '../../states/mail'
+} from '../../states/mailMoves'
 import { IconButton } from '../button/IconButton'
 import { FloatingContextMenu } from '../menu/FloatingContextMenu'
 import { FolderMenuTree } from '../menu/FolderMenuTree'

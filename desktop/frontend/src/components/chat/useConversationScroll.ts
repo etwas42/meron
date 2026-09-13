@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import { useValue } from '@legendapp/state/react'
-import { markMessagesRead } from '../../states/mail'
+import { markMessagesRead } from '../../states/mailFlags'
 import { thread$ } from '../../states/thread'
 import type { Message } from '../../types'
 import {

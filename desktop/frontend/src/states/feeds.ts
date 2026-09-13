@@ -4,7 +4,8 @@ import { isRssAccount } from '../lib/threadActions'
 import { boot } from '../boot'
 import type { Account } from '../types'
 import { ui$, showToast } from './ui'
-import { loadThreads, loadFolders } from './mail'
+import { loadThreads } from './mail'
+import { loadFolders } from './mailFolders'
 
 // RSS/feed management. RSS accounts hold feeds; each feed surfaces as a thread.
 // These drive the add-feed / edit-feed dialogs and OPML import/export.

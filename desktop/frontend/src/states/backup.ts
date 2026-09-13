@@ -1,7 +1,8 @@
 import { invoke } from '../lib/bridge'
 import { boot } from '../boot'
 import { ui$ } from './ui'
-import { loadThreads, loadFolders } from './mail'
+import { loadThreads } from './mail'
+import { loadFolders } from './mailFolders'
 
 // Backup / restore of the app's configuration: accounts and their connection
 // settings, per-account prefs, RSS subscriptions and the settings table. Cached

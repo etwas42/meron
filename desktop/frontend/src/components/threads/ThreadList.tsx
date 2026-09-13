@@ -4,13 +4,8 @@ import { Search, X, Plus, SquarePen, MoreHorizontal, Loader2 } from 'lucide-reac
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { openAddFeed, RSS_FEED_DRAG_TYPE } from '../../states/feeds'
-import {
-  openComposeTab,
-  openThreadTab,
-  openMessageTab,
-  openDraftConversationOrCompose,
-  compose$,
-} from '../../states/compose'
+import { openComposeTab, openThreadTab, openMessageTab, openDraftConversationOrCompose } from '../../states/compose'
+import { compose$ } from '../../states/composeState'
 import { accounts$, isSendableAccount } from '../../states/accounts'
 import {
   clearBulkSelection,
@@ -22,21 +17,16 @@ import {
   type BulkSelectionItem,
 } from '../../states/ui'
 import { thread$ } from '../../states/thread'
+import { mail$, getFilteredThreads, syncMail, loadMoreThreads, loadThreads, threadListViewKey } from '../../states/mail'
+import { markAllRead } from '../../states/mailFlags'
 import {
-  mail$,
-  getFilteredThreads,
-  syncMail,
-  markAllRead,
-  loadMoreThreads,
   isDraftFolder,
   folderUnread,
   emptiableFolder,
   emptyFolder,
   deletableFolder,
   deleteFolder,
-  loadThreads,
-  threadListViewKey,
-} from '../../states/mail'
+} from '../../states/mailFolders'
 import { clsx } from '../../lib/utils'
 import { isRssAccount } from '../../lib/threadActions'
 import { folderLabel } from '../../lib/kanbanData'

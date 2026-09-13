@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import { accounts$ } from './accounts'
 import { kanban$ } from './kanban'
-import { mail$, markAccountInboxRead } from './mail'
+import { mail$ } from './mail'
+import { markAccountInboxRead } from './mailFlags'
 import { ui$ } from './ui'
 
 const message = (overrides: Partial<Message> = {}): Message => ({

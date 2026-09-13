@@ -7,18 +7,17 @@ import { confirmAction, showToast } from '../../states/ui'
 import { settings$ } from '../../states/settings'
 import type { ComposeDraft, ComposerAttachment } from '../../types'
 import {
-  compose$,
-  newDraftMessageId,
   sendComposed,
   appendSentMessage,
   saveComposedDraft,
   updateComposeDraft,
   finishClosingMessageTab,
 } from '../../states/compose'
+import { compose$, newDraftMessageId } from '../../states/composeState'
 import { htmlToText } from '../../lib/html'
 import { invoke } from '../../lib/bridge'
 import { contextualErrorMessage } from '../../lib/errors'
-import { discardSavedDraftCopy } from '../../states/mail'
+import { discardSavedDraftCopy } from '../../states/mailMoves'
 import { pickFiles, pickImageFiles } from '../../lib/nativeFilePicker'
 import { getComposeSession, registerComposeSession } from '../../states/composeSessions'
 import { accounts$, isSendableAccount } from '../../states/accounts'

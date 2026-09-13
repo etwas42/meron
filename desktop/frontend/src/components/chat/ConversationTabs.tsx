@@ -1,7 +1,8 @@
 import { MessageSquare, SquarePen, X } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { compose$, closeMessageTab, activateConversationTab } from '../../states/compose'
+import { closeMessageTab, activateConversationTab } from '../../states/compose'
+import { compose$ } from '../../states/composeState'
 import { ui$ } from '../../states/ui'
 
 // The tab strip above the conversation: a fixed "Conversation" tab plus open

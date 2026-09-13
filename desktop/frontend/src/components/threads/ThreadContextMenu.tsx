@@ -18,19 +18,10 @@ import { moveFeed, openFeedEdit } from '../../states/feeds'
 import { FloatingContextMenu } from '../menu/FloatingContextMenu'
 import { FolderMenuTree } from '../menu/FolderMenuTree'
 import { MenuItem } from '../menu/MenuItem'
-import {
-  archiveThread,
-  copyThreadToFolder,
-  deleteThread,
-  ensureAccountFolders,
-  isDraftFolder,
-  isTrashFolderId,
-  mail$,
-  markThreadRead,
-  markThreadUnread,
-  moveThreadToFolder,
-  starThread,
-} from '../../states/mail'
+import { mail$ } from '../../states/mail'
+import { markThreadRead, markThreadUnread, starThread } from '../../states/mailFlags'
+import { ensureAccountFolders, isDraftFolder, isTrashFolderId } from '../../states/mailFolders'
+import { archiveThread, copyThreadToFolder, deleteThread, moveThreadToFolder } from '../../states/mailMoves'
 import { accounts$, isSendableAccount } from '../../states/accounts'
 import { isRssAccount } from '../../lib/threadActions'
 import type { Account, Message } from '../../types'

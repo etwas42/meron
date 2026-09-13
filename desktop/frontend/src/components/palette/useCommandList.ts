@@ -38,16 +38,11 @@ import {
   setGlobalKanbanFilter,
 } from '../../states/kanban'
 import { thread$ } from '../../states/thread'
-import {
-  mail$,
-  syncMail,
-  markAllRead,
-  archiveThread,
-  deleteThread,
-  toggleStarWithUndo,
-  markUnreadWithUndo,
-} from '../../states/mail'
-import { compose$, openComposeTab, openReplyInFullEditor, closeMessageTab } from '../../states/compose'
+import { mail$, syncMail } from '../../states/mail'
+import { markAllRead, toggleStarWithUndo, markUnreadWithUndo } from '../../states/mailFlags'
+import { archiveThread, deleteThread } from '../../states/mailMoves'
+import { openComposeTab, openReplyInFullEditor, closeMessageTab } from '../../states/compose'
+import { compose$ } from '../../states/composeState'
 import { RAIL_SHORTCUT_IDS, type ShortcutId } from '../../lib/shortcuts'
 import type { Command } from './paletteCommands'
 

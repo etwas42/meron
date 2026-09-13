@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { compose$ } from '../../states/compose'
+import { compose$ } from '../../states/composeState'
 import type { ComposerAttachment } from '../../types'
 import { AttachmentImagePreview } from '../composer/AttachmentImagePreview'
 import { PendingAttachmentList } from '../composer/PendingAttachmentList'

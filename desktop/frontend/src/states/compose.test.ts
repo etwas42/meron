@@ -2,13 +2,7 @@ import { beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import {
   activateConversationTab,
-  buildReplyRecipients,
-  ownAddressSet,
-  cancelQuickReplyDraftSave,
   closeMessageTab,
-  compose$,
-  discardQuickReplyDraftIfEmpty,
-  isQuickReplyBlank,
   draftShouldOpenConversation,
   openDraftCompose,
   openDraftConversationOrCompose,
@@ -19,25 +13,35 @@ import {
   openThreadTab,
   updateComposeDraft,
   openThreadTabById,
-  quickReplyCaretOffset,
+  replyAllToMessage,
+} from './compose'
+import {
+  buildReplyRecipients,
+  ownAddressSet,
   quickReplyFromState,
-  quickReplyDraftBelongsToThread,
   quickReplyRecipients,
   replyAllAddsRecipients,
-  replyAllToMessage,
   pickReplyTarget,
   resolveQuickReplyFrom,
-  retrySend,
+} from './composeReply'
+import { compose$ } from './composeState'
+import {
+  cancelQuickReplyDraftSave,
+  discardQuickReplyDraftIfEmpty,
+  isQuickReplyBlank,
+  quickReplyCaretOffset,
+  quickReplyDraftBelongsToThread,
   saveQuickReplyDraft,
   scheduleQuickReplyDraftSave,
   seedQuickReplySignature,
-  sendReply,
   withoutHydratedQuickReplyDraft,
-} from './compose'
+} from './quickReply'
+import { retrySend, sendReply } from './quickReplySend'
 import { accounts$ } from './accounts'
 import { settings$ } from './settings'
 import { ui$ } from './ui'
-import { deleteMessage, mail$ } from './mail'
+import { mail$ } from './mail'
+import { deleteMessage } from './mailMoves'
 import { resetThreadView, thread$ } from './thread'
 
 const message = (overrides: Partial<Message> = {}): Message => ({

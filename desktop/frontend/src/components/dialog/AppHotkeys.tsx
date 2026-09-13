@@ -19,19 +19,16 @@ import {
   closeKanbanPane,
 } from '../../states/kanban'
 import { openThreadSearch, thread$ } from '../../states/thread'
+import { syncMail, selectAdjacentThread } from '../../states/mail'
 import {
-  syncMail,
-  selectAdjacentThread,
-  archiveThread,
-  deleteThread,
   toggleStarWithUndo,
   markUnreadWithUndo,
-  bulkArchiveSelected,
-  bulkDeleteSelected,
   bulkMarkSelectedUnread,
   bulkStarSelected,
-} from '../../states/mail'
-import { compose$, openComposeTab, openReplyInFullEditor, closeMessageTab } from '../../states/compose'
+} from '../../states/mailFlags'
+import { archiveThread, deleteThread, bulkArchiveSelected, bulkDeleteSelected } from '../../states/mailMoves'
+import { openComposeTab, openReplyInFullEditor, closeMessageTab } from '../../states/compose'
+import { compose$ } from '../../states/composeState'
 import { handleEditUndoKeyDown } from '../../lib/editUndo'
 import {
   isBareShortcut,

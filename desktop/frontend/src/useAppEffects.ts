@@ -3,15 +3,8 @@ import { useValue } from '@legendapp/state/react'
 import { boot } from './boot'
 import { invoke } from './lib/bridge'
 import { ui$, showToast } from './states/ui'
-import {
-  mail$,
-  loadFolders,
-  loadThreads,
-  loadThread,
-  findLocalThread,
-  refreshAccountFoldersCache,
-  inboxUnread,
-} from './states/mail'
+import { mail$, loadThreads, loadThread, findLocalThread } from './states/mail'
+import { loadFolders, refreshAccountFoldersCache, inboxUnread } from './states/mailFolders'
 import { openMailtoCompose, openThreadTabById } from './states/compose'
 import { accounts$ } from './states/accounts'
 import { kanban$ } from './states/kanban'

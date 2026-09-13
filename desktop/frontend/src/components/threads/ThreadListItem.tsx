@@ -5,7 +5,7 @@ import { Avatar } from '../avatar/Avatar'
 import { formatThreadDate } from '../../lib/date'
 import { clsx } from '../../lib/utils'
 import { useTranslation } from '../../lib/i18n'
-import { isDraftFolder } from '../../states/mail'
+import { isDraftFolder } from '../../states/mailFolders'
 
 export function ThreadListItem({
   thread,

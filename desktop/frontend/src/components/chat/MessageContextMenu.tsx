@@ -18,10 +18,13 @@ import {
   editAsNewMessage,
   forwardMessage,
   openDraftCompose,
-  messageCanReplyAll,
   replyAllToMessage,
 } from '../../states/compose'
-import { deleteMessage, isDraftFolder, markMessageReadState, saveMessageAsEml, starMessage } from '../../states/mail'
+import { messageCanReplyAll } from '../../states/composeReply'
+import { saveMessageAsEml } from '../../states/mail'
+import { markMessageReadState, starMessage } from '../../states/mailFlags'
+import { isDraftFolder } from '../../states/mailFolders'
+import { deleteMessage } from '../../states/mailMoves'
 import { openExternal } from '../../lib/native'
 import { FloatingContextMenu } from '../menu/FloatingContextMenu'
 import { MenuItem } from '../menu/MenuItem'

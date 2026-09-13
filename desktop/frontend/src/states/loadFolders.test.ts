@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Folder } from '../types'
 // Initialize the account/boot dependency graph before importing mail directly.
 import './accounts'
-import { isDraftFolder, isInboxFolder, loadFolders, mail$ } from './mail'
+import { mail$ } from './mail'
+import { isDraftFolder, isInboxFolder, loadFolders } from './mailFolders'
 
 describe('loadFolders', () => {
   let previousGo: unknown

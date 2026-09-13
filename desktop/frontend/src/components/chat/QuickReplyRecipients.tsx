@@ -1,6 +1,7 @@
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { openReplyInFullEditor, quickReplyRecipients } from '../../states/compose'
+import { openReplyInFullEditor } from '../../states/compose'
+import { quickReplyRecipients } from '../../states/composeReply'
 import { parseAddressList, type AddressItem } from './messageHelpers'
 
 // How many names to spell out before collapsing the rest into "+N".

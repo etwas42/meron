@@ -1,6 +1,7 @@
 import { useValue } from '@legendapp/state/react'
 import { accountIdentities, accounts$ } from '../../states/accounts'
-import { getActiveThread, isDraftFolder } from '../../states/mail'
+import { getActiveThread } from '../../states/mail'
+import { isDraftFolder } from '../../states/mailFolders'
 import { settings$ } from '../../states/settings'
 import { thread$ } from '../../states/thread'
 import type { ConversationMode } from '../../states/thread'
