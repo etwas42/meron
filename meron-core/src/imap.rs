@@ -805,7 +805,7 @@ pub async fn delete_folders(session: &mut Session, names: &[String]) -> Result<V
 /// from its read buffer, so every later poll re-parses them and fails again.
 /// The only way forward is to drop the session and re-fetch a range that
 /// excludes the message — see `fetch_headers_isolating_unparseable` in
-/// `engine.rs`.
+/// `engine/sync.rs`.
 ///
 /// Detection is by message text because async-imap surfaces the failure as a
 /// plain `io::Error::other`, with no variant to match on. The substring is the

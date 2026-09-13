@@ -1,4 +1,11 @@
 use super::*;
+use rusqlite::OptionalExtension;
+use rusqlite::params;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+use crate::imap::Folder;
+use crate::parse::Message;
 
 fn test_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();

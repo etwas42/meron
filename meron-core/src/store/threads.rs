@@ -1,0 +1,762 @@
+//! Thread grouping: thread cards, root subjects, and reference gaps.
+
+use anyhow::Result;
+use rusqlite::{Connection, params, params_from_iter};
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+
+use crate::imap::MessageHeader;
+
+#[derive(Clone)]
+pub struct ThreadCard {
+    pub thread_key: String,
+    pub original_thread_key: Option<String>,
+    pub header: MessageHeader,
+    pub unread_count: u32,
+    /// Every message in the card's thread, read or not — the Gmail-style "3"
+    /// beside the sender. Counted per card, so a subject-branched thread counts
+    /// only its own branch.
+    pub message_count: u32,
+    pub has_draft: bool,
+}
+
+pub fn group_thread_cards(messages: Vec<MessageHeader>, default_folder: &str) -> Vec<ThreadCard> {
+    group_thread_cards_with_drafts(messages, default_folder, &HashSet::new())
+}
+
+pub fn group_thread_cards_with_drafts(
+    messages: Vec<MessageHeader>,
+    default_folder: &str,
+    draft_thread_keys: &HashSet<String>,
+) -> Vec<ThreadCard> {
+    use std::collections::HashMap;
+
+    struct RootSubject {
+        /// The card's title: the oldest message's subject verbatim. Reply
+        /// prefixes are stripped for grouping, never for display — when the
+        /// thread's own first message is not in the mailbox the oldest one here
+        /// is itself a reply, and dropping its `Re:` claims a thread start that
+        /// this folder does not hold.
+        display: String,
+        group: String,
+    }
+
+    // What one card collects. A real thread key is the same thread wherever its
+    // copies sit, but a `uid:` key names a message by (folder, uid) — the fallback
+    // for one with no threading headers — so on a page that spans folders (search
+    // covers the mailbox plus Sent) two unrelated messages that happen to share a
+    // UID carry the same key. Qualifying those with the folder keeps them apart.
+    let group_key = |message: &MessageHeader, key: &str| -> String {
+        if !key.starts_with("uid:") {
+            return key.to_string();
+        }
+        let folder = if message.folder.is_empty() {
+            default_folder
+        } else {
+            message.folder.as_str()
+        };
+        format!("{folder}\u{1}{key}")
+    };
+
+    let mut candidates: HashMap<String, Vec<RootCandidate>> = HashMap::new();
+    for message in &messages {
+        if message.uid == 0 {
+            continue;
+        }
+        let thread_key = group_key(message, &effective_thread_key(message));
+        let folder = if message.folder.is_empty() {
+            default_folder
+        } else {
+            message.folder.as_str()
+        };
+        candidates
+            .entry(thread_key)
+            .or_default()
+            .push(RootCandidate {
+                folder: folder.to_string(),
+                uid: message.uid,
+                date: message.date,
+                subject: message.subject.clone(),
+            });
+    }
+    let roots: HashMap<String, RootSubject> = candidates
+        .into_iter()
+        .filter_map(|(key, candidates)| {
+            let root = pick_root(candidates, default_folder)?;
+            Some((
+                key,
+                RootSubject {
+                    display: root.subject.trim().to_string(),
+                    group: thread_grouping_subject(&root.subject),
+                },
+            ))
+        })
+        .collect();
+
+    let mut groups: HashMap<String, ThreadCard> = HashMap::new();
+    let mut order = Vec::new();
+    // One message can reach a folder-spanning page twice: search reads the
+    // mailbox plus Sent, and a self-sent message is cached in both. The cached
+    // tally this page's is floored against folds those copies by Message-ID (see
+    // `card_message_counts`), so fold them here too, or the card claims a message
+    // more than the mailbox's own list gives it. A row with no Message-ID cannot
+    // be matched to a copy and counts on its own. The value is whether a copy has
+    // already been counted as unread.
+    let mut folded: HashMap<(String, String), bool> = HashMap::new();
+    for message in messages {
+        if message.uid == 0 {
+            continue;
+        }
+        let base_key = effective_thread_key(&message);
+        let branch = should_branch_thread_by_subject(&base_key);
+        let group_subject = if branch {
+            thread_grouping_subject(&message.subject)
+        } else {
+            String::new()
+        };
+        let compound_key = card_thread_key(&message);
+        let slot = group_key(&message, &compound_key);
+        let fold_key =
+            (!message.message_id.is_empty()).then(|| (slot.clone(), message.message_id.clone()));
+        let first_copy = fold_key
+            .as_ref()
+            .is_none_or(|key| !folded.contains_key(key));
+        // Copies can disagree on the read flag — the mailbox's copy unread, the
+        // Sent one not — and the message is unread if any of them is, whichever
+        // order the page happens to put them in.
+        let counts_unread = !message.seen
+            && fold_key
+                .as_ref()
+                .is_none_or(|key| !folded.get(key).copied().unwrap_or(false));
+        if let Some(key) = fold_key {
+            *folded.entry(key).or_insert(false) |= !message.seen;
+        }
+        let card = groups.entry(slot.clone()).or_insert_with(|| {
+            order.push(slot);
+            let root = roots.get(&group_key(&message, &base_key));
+            let mut header = message.clone();
+            if header.folder.is_empty() {
+                header.folder = default_folder.to_string();
+            }
+            header.thread_key = compound_key.clone();
+            let title = root.map(|root| root.display.as_str()).unwrap_or_default();
+            if !title.is_empty() {
+                header.subject = title.to_string();
+            }
+            let original_thread_key = if branch
+                && root
+                    .map(|root| root.group.as_str() != group_subject.as_str())
+                    .unwrap_or(false)
+            {
+                root.map(|root| branch_compound_key(&base_key, &root.group))
+            } else {
+                None
+            };
+            ThreadCard {
+                thread_key: compound_key.clone(),
+                original_thread_key,
+                header,
+                unread_count: 0,
+                message_count: 0,
+                has_draft: draft_thread_keys.contains(&base_key),
+            }
+        });
+        // A page can span folders — search covers the mailbox plus Sent — and the
+        // card above took its folder, and so its thread id, from whichever copy
+        // came first (newest). Sending a reply makes the Sent copy the newest one,
+        // which would mint a second id for the same thread: the list shows the
+        // card twice, and every id-keyed update (the draft badge a post-send
+        // discard clears, unread reconciliation) misses the row it means. The
+        // searched mailbox wins whenever it holds a copy of the thread, so the id
+        // is the one that mailbox's own list would give. Not for `uid:` keys:
+        // those name a single message by (folder, uid), so the folder cannot move
+        // without pointing at a different message.
+        if !base_key.starts_with("uid:")
+            && !card.header.folder.eq_ignore_ascii_case(default_folder)
+            && message.folder.eq_ignore_ascii_case(default_folder)
+        {
+            card.header.folder = message.folder.clone();
+        }
+        if first_copy {
+            card.message_count += 1;
+        }
+        if counts_unread {
+            card.unread_count += 1;
+        }
+        if !message.seen {
+            card.header.seen = false;
+        }
+        if message.starred {
+            card.header.starred = true;
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| groups.remove(&key))
+        .collect()
+}
+
+/// Which of `card_keys` the cache holds a copy of in `folder`, as card keys.
+///
+/// A folder-spanning page (search reads the mailbox plus Sent) sees only its own
+/// slice, so the copy that decides a card's identity — see
+/// [`group_thread_cards_with_drafts`] — may have paged out below it. The cache
+/// has the whole mailbox, so it answers for the ones the page cannot.
+///
+/// `uid:` keys are folder-scoped by construction and never move, so they are not
+/// asked about.
+pub fn card_keys_in_folder(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    card_keys: &[String],
+) -> Result<HashSet<String>> {
+    let mut roots: Vec<String> = card_keys
+        .iter()
+        .map(|key| split_thread_key(key).0)
+        .filter(|root| !root.starts_with("uid:"))
+        .collect();
+    roots.sort();
+    roots.dedup();
+
+    let mut present = HashSet::new();
+    for chunk in roots.chunks(100) {
+        let placeholders = (3..3 + chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT thread_key, subject FROM messages
+             WHERE account = ?1 AND folder = ?2 AND uid <> 0
+               AND thread_key IN ({placeholders})"
+        ))?;
+        let mut args: Vec<&str> = vec![account, folder];
+        args.extend(chunk.iter().map(String::as_str));
+        let rows = stmt.query_map(params_from_iter(args), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (root, subject) = row?;
+            present.insert(if should_branch_thread_by_subject(&root) {
+                branch_compound_key(&root, &thread_grouping_subject(&subject))
+            } else {
+                root
+            });
+        }
+    }
+    Ok(present)
+}
+
+/// Total cached messages behind each of `card_keys`, keyed by card key.
+///
+/// The header page a list request read is not the thread: it is filtered
+/// (unread-only, starred-only, search hits) and cursor-paged by *message*, so
+/// counting the headers handed to [`group_thread_cards_with_drafts`] would
+/// report "1" for a long thread with a single unread message and would split a
+/// thread that straddles a page boundary. The cache holds the whole thread, so
+/// the count is taken from there and the page tally is only a floor for
+/// messages the cache has not seen yet.
+///
+/// The scope matches what opening the row shows, so the badge never contradicts
+/// the reader (see `thread_read`): real threading keys count across every folder
+/// in the account, because a received message and the user's own Sent reply
+/// belong to one thread; synthetic `uid:N` keys stay inside `folder`, because
+/// UIDs are folder-scoped and spanning folders would pull in an unrelated
+/// message that happens to share the UID.
+///
+/// Cross-folder rows are deduplicated by Message-ID exactly as
+/// [`get_thread_headers_all_folders`] does, so a self-sent message cached in
+/// both Sent and Inbox counts once — the reader renders it as one bubble.
+///
+/// Counting re-derives each row's card key rather than grouping on the raw
+/// thread key, so a subject-branched thread counts only the branch its card
+/// stands for — the same split [`card_thread_key`] makes.
+pub fn card_message_counts(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    card_keys: &[String],
+) -> Result<std::collections::HashMap<String, u32>> {
+    use std::collections::HashMap;
+
+    let mut roots: Vec<String> = card_keys
+        .iter()
+        .map(|key| split_thread_key(key).0)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let (uid_roots, threaded_roots): (Vec<String>, Vec<String>) =
+        roots.into_iter().partition(|root| root.starts_with("uid:"));
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    count_card_rows(conn, account, Some(folder), &uid_roots, &mut counts)?;
+    count_card_rows(conn, account, None, &threaded_roots, &mut counts)?;
+    Ok(counts)
+}
+
+/// The title each of `card_keys` should show: the subject of the oldest cached
+/// message of its thread, verbatim.
+///
+/// The page a card was grouped from is a filtered, cursor-paged slice — an
+/// unread view can hold a reply while the seen thread opener sits in the same
+/// folder just outside the page — so a title read off that slice can call a
+/// reply the thread's start. The cache has the whole mailbox and settles it, the
+/// same way [`card_message_counts`] settles the tally.
+///
+/// Keyed by root thread key, not card key: every subject branch of a thread
+/// carries the root thread's title.
+pub fn card_root_subjects(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    card_keys: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    use std::collections::HashMap;
+
+    let mut roots: Vec<String> = card_keys
+        .iter()
+        .map(|key| split_thread_key(key).0)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let (uid_roots, threaded_roots): (Vec<String>, Vec<String>) =
+        roots.into_iter().partition(|root| root.starts_with("uid:"));
+
+    // `uid:` roots name a message by (folder, uid) and never move; a real thread
+    // key is the same thread wherever its copies sit, so its oldest message may
+    // be cached in another folder.
+    let mut candidates: HashMap<String, Vec<RootCandidate>> = HashMap::new();
+    collect_root_candidates(conn, account, Some(folder), &uid_roots, &mut candidates)?;
+    collect_root_candidates(conn, account, None, &threaded_roots, &mut candidates)?;
+
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(root, candidates)| {
+            let subject = pick_root(candidates, folder)?.subject.trim().to_string();
+            Some((root, subject))
+        })
+        .collect())
+}
+
+/// Gather the cached rows of `roots` as root candidates, keyed by root thread
+/// key. `folder` scopes the query to a single mailbox; `None` spans the account.
+pub(super) fn collect_root_candidates(
+    conn: &Connection,
+    account: &str,
+    folder: Option<&str>,
+    roots: &[String],
+    candidates: &mut std::collections::HashMap<String, Vec<RootCandidate>>,
+) -> Result<()> {
+    // SQLite caps bound parameters per statement; chunk so an unpaginated caller
+    // cannot overrun it (see `count_card_rows`).
+    for chunk in roots.chunks(100) {
+        let first = if folder.is_some() { 3 } else { 2 };
+        let placeholders = (first..first + chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let folder_clause = if folder.is_some() {
+            "folder = ?2 AND "
+        } else {
+            ""
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(NULLIF(thread_key, ''), 'uid:' || uid), folder, uid, date, subject
+             FROM messages
+             WHERE account = ?1 AND {folder_clause}uid <> 0
+               AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) IN ({placeholders})"
+        ))?;
+        let mut args: Vec<&str> = vec![account];
+        args.extend(folder);
+        args.extend(chunk.iter().map(String::as_str));
+        let rows = stmt.query_map(params_from_iter(args), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                RootCandidate {
+                    folder: row.get(1)?,
+                    uid: row.get(2)?,
+                    date: row.get(3)?,
+                    subject: row.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (root, candidate) = row?;
+            candidates.entry(root).or_default().push(candidate);
+        }
+    }
+    Ok(())
+}
+
+/// Tally the cached rows of `roots` into `counts`, one card key at a time.
+/// `folder` scopes the query to a single mailbox; `None` spans the account.
+pub(super) fn count_card_rows(
+    conn: &Connection,
+    account: &str,
+    folder: Option<&str>,
+    roots: &[String],
+    counts: &mut std::collections::HashMap<String, u32>,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Message-ID duplicates are folded in Rust rather than with the correlated
+    // NOT EXISTS that reading a single thread uses: with a page of keys and no
+    // index on thread_key, that subquery would re-scan the account's messages
+    // once per row, where one pass plus a set of seen ids is linear.
+    let mut seen_ids: HashSet<(String, String)> = HashSet::new();
+    // SQLite caps bound parameters per statement; a page of cards stays well
+    // under it, but chunk anyway so an unpaginated caller cannot overrun it.
+    for chunk in roots.chunks(100) {
+        let first = if folder.is_some() { 3 } else { 2 };
+        let placeholders = (first..first + chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let folder_clause = if folder.is_some() {
+            "folder = ?2 AND "
+        } else {
+            ""
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT COALESCE(NULLIF(thread_key, ''), 'uid:' || uid), subject,
+                    COALESCE(json_extract(json, '$.message_id'), '') FROM messages
+             WHERE account = ?1 AND {folder_clause}uid <> 0
+               AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) IN ({placeholders})"
+        ))?;
+        let mut args: Vec<&str> = vec![account];
+        args.extend(folder);
+        args.extend(chunk.iter().map(String::as_str));
+        let rows = stmt.query_map(params_from_iter(args), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (root, subject, message_id) = row?;
+            let key = if should_branch_thread_by_subject(&root) {
+                branch_compound_key(&root, &thread_grouping_subject(&subject))
+            } else {
+                root
+            };
+            // A row with no Message-ID cannot be matched to a copy, so it counts
+            // on its own — same call the thread reader makes.
+            if !message_id.is_empty() && !seen_ids.insert((key.clone(), message_id)) {
+                continue;
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    Ok(())
+}
+
+/// A candidate for a thread's opening message: what [`pick_root`] compares.
+pub(super) struct RootCandidate {
+    folder: String,
+    uid: u32,
+    /// Send time as Unix epoch seconds, 0 when the row carries no usable Date.
+    date: i64,
+    subject: String,
+}
+
+/// Choose the oldest message of one thread from `candidates`. `read_folder` is
+/// the mailbox the card belongs to.
+///
+/// UIDs ascend with arrival inside a folder, so there the lowest UID is the
+/// oldest message — authoritative even for a row whose Date header is missing.
+/// Across folders UIDs are unrelated: on a page that merges the mailbox with
+/// Sent (search, and any thread the user replied to) a Sent reply's UID 1 is not
+/// older than an Inbox root's UID 100. So each folder's own pick is made by UID
+/// first, and only those are compared, by send time alone — UID says nothing
+/// here and must not break the tie, or the Sent reply wins back whenever the two
+/// share a timestamp or neither carries one.
+///
+/// What breaks a cross-folder tie is the mailbox being read: it is the folder
+/// the card sits in, so its copy is the one that should title it. The folder
+/// name settles what is left, so the pick never follows input order.
+pub(super) fn pick_root(
+    candidates: Vec<RootCandidate>,
+    read_folder: &str,
+) -> Option<RootCandidate> {
+    let mut per_folder: BTreeMap<String, RootCandidate> = BTreeMap::new();
+    for candidate in candidates {
+        match per_folder.get(&candidate.folder) {
+            Some(best) if best.uid <= candidate.uid => {}
+            _ => {
+                per_folder.insert(candidate.folder.clone(), candidate);
+            }
+        }
+    }
+    per_folder.into_values().min_by(|left, right| {
+        fn rank<'a>(candidate: &'a RootCandidate, read_folder: &str) -> (i64, bool, &'a str) {
+            (
+                // An undated pick loses to a dated one.
+                if candidate.date == 0 {
+                    i64::MAX
+                } else {
+                    candidate.date
+                },
+                !candidate.folder.eq_ignore_ascii_case(read_folder),
+                candidate.folder.as_str(),
+            )
+        }
+        rank(left, read_folder).cmp(&rank(right, read_folder))
+    })
+}
+
+pub(super) fn effective_thread_key(message: &MessageHeader) -> String {
+    if message.thread_key.is_empty() {
+        format!("uid:{}", message.uid)
+    } else {
+        message.thread_key.clone()
+    }
+}
+
+/// The branch-aware thread key a list card for `message` carries: the root
+/// thread key joined with the message's grouping subject for branchable
+/// threads, or the bare root for uid:/gmthrid: keys. Every path that mints a
+/// clickable thread id (thread lists, starred items, new-mail notifications)
+/// must use this so the id matches the card the grouping produced.
+pub fn card_thread_key(message: &MessageHeader) -> String {
+    let base = effective_thread_key(message);
+    if should_branch_thread_by_subject(&base) {
+        branch_compound_key(&base, &thread_grouping_subject(&message.subject))
+    } else {
+        base
+    }
+}
+
+/// Split a `thread_key` request parameter into (root key, branch subject
+/// filter). Card-minted keys for branchable threads always carry the
+/// `#subject` suffix (see [`card_thread_key`]); uid:/gmthrid: keys never do.
+pub fn split_thread_key(thread_key: &str) -> (String, Option<String>) {
+    if should_branch_thread_by_subject(thread_key) {
+        split_branch_compound_key(thread_key)
+    } else {
+        (thread_key.to_string(), None)
+    }
+}
+
+pub fn should_branch_thread_by_subject(thread_key: &str) -> bool {
+    !thread_key.starts_with("uid:") && !thread_key.starts_with("gmthrid:")
+}
+
+/// Join a root thread key and a grouping subject into one branch key. The root
+/// is a raw Message-ID, where `#` is legal atext — escape it so
+/// [`split_branch_compound_key`] can split at the first literal `#`
+/// unambiguously (the subject side stays verbatim; it is only ever compared
+/// whole against other grouping subjects).
+pub fn branch_compound_key(root: &str, group_subject: &str) -> String {
+    let escaped = root.replace('%', "%25").replace('#', "%23");
+    format!("{escaped}#{group_subject}")
+}
+
+/// Split a branch key built by [`branch_compound_key`] back into
+/// (root thread key, grouping subject). Keys without a `#` separator were
+/// never escaped (unbranched legacy ids) and come back verbatim with no
+/// subject.
+pub fn split_branch_compound_key(compound: &str) -> (String, Option<String>) {
+    match compound.split_once('#') {
+        Some((root, subject)) => (
+            root.replace("%23", "#").replace("%25", "%"),
+            Some(subject.to_string()),
+        ),
+        None => (compound.to_string(), None),
+    }
+}
+
+pub fn thread_grouping_subject(subject: &str) -> String {
+    let mut subject = subject.trim();
+    loop {
+        if let Some(rest) = strip_reply_prefix(subject) {
+            subject = rest.trim();
+            continue;
+        }
+        if let Some(rest) = strip_leading_bracket_tag(subject) {
+            subject = rest.trim();
+            continue;
+        }
+        break;
+    }
+    subject.to_string()
+}
+
+pub(super) fn strip_reply_prefix(subject: &str) -> Option<&str> {
+    let mut probe = subject.trim_start();
+    while let Some(rest) = strip_leading_bracket_tag(probe) {
+        probe = rest.trim_start();
+    }
+
+    const PREFIXES: &[&str] = &[
+        "re", "fw", "fwd", "aw", "sv", "vs", "rv", "res", "tr", "antw", "wg", "答复", "回复",
+        "转发",
+    ];
+    // Try every prefix that matches, not just the first: "fw" is a string
+    // prefix of "Fwd:" but fails the colon check, and only the "fwd" entry
+    // succeeds (mirrors the Go regex alternation, where the engine picks the
+    // alternative that lets the trailing colon match).
+    for prefix in PREFIXES {
+        if !probe.is_char_boundary(prefix.len())
+            || !probe[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            continue;
+        }
+        let mut rest = &probe[prefix.len()..];
+        if let Some(after_count) = strip_reply_count(rest) {
+            rest = after_count;
+        }
+        let mut chars = rest.chars();
+        match chars.next() {
+            Some(':') | Some('：') => return Some(chars.as_str()),
+            _ => continue,
+        }
+    }
+    None
+}
+
+pub(super) fn strip_reply_count(rest: &str) -> Option<&str> {
+    let bytes = rest.as_bytes();
+    let close = match bytes.first()? {
+        b'[' => b']',
+        b'(' => b')',
+        _ => return None,
+    };
+    let end = bytes.iter().position(|byte| *byte == close)?;
+    if end <= 1 || !bytes[1..end].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(&rest[end + 1..])
+}
+
+pub(super) fn strip_leading_bracket_tag(subject: &str) -> Option<&str> {
+    let trimmed = subject.trim_start();
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let end = trimmed.find(']')?;
+    Some(&trimmed[end + 1..])
+}
+
+/// Message-IDs a thread references but hasn't cached locally. Across every
+/// cached row of `account` sharing `thread_key`, collect the union of ids they
+/// reference (each row's `References` chain) plus the root id (`thread_key`
+/// itself), then subtract the ids already present as cached messages. The
+/// remainder is the ancestry the thread links to but that lies outside the
+/// synced window — the on-demand fetch target. All ids are lowercased here so
+/// the set comparison is case-insensitive; stored ids preserve the original
+/// header casing.
+pub fn get_thread_reference_gaps(
+    conn: &Connection,
+    account: &str,
+    thread_key: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT json FROM messages
+         WHERE account = ?1 AND uid <> 0
+           AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) = ?2",
+    )?;
+    let rows = stmt.query_map(params![account, thread_key], |row| {
+        row.get::<_, Option<String>>(0)
+    })?;
+    let mut referenced: std::collections::BTreeSet<String> = Default::default();
+    let mut present: std::collections::HashSet<String> = Default::default();
+    let normalize = |id: &str| {
+        id.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .trim()
+            .to_ascii_lowercase()
+    };
+    for row in rows {
+        let json = row?.unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+        if let Some(mid) = parsed.get("message_id").and_then(|v| v.as_str()) {
+            let mid = normalize(mid);
+            if !mid.is_empty() {
+                present.insert(mid);
+            }
+        }
+        if let Some(refs) = parsed.get("references").and_then(|v| v.as_str()) {
+            for id in refs.split_whitespace() {
+                let id = normalize(id);
+                if !id.is_empty() {
+                    referenced.insert(id);
+                }
+            }
+        }
+    }
+    // The non-synthetic `thread_key` is the thread's root Message-ID.
+    if !thread_key.starts_with("uid:") {
+        let root = normalize(thread_key);
+        if !root.is_empty() {
+            referenced.insert(root);
+        }
+    }
+    Ok(referenced
+        .into_iter()
+        .filter(|id| !present.contains(id))
+        .collect())
+}
+
+/// Like `get_thread_headers`, but spans any folder of `account` whose row
+/// shares the `thread_key`. Used by the cross-folder thread view so a reply
+/// stored in Sent appears alongside the inbox messages it threads with.
+/// Each header carries its source `folder` so the reader can fetch the body
+/// from the right mailbox. Ordered by `date` ASC (UIDs are folder-scoped, so
+/// they aren't comparable across folders).
+///
+/// A self-addressed message is delivered to both Sent and the Inbox, so the
+/// same RFC `Message-ID` lands as two rows under one `thread_key` (distinct
+/// per-folder UIDs sidestep the `UNIQUE(account, folder, msg_id)` constraint).
+/// We collapse those to a single bubble by keeping, per non-empty
+/// `Message-ID`, the unread copy if any, otherwise the lowest-`id` row. Rows
+/// without a `Message-ID` (e.g. drafts) are never collapsed — a NULL
+/// `Message-ID` never equates in SQL.
+pub fn get_thread_headers_all_folders(
+    conn: &Connection,
+    account: &str,
+    thread_key: &str,
+) -> Result<Vec<MessageHeader>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.uid, m.folder, m.subject, m.from_name, m.from_addr, m.date, m.seen, m.starred, m.thread_key,
+                json_extract(m.json, '$.in_reply_to')
+         FROM messages m
+         WHERE m.account = ?1 AND m.uid <> 0
+           AND COALESCE(NULLIF(m.thread_key, ''), 'uid:' || m.uid) = ?2
+           AND NOT EXISTS (
+             SELECT 1 FROM messages dup
+             WHERE dup.account = m.account
+               AND COALESCE(NULLIF(dup.thread_key, ''), 'uid:' || dup.uid) = ?2
+               AND COALESCE(json_extract(m.json, '$.message_id'), '') <> ''
+               AND json_extract(dup.json, '$.message_id') = json_extract(m.json, '$.message_id')
+               AND (dup.seen < m.seen OR (dup.seen = m.seen AND dup.id < m.id))
+           )
+         ORDER BY m.date ASC, m.uid ASC",
+    )?;
+    let rows = stmt.query_map(params![account, thread_key], |row| {
+        let uid: u32 = row.get(0)?;
+        Ok(MessageHeader {
+            uid,
+            folder: row.get(1)?,
+            subject: row.get(2)?,
+            from_name: row.get(3)?,
+            from_addr: row.get(4)?,
+            date: row.get(5)?,
+            seen: row.get::<_, i64>(6)? != 0,
+            starred: row.get::<_, i64>(7)? != 0,
+            thread_key: row
+                .get::<_, Option<String>>(8)?
+                .filter(|key| !key.is_empty())
+                .unwrap_or_else(|| format!("uid:{uid}")),
+            in_reply_to: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            ..Default::default()
+        })
+    })?;
+    // `date` is now an epoch integer, so the SQL ORDER BY sorts chronologically
+    // (it could not when date was an RFC 2822 string). Unknown dates (0) sort first.
+    let headers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(headers)
+}
