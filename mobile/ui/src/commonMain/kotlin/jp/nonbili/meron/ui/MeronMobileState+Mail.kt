@@ -10,6 +10,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.ui.input.key.key
 import jp.nonbili.meron.shared.EmptyFolderParams
 import jp.nonbili.meron.shared.FolderDeleteParams
+import jp.nonbili.meron.shared.FolderSummary
 import jp.nonbili.meron.shared.MarkAllReadParams
 import jp.nonbili.meron.shared.MarkReadParams
 import jp.nonbili.meron.shared.MarkStarredParams
@@ -126,6 +127,49 @@ private fun MeronMobileState.applyCoreFolderUnreadChanges(response: String) {
                     it.accountId == folder.accountId && folder.name.equals(it.folderId, ignoreCase = folder.role == "inbox")
                 }?.let { folder.copy(unread = it.unread) } ?: folder
         }
+}
+
+// The drawer's unread badges read the folder caches, not the list rows, so
+// clearing rows optimistically on its own left them showing the pre-mark totals
+// until the write answered. These apply the same change to the caches up front;
+// the response — and the sync that follows — still replace them with the
+// server's own numbers.
+private fun MeronMobileState.cachedFolderUnread(
+    accountId: String,
+    folderId: String,
+): Int = folderUnread(foldersByAccount[accountId].orEmpty(), folderId)
+
+private fun MeronMobileState.applyLocalFolderUnread(counts: Map<Pair<String, String>, Int>) {
+    if (counts.isEmpty()) return
+    val patch = { folder: FolderSummary ->
+        counts.entries
+            .firstOrNull { (target, _) ->
+                target.first == folder.accountId && folder.name.equals(target.second, ignoreCase = folder.role == INBOX_FOLDER)
+            }?.let { folder.copy(unread = it.value) } ?: folder
+    }
+    foldersByAccount = foldersByAccount.mapValues { (_, folders) -> folders.map(patch) }
+    coreFolders = coreFolders.map(patch)
+}
+
+// Folder totals after marking [mailFolders] read folder-wide and taking the
+// [rssRows] marked here off their own folders, paired with the totals they had.
+private fun MeronMobileState.plannedFolderUnread(
+    mailFolders: List<Pair<String, String>>,
+    rssRows: List<ThreadSummary>,
+): Pair<Map<Pair<String, String>, Int>, Map<Pair<String, String>, Int>> {
+    val next = mutableMapOf<Pair<String, String>, Int>()
+    val before = mutableMapOf<Pair<String, String>, Int>()
+    mailFolders.forEach { target ->
+        before[target] = cachedFolderUnread(target.first, target.second)
+        next[target] = 0
+    }
+    rssRows.forEach { row ->
+        val target = row.accountId to row.folder
+        if (target.first.isBlank() || target.second.isBlank()) return@forEach
+        before.getOrPut(target) { cachedFolderUnread(target.first, target.second) }
+        next[target] = (next[target] ?: before.getValue(target)) - 1
+    }
+    return next.mapValues { (_, value) -> value.coerceAtLeast(0) } to before
 }
 
 // Moves a thread back to the folder it was in before an archive/delete and
@@ -527,11 +571,14 @@ internal fun MeronMobileState.markVisibleMailboxAllRead() {
     }
     val threadsBefore = coreThreads
     val kanbanBefore = kanbanColumns
+    val foldersBefore = foldersByAccount
+    val coreFoldersBefore = coreFolders
     coreThreads = coreThreads.map { if (it.unread) it.copy(unread = false) else it }
     kanbanColumns =
         kanbanColumns.mapValues { (_, state) ->
             state.copy(threads = state.threads.map { if (it.unread) it.copy(unread = false) else it })
         }
+    applyLocalFolderUnread(plannedFolderUnread(mailTargets, rssTargets).first)
     scope.launch {
         runCatching {
             withContext(ioDispatcher) {
@@ -577,6 +624,8 @@ internal fun MeronMobileState.markVisibleMailboxAllRead() {
             Log.w("Mail", "mark all read failed", it)
             coreThreads = threadsBefore
             kanbanColumns = kanbanBefore
+            foldersByAccount = foldersBefore
+            coreFolders = coreFoldersBefore
             status = "Mark all read failed: ${it.message}"
         }
     }
@@ -620,7 +669,29 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                 mailAccounts.isNotEmpty() ||
                     (starred && unread.any { !threadIdIsRss(it.id) }) ||
                     unread.any { threadIdIsRss(it.backendThreadId()) }
-            KanbanMarkReadPlan(column, key, unread, starred, mailAccounts, writes, state?.unreadCount)
+            val mailFolders =
+                mailAccounts.mapNotNull { account ->
+                    val folderId =
+                        if (column.accountId == UNIFIED_ACCOUNT_ID) {
+                            unifiedAccountFolder(foldersByAccount[account.id].orEmpty(), column.folderId)
+                        } else {
+                            column.folderId
+                        }
+                    folderId?.let { account.id to it }
+                }
+            val (folderUnreadNext, folderUnreadBefore) =
+                plannedFolderUnread(mailFolders, unread.filter { threadIdIsRss(it.backendThreadId()) })
+            KanbanMarkReadPlan(
+                column,
+                key,
+                unread,
+                starred,
+                mailAccounts,
+                writes,
+                state?.unreadCount,
+                folderUnreadNext,
+                folderUnreadBefore,
+            )
         }
     for (plan in plans) {
         val readIds = plan.unread.map { it.id }.toSet()
@@ -630,6 +701,7 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                 unreadCount = if (plan.writes) 0 else state.unreadCount,
             )
         }
+        applyLocalFolderUnread(plan.folderUnread)
     }
     val optimisticIds = plans.flatMap { plan -> plan.unread.map { it.id } }.toSet()
     val coreUnreadBefore = coreThreads.filter { it.id in optimisticIds }.associate { it.id to it.unread }
@@ -726,6 +798,7 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                                 unreadCount = if (plan.writes) plan.unreadCountBefore else state.unreadCount,
                             )
                         }
+                        applyLocalFolderUnread(plan.folderUnreadBefore)
                     }
             }
             // A row shared with a column that did succeed is read on the server.

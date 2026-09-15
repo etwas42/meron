@@ -252,6 +252,100 @@ describe('markColumnAllRead', () => {
     expect(kanban$.unreadCounts['unified\ninbox'].get()).toBe(0)
   })
 
+  it('clears the side navigation folder badges before the backend answers', async () => {
+    mail$.foldersByAccount.set({
+      acc1: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 5 }],
+      acc2: [{ id: 'INBOX', account_id: 'acc2', name: 'Inbox', role: 'inbox', unread: 2 }],
+    })
+    kanban$.threads['unified\ninbox'].set([message()])
+    kanban$.unreadCounts['unified\ninbox'].set(7)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const original = (window as any).go.main.App.Invoke
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      if (command === 'mail.markAllRead') await gate
+      return original(command, payload)
+    }
+
+    const pending = markColumnAllRead({ accountId: 'unified', folderId: 'inbox' })
+
+    expect(mail$.foldersByAccount.acc1.get()?.[0]?.unread).toBe(0)
+    expect(mail$.foldersByAccount.acc2.get()?.[0]?.unread).toBe(0)
+    release()
+    await pending
+  })
+
+  it('puts the side navigation folder badges back when the write fails', async () => {
+    mail$.foldersByAccount.set({
+      acc1: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 5 }],
+    })
+    kanban$.threads['acc1\nINBOX'].set([message()])
+    kanban$.unreadCounts['acc1\nINBOX'].set(5)
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      calls.push({ command, payload })
+      if (command === 'mail.markAllRead') return { ok: false, failures: [{ message: 'Offline' }] }
+      // The failed write left the folder unread on the server too.
+      return { folders: [{ id: 'INBOX', account_id: payload.account_id, name: 'Inbox', role: 'inbox', unread: 5 }] }
+    }
+
+    await markColumnAllRead({ accountId: 'acc1', folderId: 'INBOX' })
+
+    expect(mail$.foldersByAccount.acc1.get()?.[0]?.unread).toBe(5)
+    expect(kanban$.unreadCounts['acc1\nINBOX'].get()).toBe(5)
+  })
+
+  // A board-wide mark shares one write between overlapping columns, so a single
+  // failure rolls back both — and the second column would otherwise have
+  // snapshotted the zero the first one had already written.
+  it('rolls overlapping board columns back to the count the folder had before the board cleared', async () => {
+    settings$.kanbanBoards.set([
+      {
+        id: 'board',
+        name: 'Board',
+        columns: [
+          { accountId: 'unified', folderId: 'inbox' },
+          { accountId: 'acc1', folderId: 'INBOX' },
+        ],
+      },
+    ])
+    mail$.foldersByAccount.set({
+      acc1: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 5 }],
+    })
+    kanban$.threads['unified\ninbox'].set([message()])
+    kanban$.threads['acc1\nINBOX'].set([message()])
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      calls.push({ command, payload })
+      if (command === 'mail.markAllRead') return { ok: false, failures: [{ message: 'Offline' }] }
+      return { folders: [{ id: 'INBOX', account_id: payload.account_id, name: 'Inbox', role: 'inbox', unread: 5 }] }
+    }
+
+    await markBoardAllRead('board')
+
+    expect(mail$.foldersByAccount.acc1.get()?.[0]?.unread).toBe(5)
+  })
+
+  // The refresh that follows the writes answers with the server's own counts, so
+  // a folder a sibling write did mark read keeps that count instead of being
+  // rolled back with the column that failed.
+  it('keeps the refreshed count for a folder the failed column did not leave unread', async () => {
+    mail$.foldersByAccount.set({
+      acc1: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 5 }],
+      acc2: [{ id: 'INBOX', account_id: 'acc2', name: 'Inbox', role: 'inbox', unread: 3 }],
+    })
+    kanban$.threads['unified\ninbox'].set([message()])
+    ;(window as any).go.main.App.Invoke = async (command: string, payload: any) => {
+      calls.push({ command, payload })
+      if (command === 'mail.markAllRead') return { ok: false, failures: [{ account_id: 'acc1', message: 'Offline' }] }
+      const unread = payload.account_id === 'acc1' ? 5 : 0
+      return { folders: [{ id: 'INBOX', account_id: payload.account_id, name: 'Inbox', role: 'inbox', unread }] }
+    }
+
+    await markColumnAllRead({ accountId: 'unified', folderId: 'inbox' })
+
+    expect(mail$.foldersByAccount.acc1.get()?.[0]?.unread).toBe(5)
+    expect(mail$.foldersByAccount.acc2.get()?.[0]?.unread).toBe(0)
+  })
+
   it('sends a unified non-inbox role through the role-resolving backend path', async () => {
     kanban$.threads['unified\nsent'].set([message({ folder_id: '[Gmail]/Sent Mail' })])
 

@@ -18,6 +18,10 @@ internal data class KanbanMarkReadPlan(
     val mailAccounts: List<AccountSummary>,
     val writes: Boolean,
     val unreadCountBefore: Int?,
+    // Drawer folder badges this column's writes cover: the totals to show right
+    // away, keyed by account and mailbox, and the ones to put back if it fails.
+    val folderUnread: Map<Pair<String, String>, Int> = emptyMap(),
+    val folderUnreadBefore: Map<Pair<String, String>, Int> = emptyMap(),
 )
 
 // One board action executes sequentially and shares both successful and failed

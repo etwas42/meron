@@ -5,7 +5,12 @@ import { clearBulkSelection, ui$, showToast, showUndoToast, type BulkSelectionIt
 import { accounts$, unifiedAccounts } from './accounts'
 import { kanban$ } from './kanban'
 import { isRssAccount } from '../lib/threadActions'
-import { isUnifiedStarred, unifiedFolderRole } from '../lib/unifiedFolders'
+import {
+  accountFolderForRole,
+  isUnifiedStarred,
+  unifiedFolderRole,
+  type UnifiedFolderRole,
+} from '../lib/unifiedFolders'
 import {
   captureKeys,
   findLocalThread,
@@ -279,10 +284,31 @@ export async function markAllRead() {
 
   if (mailAccountIds.length === 0 && unread.length === 0) return
 
-  // Optimistic clear for currently loaded rows. Folder cache refresh below brings
-  // aggregate unread badges in line after the folder-wide backend update.
+  const rssUnread = unread.filter((thread) =>
+    isRssAccount(
+      accounts.find((account) => account.id === thread.account_id),
+      thread.account_id,
+    ),
+  )
+
+  // Optimistic clear for currently loaded rows, and for the side navigation
+  // badges they sum into — those read the folder cache, so leaving them to the
+  // refresh below left the nav counts stale until the server answered. A mail
+  // account's folder goes to zero (its write is folder-wide); an RSS folder
+  // loses only the items marked here. The refresh below is still what reconciles
+  // a write that failed.
   mail$.threads.set(threads.map((thread) => (thread.unread ? { ...thread, unread: false, unread_count: 0 } : thread)))
   mail$.messages.set(mail$.messages.get().map((message) => (message.unread ? { ...message, unread: false } : message)))
+  for (const accountId of mailAccountIds) {
+    const accountFolders = mail$.foldersByAccount[accountId].get()
+    const folderId =
+      selectedAcc === 'unified' ? accountFolderForRole(accountFolders, folder as UnifiedFolderRole) : folder
+    const resolved = accountFolders?.find((candidate) => folderMatches(candidate, accountId, folderId))
+    if (resolved) updateCachedFolderUnread(accountId, resolved.id, 0)
+  }
+  for (const thread of rssUnread) {
+    decrementFolderUnread(thread.account_id, thread.folder_id, 1)
+  }
 
   await Promise.all([
     ...(selectedAcc === 'unified' && mailAccountIds.length > 0 ? ['unified'] : mailAccountIds).map((accountId) =>
@@ -290,18 +316,11 @@ export async function markAllRead() {
         .then(applyMutationFolderUnreads)
         .catch((err) => console.error('markAllRead failed:', err)),
     ),
-    ...unread
-      .filter((thread) =>
-        isRssAccount(
-          accounts.find((account) => account.id === thread.account_id),
-          thread.account_id,
-        ),
-      )
-      .map((thread) =>
-        invoke('mail.markRead', { thread_id: thread.thread_id }).catch((err) =>
-          console.error('markAllRead (rss) failed:', err),
-        ),
+    ...rssUnread.map((thread) =>
+      invoke('mail.markRead', { thread_id: thread.thread_id }).catch((err) =>
+        console.error('markAllRead (rss) failed:', err),
       ),
+    ),
   ])
 
   if (selectedAcc) void loadFolders(selectedAcc, false)

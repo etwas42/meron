@@ -1,11 +1,12 @@
 import { observable } from '@legendapp/state'
-import type { ChatWallpaper, Message } from '../types'
+import type { ChatWallpaper, Folder, Message } from '../types'
 import { isFilterMode, pauseMailFolderPersist, persistMailFolder, ui$, showToast, type FilterMode } from './ui'
 import { mail$ } from './mail'
-import { refreshAccountFoldersCache } from './mailFolders'
+import { folderMatches, refreshAccountFoldersCache, updateCachedFolderUnread } from './mailFolders'
 import { accounts$ } from './accounts'
 import { filterThreads, isRssAccount } from '../lib/threadActions'
 import { isUnifiedStarredColumn } from '../lib/kanbanData'
+import { accountFolderForRole, unifiedFolderRole } from '../lib/unifiedFolders'
 import { openMessageTab } from './compose'
 import { compose$ } from './composeState'
 import { persistedField } from '../lib/sessionPref'
@@ -410,7 +411,7 @@ const requestRead: ReadRequest = async (command, payload) => {
   }
 }
 
-async function markColumnRead(column: KanbanColumn, request: ReadRequest) {
+async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseline?: Record<string, Folder[]>) {
   const key = kanbanColumnKey(column)
   const threads = kanban$.threads[key].get() ?? []
   const unread = threads.filter((thread) => thread.unread)
@@ -440,6 +441,42 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest) {
       : []),
     ...itemTargets.map((thread) => () => request('mail.markRead', { thread_id: thread.thread_id })),
   ]
+  // The side navigation reads its badges from the folder cache, not from the
+  // column, so clearing only `unreadCounts` left the nav counts stale until the
+  // folder refresh below came back from the server. Work out the same folders
+  // the writes cover and their pre-write totals, to clear now and put back if a
+  // write fails: a mail account's folder goes to zero (the write is
+  // folder-wide), an RSS folder loses only the items marked here.
+  const folderTargets = new Map<string, { accountId: string; folderId: string; previous: number; next: number }>()
+  const role = column.accountId === 'unified' ? unifiedFolderRole(column.folderId) : ''
+  const targetFolder = (accountId: string, folderId: string | undefined) => {
+    if (!accountId || accountId === 'unified' || !folderId) return undefined
+    const folders = mail$.foldersByAccount[accountId].get() ?? []
+    const resolved = folders.find((folder) => folderMatches(folder, accountId, folderId))
+    if (!resolved) return undefined
+    const key = `${accountId}\n${resolved.id}`
+    let target = folderTargets.get(key)
+    if (!target) {
+      // The columns of one board clear in turn without awaiting, so by the time
+      // a later column reads the cache an earlier one sharing this folder has
+      // already zeroed it. `baseline` is the board's pre-clear snapshot, so both
+      // columns roll back to the count the folder really had; the optimistic
+      // number still counts down from what is on screen now.
+      const before = baseline?.[accountId]?.find((folder) => folderMatches(folder, accountId, folderId))
+      target = { accountId, folderId: resolved.id, previous: before?.unread ?? resolved.unread, next: resolved.unread }
+      folderTargets.set(key, target)
+    }
+    return target
+  }
+  for (const accountId of mailAccountIds) {
+    const folderId = role ? accountFolderForRole(mail$.foldersByAccount[accountId].get(), role) : column.folderId
+    const target = targetFolder(accountId, folderId)
+    if (target) target.next = 0
+  }
+  for (const thread of itemTargets) {
+    const target = targetFolder(thread.account_id, thread.folder_id)
+    if (target) target.next = Math.max(0, target.next - 1)
+  }
   // Optimistic: clear the cards before any await, so a board-wide mark flips
   // every column at once. A failure puts back only the rows cleared here (by id,
   // so a page load that landed meanwhile survives) and this column's badge.
@@ -452,11 +489,15 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest) {
     ),
   )
   if (clearsBadge) kanban$.unreadCounts[key].set(0)
+  for (const target of folderTargets.values()) updateCachedFolderUnread(target.accountId, target.folderId, target.next)
   const results = await Promise.allSettled(writes.map((write) => write()))
+  const refreshed = new Map<string, Folder[]>()
   await Promise.all(
     Array.from(new Set([...mailAccountIds, ...itemTargets.map((thread) => thread.account_id)]))
       .filter(Boolean)
-      .map((accountId) => refreshAccountFoldersCache(accountId, false)),
+      .map(async (accountId) => {
+        refreshed.set(accountId, await refreshAccountFoldersCache(accountId, false))
+      }),
   )
   const failure = results.find((result) => result.status === 'rejected')
   if (failure?.status === 'rejected') {
@@ -467,6 +508,16 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest) {
       }),
     )
     if (clearsBadge) kanban$.unreadCounts[key].set(previousUnreadCount)
+    for (const target of folderTargets.values()) {
+      // One failed write does not mean every folder is still unread: the
+      // refresh above answered with the server's own counts for the accounts it
+      // reached — including those a sibling write did mark read — so put back
+      // the pre-write count only where it did not answer.
+      const server = refreshed
+        .get(target.accountId)
+        ?.find((folder) => folderMatches(folder, target.accountId, target.folderId))
+      updateCachedFolderUnread(target.accountId, target.folderId, server?.unread ?? target.previous)
+    }
     throw failure.reason
   }
   // Reapply on success: a column reload that raced the write may have put the
@@ -514,7 +565,8 @@ export async function markBoardAllRead(boardId: string) {
     }
     return pending
   }
-  const results = await Promise.allSettled(columns.map((column) => markColumnRead(column, request)))
+  const baseline = mail$.foldersByAccount.get()
+  const results = await Promise.allSettled(columns.map((column) => markColumnRead(column, request, baseline)))
   if (results.some((result) => result.status === 'rejected')) {
     showToast(t('notification.markReadFailed'), 'error')
   }
