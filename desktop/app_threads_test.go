@@ -41,6 +41,11 @@ func TestThreadsJSONMapsCardsAndMintsIDs(t *testing.T) {
 				"starred":             true,
 				"has_draft":           true,
 				"recipient_overflow":  float64(1),
+				"senders": []any{
+					map[string]any{"name": "Ann", "me": false},
+					map[string]any{"name": "", "me": true},
+				},
+				"senders_truncated": true,
 			},
 			map[string]any{
 				"thread_key": "gmthrid:123",
@@ -71,10 +76,41 @@ func TestThreadsJSONMapsCardsAndMintsIDs(t *testing.T) {
 	if !branch.HasDraft {
 		t.Errorf("HasDraft = false, want true: %#v", branch)
 	}
+	wantSenders := []ThreadSender{{Name: "Ann"}, {Me: true}}
+	if len(branch.Senders) != 2 || branch.Senders[0] != wantSenders[0] || branch.Senders[1] != wantSenders[1] ||
+		!branch.SendersTruncated {
+		t.Errorf("senders not mapped: %#v", branch)
+	}
 
 	atomic := byID[formatImapThreadID("acc", "INBOX", "gmthrid:123")]
 	if atomic.OriginalThreadID != "" {
 		t.Errorf("unbranched card should have empty OriginalThreadID, got %q", atomic.OriginalThreadID)
+	}
+	if atomic.Senders != nil {
+		t.Errorf("card without senders should have nil Senders, got %#v", atomic.Senders)
+	}
+}
+
+// The core's ready `threads` rows decode straight into Messages, so a field the
+// struct does not declare is silently dropped on its way to the frontend.
+func TestThreadsJSONKeepsSendersFromCoreThreads(t *testing.T) {
+	raw := map[string]any{
+		"threads": []any{
+			map[string]any{
+				"id":        "t1",
+				"from_name": "Dana Evans",
+				"senders": []any{
+					map[string]any{"name": "Carol", "me": false},
+					map[string]any{"name": "devuser42", "me": false},
+					map[string]any{"name": "Dana", "me": false},
+				},
+				"senders_truncated": true,
+			},
+		},
+	}
+	thread := threadsByID(t, threadsJSON("acc", "INBOX", raw))["t1"]
+	if len(thread.Senders) != 3 || thread.Senders[2].Name != "Dana" || !thread.SendersTruncated {
+		t.Errorf("senders dropped from core thread row: %#v", thread)
 	}
 }
 

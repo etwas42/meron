@@ -657,8 +657,18 @@ internal fun MailRow(
                     Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    val you = tr("chat.you")
                     Text(
-                        senderLabel.substringBefore('@'),
+                        if (thread.senders.size > 1) {
+                            val names = thread.senders.map { it.ifBlank { you } }
+                            if (thread.sendersTruncated) {
+                                names.first() + " .. " + names.drop(1).joinToString(", ")
+                            } else {
+                                names.joinToString(", ")
+                            }
+                        } else {
+                            senderLabel.substringBefore('@')
+                        },
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,

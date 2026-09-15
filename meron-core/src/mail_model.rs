@@ -202,7 +202,15 @@ fn thread_cards_json_keyed(
     // and a title read off the slice alone would call that reply the thread's
     // start. The cache answers for the whole mailbox.
     let mut root_subjects: HashMap<(String, String), String> = HashMap::new();
+    // And for who is in it: the page's newest header names one sender, but a
+    // thread several people replied to should list them all.
+    let mut senders: HashMap<(String, String), Vec<store::CardSender>> = HashMap::new();
     for (folder, keys) in keys_by_folder {
+        senders.extend(
+            store::card_senders(conn, account_id, folder, &keys)?
+                .into_iter()
+                .map(|(key, list)| ((folder.to_string(), key), list)),
+        );
         counts.extend(
             store::card_message_counts(conn, account_id, folder, &keys)?
                 .into_iter()
@@ -234,6 +242,35 @@ fn thread_cards_json_keyed(
                 ))
                 .cloned()
                 .unwrap_or_else(|| card.header.subject.clone());
+            // Only a thread with more than one sender gets the list; a single
+            // correspondent keeps the card identity (which names the recipient
+            // on an outbound-only thread rather than "You").
+            //
+            // Past three, Gmail-style: the opener, then a gap, then the two who
+            // wrote most recently (by their newest message, not their first, so
+            // an early voice who sent the latest reply is not the one elided),
+            // in the order of those messages. `senders_truncated` marks the gap
+            // after the first entry.
+            let list = senders
+                .get(&(folder.to_string(), card.thread_key.clone()))
+                .filter(|list| list.len() > 1)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let senders_truncated = list.len() > 3;
+            let shown: Vec<&store::CardSender> = if senders_truncated {
+                let mut rest: Vec<&store::CardSender> = list[1..].iter().collect();
+                // Stable, so senders tied on date keep their first-seen order.
+                rest.sort_by_key(|sender| sender.last_date);
+                let mut shown = vec![&list[0]];
+                shown.extend_from_slice(&rest[rest.len() - 2..]);
+                shown
+            } else {
+                list.iter().collect()
+            };
+            let senders: Vec<Value> = shown
+                .into_iter()
+                .map(|sender| json!({ "name": sender.name, "me": sender.me }))
+                .collect();
             let folder_role = store::folder_role(conn, account_id, folder)?;
             let thread_id = format_thread_id(account_id, folder, &card.thread_key);
             let original_thread_id = card
@@ -263,6 +300,8 @@ fn thread_cards_json_keyed(
                 "has_draft": card.has_draft,
                 "has_attachments": false,
                 "recipient_overflow": card.header.recipient_overflow,
+                "senders": senders,
+                "senders_truncated": senders_truncated,
                 }),
             ))
         })
@@ -650,6 +689,217 @@ mod tests {
         // cached Inbox root's, not the reply that was all the page carried.
         assert_eq!(cards[0]["message_count"], 2);
         assert_eq!(cards[0]["subject"], "Topic");
+    }
+
+    // A thread several people replied to lists each of them once, oldest first,
+    // with the account's own messages as one "me" — not just the newest sender.
+    #[test]
+    fn a_card_lists_every_distinct_sender_oldest_first() {
+        let conn = Connection::open_in_memory().unwrap();
+        store::run_migrations(&conn).unwrap();
+        store::ensure_folder(&conn, "me@example.com", "INBOX").unwrap();
+        store::ensure_folder(&conn, "me@example.com", "Sent").unwrap();
+        let header = |uid: u32, date: i64, name: &str, addr: &str| MessageHeader {
+            uid,
+            folder: "INBOX".to_string(),
+            subject: "Topic".to_string(),
+            date,
+            thread_key: "root@example.com".to_string(),
+            from_name: name.to_string(),
+            from_addr: addr.to_string(),
+            message_id: format!("<{uid}@example.com>"),
+            ..Default::default()
+        };
+        let inbox = vec![
+            header(1, 100, "Alice Smith", "alice@example.com"),
+            header(3, 300, "", "bob@example.com"),
+            header(4, 400, "Alice Smith", "Alice@Example.com"),
+        ];
+        let mut sent = header(2, 200, "Me", "me@example.com");
+        sent.folder = "Sent".to_string();
+        store::upsert_messages(&conn, "me@example.com", "INBOX", &inbox).unwrap();
+        store::upsert_messages(&conn, "me@example.com", "Sent", &[sent]).unwrap();
+
+        let cards = thread_cards_json(
+            &conn,
+            "me@example.com",
+            "INBOX",
+            vec![inbox[2].clone()],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0]["senders"],
+            json!([
+                { "name": "Alice", "me": false },
+                { "name": "", "me": true },
+                { "name": "bob", "me": false },
+            ])
+        );
+        assert_eq!(cards[0]["senders_truncated"], false);
+
+        // Two more voices: the opener stays, the middle collapses into the gap.
+        let more = vec![
+            header(5, 500, "Carol King", "carol@example.com"),
+            header(6, 600, "Dave", "dave@example.com"),
+        ];
+        store::upsert_messages(&conn, "me@example.com", "INBOX", &more).unwrap();
+        let cards = thread_cards_json(
+            &conn,
+            "me@example.com",
+            "INBOX",
+            vec![more[1].clone()],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            cards[0]["senders"],
+            json!([
+                { "name": "Alice", "me": false },
+                { "name": "Carol", "me": false },
+                { "name": "Dave", "me": false },
+            ])
+        );
+        assert_eq!(cards[0]["senders_truncated"], true);
+
+        // Bob, an early voice, sends the latest reply: he is one of the two most
+        // recent, not elided for having joined before Carol.
+        let bob_again = header(7, 700, "", "bob@example.com");
+        store::upsert_messages(&conn, "me@example.com", "INBOX", &[bob_again.clone()]).unwrap();
+        let cards = thread_cards_json(
+            &conn,
+            "me@example.com",
+            "INBOX",
+            vec![bob_again],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            cards[0]["senders"],
+            json!([
+                { "name": "Alice", "me": false },
+                { "name": "Dave", "me": false },
+                { "name": "bob", "me": false },
+            ])
+        );
+        assert_eq!(cards[0]["senders_truncated"], true);
+    }
+
+    // Tracker notifications all come from one address, each under the commenter's
+    // name. Those are different people, not one sender.
+    #[test]
+    fn senders_sharing_an_address_are_told_apart_by_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        store::run_migrations(&conn).unwrap();
+        store::ensure_folder(&conn, "me@example.com", "INBOX").unwrap();
+        let header = |uid: u32, name: &str| MessageHeader {
+            uid,
+            folder: "INBOX".to_string(),
+            subject: "Re: [org/repo] Issue".to_string(),
+            date: i64::from(uid) * 100,
+            thread_key: "issue@tracker.example".to_string(),
+            from_name: name.to_string(),
+            from_addr: "notifications@tracker.example".to_string(),
+            message_id: format!("<{uid}@tracker.example>"),
+            ..Default::default()
+        };
+        let inbox = vec![
+            header(1, "Carol Diaz"),
+            header(2, "devuser42"),
+            header(3, "Dana Evans"),
+        ];
+        store::upsert_messages(&conn, "me@example.com", "INBOX", &inbox).unwrap();
+
+        let cards = thread_cards_json(
+            &conn,
+            "me@example.com",
+            "INBOX",
+            vec![inbox[2].clone()],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cards[0]["senders"],
+            json!([
+                { "name": "Carol", "me": false },
+                { "name": "devuser42", "me": false },
+                { "name": "Dana", "me": false },
+            ])
+        );
+    }
+
+    // One person writing once with a display name and once without is still one
+    // sender — but on a shared notification address, a nameless message cannot
+    // be credited to any one of several named participants.
+    #[test]
+    fn a_nameless_message_joins_its_address_only_when_one_name_is_known() {
+        let conn = Connection::open_in_memory().unwrap();
+        store::run_migrations(&conn).unwrap();
+        store::ensure_folder(&conn, "me@example.com", "INBOX").unwrap();
+        // Each thread's key doubles as its subject, to find its card by.
+        let header = |uid: u32, key: &str, name: &str, addr: &str| MessageHeader {
+            uid,
+            folder: "INBOX".to_string(),
+            subject: key.to_string(),
+            date: i64::from(uid) * 100,
+            thread_key: key.to_string(),
+            from_name: name.to_string(),
+            from_addr: addr.to_string(),
+            message_id: format!("<{uid}@example.com>"),
+            ..Default::default()
+        };
+        let messages = vec![
+            // Alice's nameless message comes first; the card still says "Alice".
+            header(1, "a@example.com", "", "alice@example.com"),
+            header(2, "a@example.com", "Bob", "bob@example.com"),
+            header(3, "a@example.com", "Alice Smith", "alice@example.com"),
+            header(
+                4,
+                "gh@example.com",
+                "Carol Diaz",
+                "notifications@tracker.example",
+            ),
+            header(5, "gh@example.com", "", "notifications@tracker.example"),
+            header(
+                6,
+                "gh@example.com",
+                "devuser42",
+                "notifications@tracker.example",
+            ),
+        ];
+        store::upsert_messages(&conn, "me@example.com", "INBOX", &messages).unwrap();
+
+        let cards = thread_cards_json(
+            &conn,
+            "me@example.com",
+            "INBOX",
+            vec![messages[2].clone(), messages[5].clone()],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let senders = |subject: &str| {
+            cards
+                .iter()
+                .find(|card| card["subject"] == subject)
+                .unwrap()["senders"]
+                .clone()
+        };
+        assert_eq!(
+            senders("a@example.com"),
+            json!([{ "name": "Alice", "me": false }, { "name": "Bob", "me": false }])
+        );
+        assert_eq!(
+            senders("gh@example.com"),
+            json!([
+                { "name": "Carol", "me": false },
+                { "name": "notifications", "me": false },
+                { "name": "devuser42", "me": false },
+            ])
+        );
     }
 
     // A `uid:` key names a message by (folder, uid) — the fallback for one with

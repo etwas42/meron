@@ -118,8 +118,15 @@ export function ThreadListItem({
               <span
                 className={clsx('text-[0.8125rem] font-semibold truncate', unread ? 'text-primary' : 'text-primary/85')}
               >
-                {thread.from_name || thread.from_addr.split('@')[0]}
-                {!!thread.recipient_overflow && (
+                {thread.senders && thread.senders.length > 1
+                  ? thread.senders
+                      .map((sender) => (sender.me ? t('chat.you') : sender.name))
+                      .reduce(
+                        (label, name, index) =>
+                          `${label}${index === 1 && thread.senders_truncated ? ' .. ' : ', '}${name}`,
+                      )
+                  : thread.from_name || thread.from_addr.split('@')[0]}
+                {!thread.senders?.length && !!thread.recipient_overflow && (
                   <span className="ml-1 font-normal text-secondary/80">+{thread.recipient_overflow}</span>
                 )}
               </span>

@@ -193,6 +193,12 @@ export type Message = {
   /** On an outbound thread card, the count of recipients beyond the one shown,
    * rendered as a "+N" hint. Absent/0 for inbound or single-recipient threads. */
   recipient_overflow?: number
+  /** On a thread card with more than one sender, each distinct sender oldest
+   * first: a short name, or `me` for the account itself. Empty otherwise. */
+  senders?: { name: string; me: boolean }[]
+  /** Long sender lists keep only the first and the last two; true when senders
+   * between the first entry and the rest were left out. */
+  senders_truncated?: boolean
   /** Local send lifecycle for an optimistically-rendered outgoing message.
    * Absent on messages loaded from the engine (treated as already sent). */
   send_status?: 'sending' | 'sent' | 'failed'

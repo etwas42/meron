@@ -398,6 +398,168 @@ pub(super) fn count_card_rows(
     roots: &[String],
     counts: &mut std::collections::HashMap<String, u32>,
 ) -> Result<()> {
+    for_each_card_row(conn, account, folder, roots, |key, _| {
+        *counts.entry(key).or_insert(0) += 1;
+    })
+}
+
+/// One sender of a thread card, as the list row names them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardSender {
+    /// Short label: the display name's first word, else the address local part.
+    /// Empty when `me` is set — the UI says "You" in its own language.
+    pub name: String,
+    pub me: bool,
+    /// Send time of this sender's newest message in the thread, epoch seconds.
+    pub last_date: i64,
+}
+
+/// The distinct senders behind each of `card_keys`, oldest first, keyed by card
+/// key — the Gmail-style "You, Dana, Bob" in place of the newest sender alone.
+///
+/// Scoped and deduplicated exactly like [`card_message_counts`], so the names
+/// and the count beside them describe the same messages. Senders are told apart
+/// by address, and every one of the account's own addresses (or anything filed
+/// in Sent, see [`super::is_outgoing`]) collapses into a single `me`.
+pub fn card_senders(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    card_keys: &[String],
+) -> Result<std::collections::HashMap<String, Vec<CardSender>>> {
+    use std::collections::HashMap;
+
+    let mut roots: Vec<String> = card_keys
+        .iter()
+        .map(|key| split_thread_key(key).0)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let (uid_roots, threaded_roots): (Vec<String>, Vec<String>) =
+        roots.into_iter().partition(|root| root.starts_with("uid:"));
+
+    let mine = super::self_addrs(conn, account);
+    let mut rows: HashMap<String, Vec<CardRow>> = HashMap::new();
+    let mut collect = |key: String, row: CardRow| rows.entry(key).or_default().push(row);
+    for_each_card_row(conn, account, Some(folder), &uid_roots, &mut collect)?;
+    for_each_card_row(conn, account, None, &threaded_roots, &mut collect)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(key, mut rows)| {
+            rows.sort_by_key(|row| row.date);
+            let me_of = |row: &CardRow| {
+                let addr = row.from_addr.trim().to_lowercase();
+                let me = super::is_outgoing(&mine, &row.folder, &addr, false);
+                (addr, me)
+            };
+            // Address alone is not a person: GitHub, Jira and mailing lists send
+            // every participant's mail from one address under that participant's
+            // display name, so a named sender keys on address and name. Collect
+            // each address's distinct names (with one raw spelling to show) first.
+            let mut named: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+            for row in &rows {
+                let (addr, me) = me_of(row);
+                if let Some(name_key) = sender_name_key(&row.from_name, &addr)
+                    && !me
+                {
+                    named
+                        .entry(addr)
+                        .or_default()
+                        .entry(name_key)
+                        .or_insert_with(|| row.from_name.clone());
+                }
+            }
+            // Identity → position in `senders`, so a repeat voice only moves
+            // that sender's `last_date` forward.
+            let mut seen: HashMap<String, usize> = HashMap::new();
+            let mut senders: Vec<CardSender> = Vec::new();
+            for row in rows {
+                let (addr, me) = me_of(&row);
+                if !me && addr.is_empty() {
+                    continue;
+                }
+                // A message with no usable name joins its address's named sender
+                // when there is exactly one — `Alice Smith <a@x>` and `<a@x>` are
+                // one person. With none it keys on the address; with several (a
+                // shared notification address) it cannot be told which, so it
+                // stays apart rather than being credited to the wrong one.
+                let (identity, display) = if me {
+                    (String::new(), String::new())
+                } else {
+                    let names = named.get(&addr);
+                    match sender_name_key(&row.from_name, &addr) {
+                        Some(name_key) => (format!("{addr}\u{1}{name_key}"), row.from_name.clone()),
+                        None => match names.filter(|names| names.len() == 1) {
+                            Some(names) => {
+                                let (name_key, raw) = names.iter().next().unwrap();
+                                (format!("{addr}\u{1}{name_key}"), raw.clone())
+                            }
+                            None => (addr.clone(), String::new()),
+                        },
+                    }
+                };
+                if let Some(&index) = seen.get(&identity) {
+                    senders[index].last_date = row.date;
+                    continue;
+                }
+                let name = if me {
+                    String::new()
+                } else {
+                    short_sender_name(&display, &addr)
+                };
+                seen.insert(identity, senders.len());
+                senders.push(CardSender {
+                    name,
+                    me,
+                    last_date: row.date,
+                });
+            }
+            (key, senders)
+        })
+        .collect())
+}
+
+/// The comparison key for a sender's display name, or None when the name says
+/// nothing over the address (missing, or one that repeats the address).
+fn sender_name_key(name: &str, addr_lower: &str) -> Option<String> {
+    let name = name.trim().trim_matches('"').trim().to_lowercase();
+    (!name.is_empty() && !name.contains(addr_lower)).then_some(name)
+}
+
+/// "Dana Evans" → "Dana"; a missing or junk name (one that repeats the
+/// address) falls back to the address local part.
+fn short_sender_name(name: &str, addr_lower: &str) -> String {
+    let name = name.trim().trim_matches('"').trim();
+    if name.is_empty() || name.to_lowercase().contains(addr_lower) {
+        return addr_lower.split('@').next().unwrap_or_default().to_string();
+    }
+    name.split_whitespace()
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(',')
+        .to_string()
+}
+
+/// The cached fields [`for_each_card_row`] hands its visitor.
+pub(super) struct CardRow {
+    folder: String,
+    from_name: String,
+    from_addr: String,
+    date: i64,
+}
+
+/// Visit every cached message behind `roots` once, with the card key it belongs
+/// to. `folder` scopes the scan (for `uid:` roots); Message-ID copies across
+/// folders are folded, so a self-sent message cached in Inbox and Sent is one
+/// visit.
+fn for_each_card_row(
+    conn: &Connection,
+    account: &str,
+    folder: Option<&str>,
+    roots: &[String],
+    mut visit: impl FnMut(String, CardRow),
+) -> Result<()> {
     use std::collections::HashSet;
 
     // Message-ID duplicates are folded in Rust rather than with the correlated
@@ -420,7 +582,9 @@ pub(super) fn count_card_rows(
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(NULLIF(thread_key, ''), 'uid:' || uid), subject,
-                    COALESCE(json_extract(json, '$.message_id'), '') FROM messages
+                    COALESCE(json_extract(json, '$.message_id'), ''),
+                    folder, COALESCE(from_name, ''), COALESCE(from_addr, ''), date
+             FROM messages
              WHERE account = ?1 AND {folder_clause}uid <> 0
                AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) IN ({placeholders})"
         ))?;
@@ -432,10 +596,16 @@ pub(super) fn count_card_rows(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                CardRow {
+                    folder: row.get(3)?,
+                    from_name: row.get(4)?,
+                    from_addr: row.get(5)?,
+                    date: row.get(6)?,
+                },
             ))
         })?;
         for row in rows {
-            let (root, subject, message_id) = row?;
+            let (root, subject, message_id, card_row) = row?;
             let key = if should_branch_thread_by_subject(&root) {
                 branch_compound_key(&root, &thread_grouping_subject(&subject))
             } else {
@@ -446,7 +616,7 @@ pub(super) fn count_card_rows(
             if !message_id.is_empty() && !seen_ids.insert((key.clone(), message_id)) {
                 continue;
             }
-            *counts.entry(key).or_insert(0) += 1;
+            visit(key, card_row);
         }
     }
     Ok(())

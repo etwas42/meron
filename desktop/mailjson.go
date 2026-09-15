@@ -103,6 +103,8 @@ func threadsJSON(accountID, folder string, raw any) any {
 			HasDraft:          jsonBool(card["has_draft"]),
 			OriginalThreadID:  originalThreadID,
 			RecipientOverflow: uint32(jsonNumber(card["recipient_overflow"])),
+			Senders:           threadSenders(card["senders"]),
+			SendersTruncated:  jsonBool(card["senders_truncated"]),
 		})
 	}
 	out := map[string]any{
@@ -111,6 +113,22 @@ func threadsJSON(accountID, folder string, raw any) any {
 	}
 	copyPageMetadata(object, out)
 	return out
+}
+
+func threadSenders(value any) []ThreadSender {
+	list, _ := value.([]any)
+	senders := make([]ThreadSender, 0, len(list))
+	for _, item := range list {
+		sender, _ := item.(map[string]any)
+		senders = append(senders, ThreadSender{
+			Name: jsonString(sender["name"]),
+			Me:   jsonBool(sender["me"]),
+		})
+	}
+	if len(senders) == 0 {
+		return nil
+	}
+	return senders
 }
 
 func copyPageMetadata(object, out map[string]any) {

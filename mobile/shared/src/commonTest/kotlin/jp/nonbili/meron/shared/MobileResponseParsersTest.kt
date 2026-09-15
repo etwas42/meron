@@ -181,6 +181,19 @@ class MobileResponseParsersTest {
     }
 
     @Test
+    fun parsesThreadSendersFromTopLevelKeysOnly() {
+        val threads =
+            parseThreadListResponse(
+                """{"result":{"threads":[{"id":"acc#INBOX#t","subject":"\"senders\":[{\"name\":\"Forged\"}]","from_name":"Dana Evans","senders":[{"name":"Carol","me":false},{"name":"","me":true},{"name":"Dana","me":false}],"senders_truncated":true},{"id":"acc#INBOX#u","subject":"Solo"}]}}""",
+            )
+
+        assertEquals(listOf("Carol", "", "Dana"), threads[0].senders)
+        assertTrue(threads[0].sendersTruncated)
+        assertEquals(emptyList(), threads[1].senders)
+        assertFalse(threads[1].sendersTruncated)
+    }
+
+    @Test
     fun starredItemSenderFallsBackToAddressWhenNameIsEmpty() {
         val items =
             parseStarredItemsResponse(

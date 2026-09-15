@@ -99,6 +99,17 @@ type Message struct {
 	// RecipientOverflow is the count of additional recipients beyond the one shown
 	// on an outbound thread card (for a "+N" hint); 0 for inbound/single-recipient.
 	RecipientOverflow uint32 `json:"recipient_overflow,omitempty"`
+	// Senders lists each distinct sender of a thread card with more than one,
+	// oldest first; SendersTruncated marks senders left out after the first.
+	Senders          []ThreadSender `json:"senders,omitempty"`
+	SendersTruncated bool           `json:"senders_truncated,omitempty"`
+}
+
+// ThreadSender is one sender on a thread card: a short name, or Me for the
+// account itself (the UI says "You").
+type ThreadSender struct {
+	Name string `json:"name"`
+	Me   bool   `json:"me"`
 }
 
 type AddPasswordAccountRequest struct {
