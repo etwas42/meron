@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Empty {folder}?",
   "threads.emptyFolder.done": "{folder} emptied",
   "threads.emptyFolder.failed": "Could not empty {folder}",
+  "threads.me": "me",
   "threads.moveConversation": "Move conversation",
   "threads.noSubject": "(no subject)",
   "threads.searchFeeds": "Search feeds...",

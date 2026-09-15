@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Vai iztukšot {folder}?",
   "threads.emptyFolder.done": "{folder} iztukšota",
   "threads.emptyFolder.failed": "Neizdevās iztukšot {folder}",
+  "threads.me": "es",
   "threads.moveConversation": "Pārvietot sarunu",
   "threads.noSubject": "(bez tēmas)",
   "threads.searchFeeds": "Meklēt plūsmas...",

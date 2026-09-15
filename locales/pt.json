@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Esvaziar {folder}?",
   "threads.emptyFolder.done": "{folder} esvaziada",
   "threads.emptyFolder.failed": "Não foi possível esvaziar {folder}",
+  "threads.me": "eu",
   "threads.moveConversation": "Mover conversa",
   "threads.noSubject": "(sem assunto)",
   "threads.searchFeeds": "Pesquisar feeds...",

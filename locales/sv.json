@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Töm {folder}?",
   "threads.emptyFolder.done": "{folder} tömd",
   "threads.emptyFolder.failed": "Det gick inte att tömma {folder}",
+  "threads.me": "jag",
   "threads.moveConversation": "Flytta konversation",
   "threads.noSubject": "(inget ämne)",
   "threads.searchFeeds": "Sök flöden...",

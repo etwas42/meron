@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Opróżnić {folder}?",
   "threads.emptyFolder.done": "Opróżniono {folder}",
   "threads.emptyFolder.failed": "Nie udało się opróżnić {folder}",
+  "threads.me": "ja",
   "threads.moveConversation": "Przenieś rozmowę",
   "threads.noSubject": "(bez tematu)",
   "threads.searchFeeds": "Szukaj kanałów...",

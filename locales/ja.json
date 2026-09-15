@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "{folder} を空にしますか？",
   "threads.emptyFolder.done": "{folder} を空にしました",
   "threads.emptyFolder.failed": "{folder} を空にできませんでした",
+  "threads.me": "自分",
   "threads.moveConversation": "会話を移動",
   "threads.noSubject": "(件名なし)",
   "threads.searchFeeds": "フィードを検索...",

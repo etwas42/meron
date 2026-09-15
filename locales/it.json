@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Svuotare {folder}?",
   "threads.emptyFolder.done": "{folder} svuotata",
   "threads.emptyFolder.failed": "Impossibile svuotare {folder}",
+  "threads.me": "io",
   "threads.moveConversation": "Sposta la conversazione",
   "threads.noSubject": "(nessun argomento)",
   "threads.searchFeeds": "Cerca feed...",

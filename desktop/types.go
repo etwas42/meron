@@ -106,7 +106,7 @@ type Message struct {
 }
 
 // ThreadSender is one sender on a thread card: a short name, or Me for the
-// account itself (the UI says "You").
+// account itself (the UI says "me").
 type ThreadSender struct {
 	Name string `json:"name"`
 	Me   bool   `json:"me"`

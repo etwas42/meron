@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Dọn {folder}?",
   "threads.emptyFolder.done": "Đã dọn {folder}",
   "threads.emptyFolder.failed": "Không thể dọn {folder}",
+  "threads.me": "tôi",
   "threads.moveConversation": "Di chuyển cuộc trò chuyện",
   "threads.noSubject": "(không có chủ đề)",
   "threads.searchFeeds": "Tìm kiếm nguồn tin...",

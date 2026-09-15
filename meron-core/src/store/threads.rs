@@ -407,7 +407,7 @@ pub(super) fn count_card_rows(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardSender {
     /// Short label: the display name's first word, else the address local part.
-    /// Empty when `me` is set — the UI says "You" in its own language.
+    /// Empty when `me` is set — the UI says "me" in its own language.
     pub name: String,
     pub me: bool,
     /// Send time of this sender's newest message in the thread, epoch seconds.
@@ -415,7 +415,7 @@ pub struct CardSender {
 }
 
 /// The distinct senders behind each of `card_keys`, oldest first, keyed by card
-/// key — the Gmail-style "You, Dana, Bob" in place of the newest sender alone.
+/// key — the Gmail-style "me, Dana, Bob" in place of the newest sender alone.
 ///
 /// Scoped and deduplicated exactly like [`card_message_counts`], so the names
 /// and the count beside them describe the same messages. Senders are told apart

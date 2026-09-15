@@ -116,7 +116,7 @@ data class ThreadSummary(
     /** Total messages in the thread, read or not; 0 when the core did not group. */
     val messageCount: Int = 0,
     /** Distinct senders oldest first when the thread has more than one; a blank
-     *  entry is the account itself, for the row to say "You". */
+     *  entry is the account itself, for the row to say "me". */
     val senders: List<String> = emptyList(),
     /** Senders between the first entry and the rest were left out of a long list. */
     val sendersTruncated: Boolean = false,

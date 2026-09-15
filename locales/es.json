@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "¿Vaciar {folder}?",
   "threads.emptyFolder.done": "{folder} vaciada",
   "threads.emptyFolder.failed": "No se pudo vaciar {folder}",
+  "threads.me": "yo",
   "threads.moveConversation": "Mover conversación",
   "threads.noSubject": "(sin tema)",
   "threads.searchFeeds": "Buscar feeds...",

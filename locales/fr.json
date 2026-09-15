@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Vider {folder} ?",
   "threads.emptyFolder.done": "{folder} vidé",
   "threads.emptyFolder.failed": "Impossible de vider {folder}",
+  "threads.me": "moi",
   "threads.moveConversation": "Déplacer la conversation",
   "threads.noSubject": "(pas de sujet)",
   "threads.searchFeeds": "Rechercher des flux...",

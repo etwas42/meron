@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "إفراغ {folder}؟",
   "threads.emptyFolder.done": "تم إفراغ {folder}",
   "threads.emptyFolder.failed": "تعذر إفراغ {folder}",
+  "threads.me": "أنا",
   "threads.moveConversation": "نقل المحادثة",
   "threads.noSubject": "(لا يوجد موضوع)",
   "threads.searchFeeds": "البحث في الخلاصات...",

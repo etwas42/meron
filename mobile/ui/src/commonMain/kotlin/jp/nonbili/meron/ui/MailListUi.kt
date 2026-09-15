@@ -657,10 +657,10 @@ internal fun MailRow(
                     Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    val you = tr("chat.you")
+                    val me = tr("threads.me")
                     Text(
                         if (thread.senders.size > 1) {
-                            val names = thread.senders.map { it.ifBlank { you } }
+                            val names = thread.senders.map { it.ifBlank { me } }
                             if (thread.sendersTruncated) {
                                 names.first() + " .. " + names.drop(1).joinToString(", ")
                             } else {

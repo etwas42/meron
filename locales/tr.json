@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "{folder} boşaltılsın mı?",
   "threads.emptyFolder.done": "{folder} boşaltıldı",
   "threads.emptyFolder.failed": "{folder} boşaltılamadı",
+  "threads.me": "ben",
   "threads.moveConversation": "Konuşmayı taşı",
   "threads.noSubject": "(konu yok)",
   "threads.searchFeeds": "Beslemelerde ara...",

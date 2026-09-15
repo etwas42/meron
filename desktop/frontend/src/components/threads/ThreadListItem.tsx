@@ -120,7 +120,7 @@ export function ThreadListItem({
               >
                 {thread.senders && thread.senders.length > 1
                   ? thread.senders
-                      .map((sender) => (sender.me ? t('chat.you') : sender.name))
+                      .map((sender) => (sender.me ? t('threads.me') : sender.name))
                       .reduce(
                         (label, name, index) =>
                           `${label}${index === 1 && thread.senders_truncated ? ' .. ' : ', '}${name}`,

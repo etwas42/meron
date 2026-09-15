@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Kas tühjendada {folder}?",
   "threads.emptyFolder.done": "{folder} on tühjendatud",
   "threads.emptyFolder.failed": "Kausta {folder} ei õnnestunud tühjendada",
+  "threads.me": "mina",
   "threads.moveConversation": "Teisalda vestlus",
   "threads.noSubject": "(teemat pole)",
   "threads.searchFeeds": "Otsi vooge...",

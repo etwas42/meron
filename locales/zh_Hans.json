@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "清空 {folder}？",
   "threads.emptyFolder.done": "已清空 {folder}",
   "threads.emptyFolder.failed": "无法清空 {folder}",
+  "threads.me": "我",
   "threads.moveConversation": "移动对话",
   "threads.noSubject": "（无主题）",
   "threads.searchFeeds": "搜索订阅源...",

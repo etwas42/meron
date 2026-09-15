@@ -244,7 +244,7 @@ fn thread_cards_json_keyed(
                 .unwrap_or_else(|| card.header.subject.clone());
             // Only a thread with more than one sender gets the list; a single
             // correspondent keeps the card identity (which names the recipient
-            // on an outbound-only thread rather than "You").
+            // on an outbound-only thread rather than "me").
             //
             // Past three, Gmail-style: the opener, then a gap, then the two who
             // wrote most recently (by their newest message, not their first, so

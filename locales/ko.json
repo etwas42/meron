@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "{folder}을(를) 비울까요?",
   "threads.emptyFolder.done": "{folder}을(를) 비웠습니다",
   "threads.emptyFolder.failed": "{folder}을(를) 비우지 못했습니다",
+  "threads.me": "나",
   "threads.moveConversation": "대화 이동",
   "threads.noSubject": "(제목 없음)",
   "threads.searchFeeds": "피드 검색...",

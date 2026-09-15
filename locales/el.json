@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "Άδειασμα {folder};",
   "threads.emptyFolder.done": "Το {folder} άδειασε",
   "threads.emptyFolder.failed": "Δεν ήταν δυνατό το άδειασμα του {folder}",
+  "threads.me": "εγώ",
   "threads.moveConversation": "Μετακίνηση συνομιλίας",
   "threads.noSubject": "(χωρίς θέμα)",
   "threads.searchFeeds": "Αναζήτηση ροών...",

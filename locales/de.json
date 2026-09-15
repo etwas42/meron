@@ -874,6 +874,7 @@
   "threads.emptyFolder.confirmTitle": "{folder} leeren?",
   "threads.emptyFolder.done": "{folder} geleert",
   "threads.emptyFolder.failed": "{folder} konnte nicht geleert werden",
+  "threads.me": "ich",
   "threads.moveConversation": "Gespräch verschieben",
   "threads.noSubject": "(kein Thema)",
   "threads.searchFeeds": "Feeds suchen...",
