@@ -8,6 +8,8 @@ type RecipientInputProps = {
   accountId: string
   placeholder?: string
   autoFocus?: boolean
+  inputRef?: React.Ref<HTMLInputElement>
+  onTab?: () => void
 }
 
 // A comma-separated recipient field carries multiple addresses; autocomplete
@@ -21,11 +23,20 @@ function splitTail(value: string): { head: string; tail: string } {
 
 const inputClass = 'w-full bg-transparent text-[0.8125rem] text-primary placeholder-secondary outline-none'
 
-export function RecipientInput({ value, onChange, accountId, placeholder, autoFocus }: RecipientInputProps) {
+export function RecipientInput({
+  value,
+  onChange,
+  accountId,
+  placeholder,
+  autoFocus,
+  inputRef,
+  onTab,
+}: RecipientInputProps) {
   const [suggestions, setSuggestions] = useState<Contact[]>([])
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(0)
   const focusedRef = useRef(false)
+  const suggestionsEnabledRef = useRef(false)
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const tail = splitTail(value).tail.trim()
@@ -33,11 +44,11 @@ export function RecipientInput({ value, onChange, accountId, placeholder, autoFo
   // Fetch suggestions (debounced) while focused. An empty token surfaces the
   // top correspondents; otherwise we match what's been typed so far.
   useEffect(() => {
-    if (!focusedRef.current) return
+    if (!focusedRef.current || !suggestionsEnabledRef.current) return
     let cancelled = false
     const timer = setTimeout(async () => {
       const results = await suggestContacts(accountId, tail)
-      if (cancelled) return
+      if (cancelled || !focusedRef.current || !suggestionsEnabledRef.current) return
       setSuggestions(results)
       setActive(0)
       setOpen(results.length > 0)
@@ -57,6 +68,15 @@ export function RecipientInput({ value, onChange, accountId, placeholder, autoFo
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Tab' && !(open && suggestions.length > 0)) {
+      suggestionsEnabledRef.current = false
+      setOpen(false)
+      if (onTab && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault()
+        onTab()
+      }
+      return
+    }
     if (open && suggestions.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
@@ -85,29 +105,39 @@ export function RecipientInput({ value, onChange, accountId, placeholder, autoFo
   return (
     <div className="relative flex-1">
       <input
+        ref={inputRef}
         autoFocus={autoFocus}
         value={value}
         placeholder={placeholder}
         spellCheck={false}
         className={inputClass}
-        onChange={(e) => onChange(e.target.value)}
+        onChange={(e) => {
+          suggestionsEnabledRef.current = true
+          onChange(e.target.value)
+        }}
         onKeyDown={onKeyDown}
         onFocus={() => {
           focusedRef.current = true
           if (blurTimer.current) clearTimeout(blurTimer.current)
+          // Existing recipients should only trigger suggestions when edited.
+          suggestionsEnabledRef.current = value.trim().length === 0
+          if (!suggestionsEnabledRef.current) {
+            setOpen(false)
+            return
+          }
           if (suggestions.length > 0) setOpen(true)
           else
             void suggestContacts(accountId, tail).then((r) => {
-              if (!focusedRef.current) return
+              if (!focusedRef.current || !suggestionsEnabledRef.current) return
               setSuggestions(r)
               setActive(0)
               setOpen(r.length > 0)
             })
         }}
         onBlur={() => {
+          focusedRef.current = false
           // Delay so a mousedown on a suggestion registers before we close.
           blurTimer.current = setTimeout(() => {
-            focusedRef.current = false
             setOpen(false)
           }, 150)
         }}

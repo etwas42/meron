@@ -1,4 +1,5 @@
 import { useValue } from '@legendapp/state/react'
+import { useRef } from 'react'
 import { useTranslation } from '../../lib/i18n'
 import { accounts$, isSendableAccount, accountIdentities } from '../../states/accounts'
 import { settings$ } from '../../states/settings'
@@ -14,12 +15,16 @@ export function ComposerHeaderFields({
   draft,
   update,
   focusTo,
+  onFocusBody,
 }: {
   draft: ComposeDraft
   update: (partial: Partial<ComposeDraft>) => void
   focusTo: boolean
+  onFocusBody: () => void
 }) {
   const { t } = useTranslation()
+  const ccRef = useRef<HTMLInputElement>(null)
+  const subjectRef = useRef<HTMLInputElement>(null)
   const accounts = useValue(accounts$)
   const spellCheck = useValue(settings$.spellCheck)
   const sendable = accounts.filter(isSendableAccount)
@@ -58,6 +63,7 @@ export function ComposerHeaderFields({
         <span className={labelClass}>{t('composer.fields.to')}</span>
         <RecipientInput
           autoFocus={focusTo}
+          onTab={() => (draft.showCcBcc ? ccRef.current : subjectRef.current)?.focus()}
           value={draft.to}
           onChange={(to) => update({ to })}
           accountId={draft.accountId}
@@ -76,6 +82,7 @@ export function ComposerHeaderFields({
           <div className="flex items-center gap-2 border-b border-border/60 py-1.5">
             <span className={labelClass}>{t('composer.fields.cc')}</span>
             <RecipientInput
+              inputRef={ccRef}
               value={draft.cc}
               onChange={(cc) => update({ cc })}
               accountId={draft.accountId}
@@ -97,8 +104,15 @@ export function ComposerHeaderFields({
       <div className="flex items-center gap-2 py-1.5">
         <span className={labelClass}>{t('composer.fields.subject')}</span>
         <input
+          ref={subjectRef}
           value={draft.subject}
           onChange={(e) => update({ subject: e.target.value })}
+          onKeyDown={(e) => {
+            if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+              e.preventDefault()
+              onFocusBody()
+            }
+          }}
           placeholder={t('composer.fields.subject')}
           spellCheck={spellCheck}
           className={fieldClass}

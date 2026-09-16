@@ -47,7 +47,15 @@ export function Composer({ tabId }: { tabId: string }) {
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden bg-chat" onKeyDown={handleSendShortcut}>
-      <ComposerHeaderFields draft={draft} update={update} focusTo={!focusBody} />
+      <ComposerHeaderFields
+        draft={draft}
+        update={update}
+        focusTo={!focusBody}
+        onFocusBody={() => {
+          if (draft.rich) editor?.commands.focus()
+          else textRef.current?.focus()
+        }}
+      />
 
       {draft.rich && editor && <ComposerToolbar editor={editor} onSetLink={setLink} />}
 
