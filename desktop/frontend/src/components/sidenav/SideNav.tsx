@@ -156,7 +156,7 @@ export function SideNav() {
           <div className="h-px w-8 shrink-0 bg-white/10" />
         </>
       )}
-      <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-4 overflow-y-auto pt-1.5">
+      <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-4 overflow-y-auto no-scrollbar pt-1.5">
         {/* Unified Inbox Home Button */}
         {showUnifiedInbox && (
           <div className="relative w-full flex justify-center group">

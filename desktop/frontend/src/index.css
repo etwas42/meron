@@ -25,6 +25,9 @@
   --color-accent-hover-label: var(--me-accent-hover-label, #ffffff);
   --color-unread-bg: color-mix(in srgb, var(--me-accent) 18%, var(--me-bg-chats));
   --color-unread-text: color-mix(in srgb, var(--me-accent) 55%, var(--me-text-primary));
+  /* The rail badge sits on the always-dark sidenav, so it cannot reuse
+     --color-unread-bg: that one is mixed into --me-bg-chats, a column surface
+     that is dark in dark themes and would leave the badge unreadable there. */
   --color-unread-rail-bg: color-mix(in srgb, var(--me-accent) 35%, white);
   --color-unread-rail-text: color-mix(in srgb, var(--me-accent) 25%, var(--me-bg-sidenav));
   /* Side nav glyphs sit on the always-dark sidenav, in light themes too, so an
@@ -345,6 +348,15 @@ textarea,
 
 [data-thread-list]::-webkit-scrollbar-thumb:hover {
   border-width: 0;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 /* Custom patterns */
