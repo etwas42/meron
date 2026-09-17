@@ -21,6 +21,11 @@
   --color-secondary: var(--me-text-secondary);
   --color-accent: var(--me-accent);
   --color-accent-hover: var(--me-accent-hover);
+  /* Side nav glyphs sit on the always-dark sidenav, in light themes too, so an
+     accent tinted toward white is what reads there. --me-accent-hover is not a
+     substitute: it darkens in light themes (see accentHover in lib/themes.ts).
+     Derived from --me-accent so custom themes track it with no extra plumbing. */
+  --color-accent-bright: color-mix(in srgb, var(--me-accent) 70%, white);
   --color-bubble-in: var(--me-bubble-in);
   --color-bubble-in-text: var(--me-bubble-in-text);
   --color-bubble-out: var(--me-bubble-out);

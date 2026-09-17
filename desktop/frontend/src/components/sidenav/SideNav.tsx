@@ -1,13 +1,15 @@
 import { useState } from 'react'
 import type { DragEvent } from 'react'
-import { Mail, MoreHorizontal, EyeOff } from 'lucide-react'
+import { Mail, MoreHorizontal, EyeOff, SquarePen } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
+import { formatShortcut, isMac, RAIL_SHORTCUT_IDS } from '../../lib/shortcuts'
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import type { DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { restrictToVerticalAxis } from '@dnd-kit/modifiers'
-import { accounts$, reorderAccountIds } from '../../states/accounts'
+import { accounts$, isSendableAccount, reorderAccountIds } from '../../states/accounts'
+import { openComposeTab } from '../../states/compose'
 import { moveFeed, RSS_FEED_DRAG_TYPE } from '../../states/feeds'
 import { kanban$, openMailAccount, reorderKanbanBoards, selectKanbanBoard } from '../../states/kanban'
 import { mail$ } from '../../states/mail'
@@ -26,6 +28,7 @@ import type { Account } from '../../types'
 export function SideNav() {
   const { t } = useTranslation()
   const accounts = useValue(accounts$)
+  useValue(settings$.shortcutOverrides)
   const boards = useValue(settings$.kanbanBoards)
   const hiddenSideNavAccounts = useValue(settings$.hiddenSideNavAccounts)
   const showUnifiedInbox = useValue(settings$.showUnifiedInboxInSideNav)
@@ -33,6 +36,7 @@ export function SideNav() {
   const foldersByAccount = useValue(mail$.foldersByAccount)
   const activeBoardId = useValue(kanban$.activeBoardId)
   const selectedAccount = useValue(ui$.selectedAccount)
+  const hasSendableAccount = accounts.some(isSendableAccount)
   // Right-click context menu anchored at the cursor for one account.
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null)
   const menuAccount = menu ? accounts.find((acc) => acc.id === menu.id) : null
@@ -57,6 +61,10 @@ export function SideNav() {
   const sideNavAccounts = accounts.filter((account) => !hiddenSideNavAccountIds.has(account.id))
   const hasBoards = boards.length > 0
   const hasAccounts = sideNavAccounts.length > 0
+  const railShortcut = (index: number) => {
+    const id = RAIL_SHORTCUT_IDS[index]
+    return id ? formatShortcut(id).join(isMac ? '' : '+') : undefined
+  }
 
   const isRssAccount = (account: { provider: string; auth_type: string }) =>
     account.provider === 'rss' || account.auth_type === 'rss'
@@ -135,6 +143,19 @@ export function SideNav() {
         setMoreMenu({ x: event.clientX, y: event.clientY })
       }}
     >
+      {hasSendableAccount && (
+        <>
+          <button
+            className="relative isolate flex h-11 w-11 shrink-0 transform-gpu items-center justify-center overflow-hidden rounded-2xl bg-accent text-white hover:bg-accent-hover cursor-pointer"
+            onClick={() => openComposeTab()}
+            title={`${t('composer.actions.newMessage')} (${formatShortcut('compose.new').join(isMac ? '' : '+')})`}
+            aria-label={t('composer.actions.newMessage')}
+          >
+            <SquarePen size={19} />
+          </button>
+          <div className="h-px w-8 shrink-0 bg-white/10" />
+        </>
+      )}
       <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-4 overflow-y-auto pt-1.5">
         {/* Unified Inbox Home Button */}
         {showUnifiedInbox && (
@@ -157,7 +178,7 @@ export function SideNav() {
                   event.stopPropagation()
                   setUnifiedMenu({ x: event.clientX, y: event.clientY })
                 }}
-                title={t('settings.sideNav.showUnifiedInbox')}
+                title={`${t('settings.sideNav.showUnifiedInbox')} (${railShortcut(0)})`}
               >
                 <Mail size={19} />
               </button>
@@ -178,10 +199,11 @@ export function SideNav() {
               modifiers={[restrictToVerticalAxis]}
             >
               <SortableContext items={boards.map((board) => board.id)} strategy={verticalListSortingStrategy}>
-                {boards.map((board) => (
+                {boards.map((board, index) => (
                   <SortableBoard
                     key={board.id}
                     board={board}
+                    shortcut={railShortcut(Number(showUnifiedInbox) + index)}
                     active={board.id === activeBoardId}
                     onSelect={() => selectKanbanBoard(board.id)}
                     onContextMenu={(e) => {
@@ -208,10 +230,11 @@ export function SideNav() {
               modifiers={[restrictToVerticalAxis]}
             >
               <SortableContext items={sideNavAccounts.map((acc) => acc.id)} strategy={verticalListSortingStrategy}>
-                {sideNavAccounts.map((account) => (
+                {sideNavAccounts.map((account, index) => (
                   <SortableAccount
                     key={account.id}
                     account={account}
+                    shortcut={railShortcut(Number(showUnifiedInbox) + boards.length + index)}
                     active={!activeBoardId && account.id === selectedAccount}
                     onSelect={() => selectAccount(account.id)}
                     onContextMenu={(e) => {

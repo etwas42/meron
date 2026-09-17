@@ -52,8 +52,14 @@ export function Composer({ tabId }: { tabId: string }) {
         update={update}
         focusTo={!focusBody}
         onFocusBody={() => {
-          if (draft.rich) editor?.commands.focus()
-          else textRef.current?.focus()
+          if (draft.rich) {
+            if (!editor || editor.isDestroyed) return false
+            editor.view.focus()
+            return editor.view.hasFocus()
+          }
+          const body = textRef.current
+          body?.focus()
+          return !!body && body.ownerDocument.activeElement === body
         }}
       />
 

@@ -37,13 +37,14 @@ const activeIndicator = (active: boolean) => (
 )
 
 interface SortableBoardProps {
+  shortcut?: string
   board: { id: string; name: string; avatarUrl?: string }
   active: boolean
   onSelect: () => void
   onContextMenu: (e: React.MouseEvent) => void
 }
 
-export function SortableBoard({ board, active, onSelect, onContextMenu }: SortableBoardProps) {
+export function SortableBoard({ board, active, onSelect, onContextMenu, shortcut }: SortableBoardProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: board.id })
 
   return (
@@ -55,7 +56,7 @@ export function SortableBoard({ board, active, onSelect, onContextMenu }: Sortab
       onClick={onSelect}
       onContextMenu={onContextMenu}
       className="relative w-full flex justify-center group cursor-move"
-      title={board.name}
+      title={board.name + (shortcut ? ` (${shortcut})` : '')}
     >
       {activeIndicator(active)}
       {board.avatarUrl ? (
@@ -84,6 +85,7 @@ export function SortableBoard({ board, active, onSelect, onContextMenu }: Sortab
 }
 
 interface SortableAccountProps {
+  shortcut?: string
   account: Account
   active: boolean
   onSelect: () => void
@@ -94,6 +96,7 @@ interface SortableAccountProps {
 
 export function SortableAccount({
   account,
+  shortcut,
   active,
   onSelect,
   onContextMenu,
@@ -127,7 +130,7 @@ export function SortableAccount({
       onDragOver={(event) => onFeedDragOver?.(event, account)}
       onDrop={(event) => onFeedDrop?.(event, account)}
       className="relative w-full flex justify-center group cursor-move"
-      title={baseTooltip + stateSuffix}
+      title={baseTooltip + stateSuffix + (shortcut ? ` (${shortcut})` : '')}
     >
       {activeIndicator(active)}
       {/* Badges live on this wrapper, not the dimmed avatar div, so the unread

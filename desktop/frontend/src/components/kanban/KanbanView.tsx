@@ -273,6 +273,7 @@ export function KanbanView({ boardId }: { boardId: string }) {
           <IconButton
             icon={SquarePen}
             label={t('composer.actions.newMessage')}
+            className="min-[769px]:hidden"
             onClick={() => {
               const id = openComposeTab()
               if (!id) return

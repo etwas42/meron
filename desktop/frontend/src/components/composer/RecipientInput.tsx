@@ -60,6 +60,7 @@ export function RecipientInput({
   }, [tail, accountId])
 
   function accept(contact: Contact) {
+    suggestionsEnabledRef.current = false
     const { head } = splitTail(value)
     const prefix = head ? `${head} ` : ''
     onChange(`${prefix}${formatContact(contact)}, `)
@@ -68,10 +69,11 @@ export function RecipientInput({
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'Tab' && !(open && suggestions.length > 0)) {
+    const plainTab = e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
+    if (e.key === 'Tab' && (!plainTab || !(open && suggestions.length > 0))) {
       suggestionsEnabledRef.current = false
       setOpen(false)
-      if (onTab && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (onTab && plainTab) {
         e.preventDefault()
         onTab()
       }

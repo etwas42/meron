@@ -296,12 +296,13 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                   className="min-[769px]:hidden"
                   onClick={() => ui$.setupOpen.set(true)}
                 />
-                {/* New mail (compose) */}
+                {/* Compose remains in the header when the side navigation is hidden. */}
                 {hasSendableAccount && !isStarredView && !isRSSAccount && (
                   <IconButton
                     icon={SquarePen}
                     iconSize={16}
                     label={t('composer.actions.newMessage')}
+                    className="min-[769px]:hidden"
                     size="md"
                     radius="lg"
                     onClick={() => openComposeTab()}

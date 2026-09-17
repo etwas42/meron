@@ -20,7 +20,7 @@ export function ComposerHeaderFields({
   draft: ComposeDraft
   update: (partial: Partial<ComposeDraft>) => void
   focusTo: boolean
-  onFocusBody: () => void
+  onFocusBody: () => boolean
 }) {
   const { t } = useTranslation()
   const ccRef = useRef<HTMLInputElement>(null)
@@ -109,8 +109,7 @@ export function ComposerHeaderFields({
           onChange={(e) => update({ subject: e.target.value })}
           onKeyDown={(e) => {
             if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-              e.preventDefault()
-              onFocusBody()
+              if (onFocusBody()) e.preventDefault()
             }
           }}
           placeholder={t('composer.fields.subject')}
