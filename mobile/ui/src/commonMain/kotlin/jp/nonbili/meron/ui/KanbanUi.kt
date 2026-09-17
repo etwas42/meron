@@ -1021,18 +1021,19 @@ internal fun KanbanUnreadBadge(
     unread: Int,
     modifier: Modifier = Modifier,
 ) {
+    val chat = LocalChatColors.current
     Box(
         modifier
             .heightIn(min = 18.dp)
             .widthIn(min = 18.dp)
             .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.primary)
+            .background(chat.unreadBackground)
             .padding(horizontal = 5.dp, vertical = 2.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             unread.toString(),
-            color = MaterialTheme.colorScheme.onPrimary,
+            color = chat.unreadText,
             fontSize = 10.sp,
             lineHeight = 10.sp,
             fontWeight = FontWeight.Bold,

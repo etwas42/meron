@@ -479,7 +479,7 @@ internal fun SidebarRow(
     title: String,
     trailing: String?,
 ) {
-    val tint = if (selected) MaterialTheme.colorScheme.primary else chat.onSidebarMuted
+    val tint = if (selected) chat.sidebarAccent else chat.onSidebarMuted
     Row(
         Modifier
             .fillMaxWidth()
@@ -511,13 +511,13 @@ internal fun SidebarRow(
                     .height(28.dp)
                     .widthIn(min = 28.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primary)
+                    .background(chat.sidebarUnreadBackground)
                     .padding(horizontal = 8.dp),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
                     trailing,
-                    color = Color.White,
+                    color = chat.sidebarUnreadText,
                     fontSize = 12.sp,
                     lineHeight = 12.sp,
                     fontWeight = FontWeight.Bold,

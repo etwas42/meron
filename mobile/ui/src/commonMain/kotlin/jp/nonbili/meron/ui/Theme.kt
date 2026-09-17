@@ -7,6 +7,8 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.graphics.luminance
 
 enum class AppAppearanceMode(
     val storageValue: String,
@@ -34,11 +36,16 @@ data class ChatColors(
     val sidebar: Color,
     val onSidebar: Color,
     val onSidebarMuted: Color,
+    val sidebarAccent: Color,
     val bubbleIn: Color,
     val bubbleInText: Color,
     val bubbleOut: Color,
     val bubbleOutText: Color,
     val star: Color,
+    val unreadBackground: Color,
+    val unreadText: Color,
+    val sidebarUnreadBackground: Color,
+    val sidebarUnreadText: Color,
 )
 
 private data class MobileThemeSpec(
@@ -71,7 +78,7 @@ private val IndigoLight =
         Color(0xFFE2E8F0),
         Color(0xFF0F172A),
         Color(0xFF64748B),
-        Color(0xFF4F46E5),
+        Color(0xFF6558CC),
         Color(0xFFE0E7FF),
         Color(0xFF312E81),
         Color(0xFF0F172A),
@@ -90,7 +97,7 @@ private val IndigoDark =
         Color(0xFF1E293B),
         Color(0xFFF8FAFC),
         Color(0xFF94A3B8),
-        Color(0xFF6366F1),
+        Color(0xFF7165C4),
         Color(0xFF312E81),
         Color(0xFFE0E7FF),
         Color(0xFF05070C),
@@ -128,7 +135,7 @@ private val MeronDark =
         Color(0xFF28332D),
         Color(0xFFF2F5F3),
         Color(0xFF98A39D),
-        Color(0xFF36B489),
+        Color(0xFF40A984),
         Color(0xFF1C463A),
         Color(0xFFD6EEE2),
         Color(0xFF070A09),
@@ -147,7 +154,7 @@ private val Mist =
         Color(0xFFCFE0E5),
         Color(0xFF14323C),
         Color(0xFF6F8790),
-        Color(0xFF0EA5B7),
+        Color(0xFF2996A6),
         Color(0xFFD5F0F4),
         Color(0xFF0E5663),
         Color(0xFF123947),
@@ -261,7 +268,7 @@ private val Midnight =
         Color(0xFF26354D),
         Color(0xFFF8FAFC),
         Color(0xFF94A3B8),
-        Color(0xFF38BDF8),
+        Color(0xFF55ADD5),
         Color(0xFF12324A),
         Color(0xFFDFF6FF),
         Color(0xFF050814),
@@ -404,11 +411,17 @@ private fun mobileThemeSpec(
         AppAppearanceMode.Ember -> Ember
     }
 
+/** Choose the higher-contrast label for an opaque accent, matching desktop. */
+internal fun accentLabelColor(color: Color): Color {
+    val luminance = color.luminance()
+    return if (1.05f / (luminance + 0.05f) >= (luminance + 0.05f) / 0.05f) Color.White else Color.Black
+}
+
 private fun materialColors(spec: MobileThemeSpec) =
     if (spec.dark) {
         darkColorScheme(
             primary = spec.accent,
-            onPrimary = Color.White,
+            onPrimary = accentLabelColor(spec.accent),
             primaryContainer = spec.accentContainer,
             onPrimaryContainer = spec.onAccentContainer,
             secondary = spec.textSecondary,
@@ -431,7 +444,7 @@ private fun materialColors(spec: MobileThemeSpec) =
     } else {
         lightColorScheme(
             primary = spec.accent,
-            onPrimary = Color.White,
+            onPrimary = accentLabelColor(spec.accent),
             primaryContainer = spec.accentContainer,
             onPrimaryContainer = spec.onAccentContainer,
             secondary = spec.textSecondary,
@@ -458,9 +471,16 @@ private fun chatColors(spec: MobileThemeSpec): ChatColors =
         sidebar = spec.sidebar,
         onSidebar = Color(0xFFF8FAFC),
         onSidebarMuted = if (spec.dark) Color(0xFFA8B0BC) else Color(0xFFCBD5E1),
+        // The sidebar stays dark in light themes too; mirror desktop's accent-bright.
+        sidebarAccent = spec.accent.copy(alpha = 0.7f).compositeOver(Color.White),
         bubbleIn = spec.bubbleIn,
         bubbleInText = spec.bubbleInText,
         bubbleOut = spec.bubbleOut,
         bubbleOutText = spec.bubbleOutText,
         star = if (spec.dark) Color(0xFFFBBF24) else Color(0xFFF59E0B),
+        // Alpha compositing over opaque sRGB colors matches desktop's color-mix(in srgb).
+        unreadBackground = spec.accent.copy(alpha = 0.18f).compositeOver(spec.bgChats),
+        unreadText = spec.accent.copy(alpha = 0.55f).compositeOver(spec.textPrimary),
+        sidebarUnreadBackground = spec.accent.copy(alpha = 0.35f).compositeOver(Color.White),
+        sidebarUnreadText = spec.accent.copy(alpha = 0.25f).compositeOver(spec.sidebar),
     )
