@@ -73,7 +73,7 @@ export function SortableBoard({ board, active, onSelect, onContextMenu, shortcut
         <div
           className={`flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 ${
             active
-              ? 'bg-accent text-white shadow-lg shadow-accent/25 scale-105'
+              ? 'bg-accent text-white scale-105'
               : 'bg-white/10 text-white/60 hover:bg-white/20 hover:text-white hover:scale-105'
           }`}
         >

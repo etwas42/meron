@@ -21,6 +21,12 @@
   --color-secondary: var(--me-text-secondary);
   --color-accent: var(--me-accent);
   --color-accent-hover: var(--me-accent-hover);
+  --color-accent-label: var(--me-accent-label, #ffffff);
+  --color-accent-hover-label: var(--me-accent-hover-label, #ffffff);
+  --color-unread-bg: color-mix(in srgb, var(--me-accent) 18%, var(--me-bg-chats));
+  --color-unread-text: color-mix(in srgb, var(--me-accent) 55%, var(--me-text-primary));
+  --color-unread-rail-bg: color-mix(in srgb, var(--me-accent) 35%, white);
+  --color-unread-rail-text: color-mix(in srgb, var(--me-accent) 25%, var(--me-bg-sidenav));
   /* Side nav glyphs sit on the always-dark sidenav, in light themes too, so an
      accent tinted toward white is what reads there. --me-accent-hover is not a
      substitute: it darkens in light themes (see accentHover in lib/themes.ts).
@@ -88,8 +94,8 @@
   --me-border: #e2e8f0;
   --me-text-primary: #0f172a;
   --me-text-secondary: #64748b;
-  --me-accent: #4f46e5;
-  --me-accent-hover: #4338ca;
+  --me-accent: #6558cc;
+  --me-accent-hover: #594dbb;
   --me-bubble-in: #ffffff;
   --me-bubble-in-text: #0f172a;
   --me-bubble-out: #e0e7ff;
@@ -97,7 +103,7 @@
   --me-composer-bg: #ffffff;
   --me-composer-border: #e2e8f0;
   --me-bubble-shadow-in: 0 2px 8px -2px rgba(15, 23, 42, 0.08), 0 1px 3px -1px rgba(15, 23, 42, 0.04);
-  --me-bubble-shadow-out: 0 2px 8px -2px rgba(79, 70, 229, 0.12), 0 1px 3px -1px rgba(79, 70, 229, 0.06);
+  --me-bubble-shadow-out: 0 2px 8px -2px rgba(101, 88, 204, 0.12), 0 1px 3px -1px rgba(101, 88, 204, 0.06);
   --me-wallpaper-overlay: color-mix(in srgb, var(--me-bg-chat) 50%, transparent);
 
   color-scheme: light;
@@ -118,8 +124,8 @@
   --me-border: #1e293b;
   --me-text-primary: #f8fafc;
   --me-text-secondary: #94a3b8;
-  --me-accent: #6366f1;
-  --me-accent-hover: #818cf8;
+  --me-accent: #7165c4;
+  --me-accent-hover: #7c70ce;
   --me-bubble-in: #1e293b;
   --me-bubble-in-text: #f8fafc;
   --me-bubble-out: #312e81;

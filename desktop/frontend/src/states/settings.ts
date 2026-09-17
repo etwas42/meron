@@ -4,6 +4,7 @@ import {
   DEFAULT_LIGHT_ID,
   THEME_TOKEN_KEYS,
   TOKEN_CSS_VAR,
+  accentLabelVars,
   builtinTheme,
   defaultThemeId,
   sanitizeCustomThemes,
@@ -436,6 +437,9 @@ function applyActiveTheme() {
   for (const key of THEME_TOKEN_KEYS) {
     if (isDefault) root.style.removeProperty(TOKEN_CSS_VAR[key])
     else root.style.setProperty(TOKEN_CSS_VAR[key], def.tokens[key])
+  }
+  for (const [key, value] of Object.entries(accentLabelVars(def.tokens))) {
+    root.style.setProperty(key, value)
   }
 
   localStorage.setItem(

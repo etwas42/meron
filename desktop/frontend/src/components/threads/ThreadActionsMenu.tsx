@@ -223,7 +223,7 @@ export function ThreadActionsMenu({
     <div ref={rootRef} className="relative">
       <button
         className={`flex ${triggerClassName} shrink-0 items-center justify-center rounded-lg cursor-pointer transition-all ${
-          filterActive ? 'bg-accent text-white shadow-sm shadow-accent/20' : 'hover:bg-hover text-secondary'
+          filterActive ? 'bg-accent text-accent-label shadow-sm shadow-accent/20' : 'hover:bg-hover text-secondary'
         }`}
         onClick={(event) => {
           event.stopPropagation()

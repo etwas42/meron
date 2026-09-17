@@ -169,7 +169,7 @@ export function SideNav() {
               <button
                 className={`flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 cursor-pointer ${
                   isUnifiedActive
-                    ? 'bg-accent text-white shadow-lg shadow-accent/25'
+                    ? 'bg-accent text-white'
                     : 'bg-white/10 text-white/60 hover:bg-white/20 hover:text-white hover:scale-105'
                 }`}
                 onClick={() => selectAccount('unified')}

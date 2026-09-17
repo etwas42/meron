@@ -201,7 +201,7 @@ export function ConversationDetailsPanel({
                       onClick={() => onShowInConversation(item.messageId)}
                       title={t('chat.showInConversation')}
                       aria-label={t('chat.showInConversation')}
-                      className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/65 text-white shadow-sm transition-colors hover:bg-accent cursor-pointer"
+                      className="absolute right-1.5 top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/65 text-white shadow-sm transition-colors hover:bg-accent hover:text-accent-label cursor-pointer"
                     >
                       <MessageSquare size={14} />
                     </button>

@@ -98,7 +98,7 @@ export function ComposerFooter({
           className={`flex items-center justify-center gap-1.5 rounded-xl px-5 py-2 text-xs font-bold transition-all ${
             !canSend
               ? 'cursor-not-allowed bg-hover text-secondary/70 shadow-none'
-              : 'bg-accent text-white shadow-md shadow-accent/15 hover:bg-accent-hover hover:shadow-lg hover:shadow-accent/20 active:scale-98 cursor-pointer'
+              : 'bg-accent text-accent-label shadow-md shadow-accent/15 hover:bg-accent-hover hover:text-accent-hover-label hover:shadow-lg hover:shadow-accent/20 active:scale-98 cursor-pointer'
           }`}
         >
           {sending ? <RefreshCw size={12} className="animate-spin" /> : <Send size={12} />}

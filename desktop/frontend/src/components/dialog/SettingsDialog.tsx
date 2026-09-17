@@ -971,7 +971,7 @@ function AccountPanel({ account }: { account: Account }) {
               <button
                 type="button"
                 onClick={reconnectAccount}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-accent hover:bg-accent-hover text-white font-bold text-[0.625rem] cursor-pointer transition-colors"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-accent hover:bg-accent-hover text-accent-label hover:text-accent-hover-label font-bold text-[0.625rem] cursor-pointer transition-colors"
               >
                 <KeyRound size={12} />
                 {t('settings.account.reconnectButton', { defaultValue: 'Reconnect' })}

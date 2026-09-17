@@ -90,7 +90,7 @@ export function ThreadListItem({
               className={clsx(
                 'flex h-7 w-7 items-center justify-center rounded-full transition-colors',
                 bulkSelected
-                  ? 'bg-accent text-white shadow-sm shadow-accent/20'
+                  ? 'bg-accent text-accent-label shadow-sm shadow-accent/20'
                   : 'border border-secondary/30 text-secondary/35',
               )}
             >
@@ -141,8 +141,8 @@ export function ThreadListItem({
             </div>
             <time
               className={clsx(
-                'ml-auto shrink-0 text-[0.6875rem] font-normal',
-                unread ? 'text-accent' : 'text-secondary/65',
+                'ml-auto shrink-0 text-[0.6875rem]',
+                unread ? 'font-medium text-primary' : 'font-normal text-secondary/65',
               )}
             >
               {formatThreadDate(thread.date)}
@@ -166,7 +166,7 @@ export function ThreadListItem({
             {unread && bulkSelectable ? (
               <span className="h-2 w-2 shrink-0 rounded-full bg-accent" />
             ) : unread ? (
-              <span className="h-4 min-w-4 px-1 flex items-center justify-center rounded-full bg-accent text-white text-[0.625rem] font-bold shadow-sm shadow-accent/20 leading-none shrink-0">
+              <span className="h-4 min-w-4 px-1 flex items-center justify-center rounded-full bg-unread-bg text-unread-text text-[0.625rem] font-semibold leading-none shrink-0">
                 {thread.unread_count ?? 1}
               </span>
             ) : null}

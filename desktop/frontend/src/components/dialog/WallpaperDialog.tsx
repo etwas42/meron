@@ -97,7 +97,7 @@ export function WallpaperDialog({
                   </span>
                 </span>
                 {selectedKey.startsWith('custom:') && (
-                  <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-white shadow-xs">
+                  <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
                     <Check size={11} />
                   </span>
                 )}
@@ -120,7 +120,7 @@ export function WallpaperDialog({
                   >
                     <span className={`absolute inset-0 ${preset.previewClass}`} />
                     {selected && (
-                      <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-white shadow-xs">
+                      <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
                         <Check size={11} />
                       </span>
                     )}
@@ -151,17 +151,17 @@ export function WallpaperDialog({
 
                 {/* Left Bubble (Incoming) */}
                 <div className="flex items-end gap-1.5 max-w-[85%] self-start">
-                  <div className="h-5 w-5 rounded-full bg-accent/80 flex items-center justify-center text-[0.53125rem] font-bold text-white shadow-xs">
+                  <div className="h-5 w-5 rounded-full bg-accent flex items-center justify-center text-[0.53125rem] font-bold text-accent-label shadow-xs">
                     {previewName ? previewName.slice(0, 1) : 'U'}
                   </div>
-                  <div className="rounded-2xl rounded-bl-sm border border-border bg-chats p-2.5 text-[0.6875rem] leading-normal text-primary shadow-xs">
+                  <div className="rounded-2xl rounded-bl-sm border border-border/40 bg-bubble-in p-2.5 text-[0.6875rem] leading-normal text-bubble-in-text shadow-bubble-in">
                     How does this chat wallpaper look on your screen?
                   </div>
                 </div>
 
                 {/* Right Bubble (Outgoing) */}
                 <div className="flex flex-col max-w-[80%] self-end">
-                  <div className="rounded-2xl rounded-br-sm border border-accent/20 bg-accent text-white p-2.5 text-[0.6875rem] leading-normal shadow-xs">
+                  <div className="rounded-2xl rounded-br-sm border border-border/35 bg-bubble-out text-bubble-out-text p-2.5 text-[0.6875rem] leading-normal shadow-bubble-out">
                     Looks fantastic! The text contrast and background pattern are perfectly balanced.
                   </div>
                 </div>

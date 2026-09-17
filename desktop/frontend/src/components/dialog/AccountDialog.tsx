@@ -199,8 +199,8 @@ function SaveButton({ ctl, isSetup }: { ctl: AccountDialogController; isSetup: b
             ? 'bg-hover text-secondary/70 cursor-not-allowed border border-transparent shadow-none'
             : 'bg-hover text-secondary/70 cursor-not-allowed shadow-none border border-transparent'
           : isSetup
-            ? 'border border-accent bg-accent text-white hover:bg-accent-hover hover:border-accent-hover active:scale-[0.99] shadow-md shadow-accent/15'
-            : 'bg-accent hover:bg-accent-hover text-white shadow-md shadow-accent/15 hover:shadow-lg hover:shadow-accent/20 active:scale-98'
+            ? 'border border-accent bg-accent text-accent-label hover:bg-accent-hover hover:text-accent-hover-label hover:border-accent-hover active:scale-[0.99] shadow-md shadow-accent/15'
+            : 'bg-accent hover:bg-accent-hover text-accent-label hover:text-accent-hover-label shadow-md shadow-accent/15 hover:shadow-lg hover:shadow-accent/20 active:scale-98'
       }`}
     >
       {loading && <RefreshCw size={11} className="animate-spin" />}

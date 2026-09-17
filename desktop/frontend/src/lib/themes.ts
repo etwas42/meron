@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react'
-import { darken, isValidColor, lighten, mix, withAlpha } from './color'
+import { darken, isValidColor, lighten, mix, parseColor, withAlpha } from './color'
 
 // Theme registry and derivation. A theme is a complete set of values for the
 // `--me-*` CSS custom properties in index.css. Built-ins live here; custom
@@ -168,8 +168,8 @@ const MERON_DARK: ThemeTokens = {
   border: '#28332d',
   textPrimary: '#f2f5f3',
   textSecondary: '#98a39d',
-  accent: '#36b489',
-  accentHover: '#4cc49a',
+  accent: '#40a984',
+  accentHover: '#51b792',
   bubbleIn: '#1f2823',
   bubbleInText: '#f2f5f3',
   bubbleOut: '#1c463a',
@@ -196,8 +196,8 @@ const INDIGO_LIGHT: ThemeTokens = {
   border: '#e2e8f0',
   textPrimary: '#0f172a',
   textSecondary: '#64748b',
-  accent: '#4f46e5',
-  accentHover: '#4338ca',
+  accent: '#6558cc',
+  accentHover: '#594dbb',
   bubbleIn: '#ffffff',
   bubbleInText: '#0f172a',
   bubbleOut: '#e0e7ff',
@@ -205,7 +205,7 @@ const INDIGO_LIGHT: ThemeTokens = {
   composerBg: '#ffffff',
   composerBorder: '#e2e8f0',
   bubbleShadowIn: '0 2px 8px -2px rgba(15, 23, 42, 0.08), 0 1px 3px -1px rgba(15, 23, 42, 0.04)',
-  bubbleShadowOut: '0 2px 8px -2px rgba(79, 70, 229, 0.12), 0 1px 3px -1px rgba(79, 70, 229, 0.06)',
+  bubbleShadowOut: '0 2px 8px -2px rgba(101, 88, 204, 0.12), 0 1px 3px -1px rgba(101, 88, 204, 0.06)',
 }
 
 const INDIGO_DARK: ThemeTokens = {
@@ -221,8 +221,8 @@ const INDIGO_DARK: ThemeTokens = {
   border: '#1e293b',
   textPrimary: '#f8fafc',
   textSecondary: '#94a3b8',
-  accent: '#6366f1',
-  accentHover: '#818cf8',
+  accent: '#7165c4',
+  accentHover: '#7c70ce',
   bubbleIn: '#1e293b',
   bubbleInText: '#f8fafc',
   bubbleOut: '#312e81',
@@ -241,7 +241,7 @@ const MIST: ThemeTokens = {
     bgApp: '#edf4f7',
     surface: '#ffffff',
     sideNav: '#123947',
-    accent: '#0ea5b7',
+    accent: '#2996a6',
     text: '#14323c',
   }),
   bgChat: '#f5fafb',
@@ -257,7 +257,7 @@ const MIST: ThemeTokens = {
   composerBg: '#ffffff',
   composerBorder: '#cfe0e5',
   bubbleShadowIn: '0 2px 8px -2px rgba(20, 50, 60, 0.1), 0 1px 3px -1px rgba(20, 50, 60, 0.06)',
-  bubbleShadowOut: '0 2px 8px -2px rgba(14, 165, 183, 0.18), 0 1px 3px -1px rgba(14, 165, 183, 0.1)',
+  bubbleShadowOut: '0 2px 8px -2px rgba(41, 150, 166, 0.18), 0 1px 3px -1px rgba(41, 150, 166, 0.1)',
 }
 
 const PAPER: ThemeTokens = {
@@ -339,7 +339,7 @@ const MIDNIGHT: ThemeTokens = {
     bgApp: '#0b1120',
     surface: '#111827',
     sideNav: '#050814',
-    accent: '#38bdf8',
+    accent: '#55add5',
     text: '#f8fafc',
   }),
   bgChat: '#0d1526',
@@ -506,8 +506,8 @@ export function defaultThemeId(appearance: Appearance): string {
 /** Editor seed for a new custom theme: the default theme's source palette. */
 export function defaultCustomInput(appearance: Appearance): CustomThemeInput {
   return appearance === 'light'
-    ? { appearance, bgApp: '#f1f5f9', surface: '#ffffff', sideNav: '#0f172a', accent: '#4f46e5', text: '#0f172a' }
-    : { appearance, bgApp: '#090d16', surface: '#0f172a', sideNav: '#05070c', accent: '#6366f1', text: '#f8fafc' }
+    ? { appearance, bgApp: '#f1f5f9', surface: '#ffffff', sideNav: '#0f172a', accent: '#6558cc', text: '#0f172a' }
+    : { appearance, bgApp: '#090d16', surface: '#0f172a', sideNav: '#05070c', accent: '#7165c4', text: '#f8fafc' }
 }
 
 export function newCustomThemeId(): string {
@@ -524,11 +524,31 @@ export function isCustomThemeId(id: string): boolean {
  * override the inherited ones, so the token utilities (`bg-app`, `bg-accent`, ...) work inside it.
  */
 export function cssVarStyle(tokens: ThemeTokens): CSSProperties {
-  const style: Record<string, string> = {}
+  const style: Record<string, string> = accentLabelVars(tokens)
   for (const key of THEME_TOKEN_KEYS) {
     style[TOKEN_CSS_VAR[key]] = tokens[key]
   }
   return style as CSSProperties
+}
+
+/** WCAG relative luminance; choose the higher-contrast label for an opaque fill. */
+export function accentLabelColor(color: string): string {
+  const rgb = parseColor(color)
+  if (!rgb) return '#ffffff'
+  const linear = [rgb.r, rgb.g, rgb.b].map((channel) => {
+    const value = channel / 255
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  })
+  const luminance = linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
+  return 1.05 / (luminance + 0.05) >= (luminance + 0.05) / 0.05 ? '#ffffff' : '#000000'
+}
+
+// Derived rather than persisted so existing custom themes gain readable labels too.
+export function accentLabelVars(tokens: ThemeTokens): Record<string, string> {
+  return {
+    '--me-accent-label': accentLabelColor(tokens.accent),
+    '--me-accent-hover-label': accentLabelColor(tokens.accentHover),
+  }
 }
 
 function sanitizeTokens(raw: unknown): ThemeTokens | null {

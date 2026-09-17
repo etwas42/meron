@@ -76,9 +76,9 @@ export function QuickReplyComposer() {
             disabled={!canSend}
             className={`flex h-8.5 w-8.5 shrink-0 items-center justify-center rounded-full shadow transition-all ${
               sendingReply
-                ? 'bg-accent text-white cursor-wait'
+                ? 'bg-accent text-accent-label cursor-wait'
                 : canSend
-                  ? 'bg-accent text-white hover:scale-105 cursor-pointer'
+                  ? 'bg-accent text-accent-label hover:scale-105 cursor-pointer'
                   : 'bg-active text-secondary/70 cursor-not-allowed'
             }`}
             title={

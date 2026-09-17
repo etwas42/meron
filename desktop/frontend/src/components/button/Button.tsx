@@ -13,7 +13,7 @@ const SIZES: Record<ButtonSize, { box: string; icon: number }> = {
 
 const VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    'bg-accent text-white shadow-md shadow-accent/15 hover:bg-accent-hover hover:shadow-lg hover:shadow-accent/20 active:scale-98',
+    'bg-accent text-accent-label shadow-md shadow-accent/15 hover:bg-accent-hover hover:text-accent-hover-label hover:shadow-lg hover:shadow-accent/20 active:scale-98',
   secondary: 'border border-border/70 bg-chats text-primary shadow-sm hover:bg-hover active:scale-95',
   ghost: 'text-secondary hover:bg-hover hover:text-primary',
   danger: 'bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/20 dark:text-rose-400 dark:hover:bg-rose-950/40',

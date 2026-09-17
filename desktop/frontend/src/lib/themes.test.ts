@@ -6,6 +6,8 @@ import {
   DEFAULT_LIGHT_ID,
   THEME_TOKEN_KEYS,
   TOKEN_CSS_VAR,
+  accentLabelColor,
+  accentLabelVars,
   cssVarStyle,
   deriveThemeTokens,
   isCustomThemeId,
@@ -91,6 +93,36 @@ describe('cssVarStyle', () => {
     for (const key of THEME_TOKEN_KEYS) {
       expect(style[TOKEN_CSS_VAR[key]]).toBe(BUILTIN_THEMES[0].tokens[key])
     }
+  })
+  it('scopes accent labels to the preview theme, including hover', () => {
+    for (const theme of BUILTIN_THEMES) {
+      expect(cssVarStyle(theme.tokens)).toMatchObject(accentLabelVars(theme.tokens))
+    }
+  })
+})
+
+describe('accent labels', () => {
+  it('meets 4.5:1 contrast on every built-in normal and hover fill', () => {
+    for (const theme of BUILTIN_THEMES) {
+      for (const fill of [theme.tokens.accent, theme.tokens.accentHover]) {
+        const channels = fill
+          .slice(1)
+          .match(/../g)!
+          .map((hex) => {
+            const value = parseInt(hex, 16) / 255
+            return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+          })
+        const luminance = channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+        const contrast = accentLabelColor(fill) === '#ffffff' ? 1.05 / (luminance + 0.05) : (luminance + 0.05) / 0.05
+        expect(contrast).toBeGreaterThanOrEqual(4.5)
+      }
+    }
+  })
+
+  it('supports custom accents in hex, RGB, and HSL', () => {
+    expect(accentLabelColor('#fff')).toBe('#000000')
+    expect(accentLabelColor('rgb(0, 0, 0)')).toBe('#ffffff')
+    expect(accentLabelColor('hsl(60, 100%, 50%)')).toBe('#000000')
   })
 })
 

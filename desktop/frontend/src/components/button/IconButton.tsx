@@ -22,7 +22,7 @@ const RADII: Record<IconButtonRadius, string> = {
 function variantClasses(variant: IconButtonVariant, active: boolean): string {
   switch (variant) {
     case 'accent':
-      return 'bg-accent text-white shadow-sm shadow-accent/20 hover:bg-accent-hover'
+      return 'bg-accent text-accent-label shadow-sm shadow-accent/20 hover:bg-accent-hover hover:text-accent-hover-label'
     case 'accentSoft':
       return 'bg-accent/10 text-accent hover:bg-accent/15'
     case 'danger':
