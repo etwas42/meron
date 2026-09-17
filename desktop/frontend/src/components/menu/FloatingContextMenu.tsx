@@ -11,6 +11,7 @@ export function FloatingContextMenu({
   children,
   className,
   offset = 0,
+  placement = 'down',
   margin = 8,
   overlay = false,
   overlayClassName = 'fixed inset-0 z-40',
@@ -24,6 +25,7 @@ export function FloatingContextMenu({
   children: ReactNode
   className: string
   offset?: number
+  placement?: 'up' | 'down'
   margin?: number
   overlay?: boolean
   overlayClassName?: string
@@ -42,7 +44,7 @@ export function FloatingContextMenu({
 
     const { width, height } = el.getBoundingClientRect()
     const desiredLeft = x + offset
-    const desiredTop = y + offset
+    const desiredTop = placement === 'up' ? y - offset - height : y + offset
     const left = Math.max(margin, Math.min(desiredLeft, window.innerWidth - width - margin))
     const top = Math.max(margin, Math.min(desiredTop, window.innerHeight - height - margin))
 

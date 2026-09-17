@@ -1,11 +1,11 @@
 import { Columns3, Info, Plus, RefreshCw, Settings, SquareChevronRight } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
 import { syncMail } from '../../states/mail'
 import { openCommandPalette, ui$ } from '../../states/ui'
 import { formatShortcut, isMac, type ShortcutId } from '../../lib/shortcuts'
 import { MenuItem } from '../menu/MenuItem'
+import { FloatingContextMenu } from '../menu/FloatingContextMenu'
 
 /** The chord a menu row triggers, so the keystroke is learnable from the menu. */
 function Hint({ id }: { id: ShortcutId }) {
@@ -32,79 +32,70 @@ export function QuickSettingsMenu({
 }) {
   const { t } = useTranslation()
   const busy = useValue(ui$.busy)
-  useEscapeKey(onClose)
 
   return (
-    <>
-      <div
-        className="fixed inset-0 z-40"
-        onClick={onClose}
-        onContextMenu={(e) => {
-          e.preventDefault()
+    <FloatingContextMenu
+      x={anchor.x}
+      y={anchor.placement === 'up' ? anchor.y - 4 : anchor.y + 4}
+      placement={anchor.placement}
+      onClose={onClose}
+      overlay
+      className="fixed z-50 max-h-[calc(100dvh-16px)] w-60 overflow-y-auto rounded-lg border border-border bg-chats p-2 shadow-2xl animate-fade-in text-primary"
+      onContextMenu={(e) => {
+        e.preventDefault()
+        e.stopPropagation()
+      }}
+    >
+      <MenuItem
+        icon={<SquareChevronRight size={13} className="text-secondary" />}
+        label={t('palette.label')}
+        trailing={<Hint id="palette.open" />}
+        onClick={() => {
+          onClose()
+          openCommandPalette()
+        }}
+      />
+      <MenuItem
+        icon={<Plus size={13} className="text-secondary" />}
+        label={t('accounts.actions.addAccount')}
+        onClick={() => {
+          ui$.setupOpen.set(true)
           onClose()
         }}
       />
-      <div
-        className={`fixed z-50 w-60 rounded-lg border border-border bg-chats p-2 shadow-2xl animate-fade-in text-primary ${
-          anchor.placement === 'up' ? '-translate-y-full' : ''
-        }`}
-        style={{ left: anchor.x, top: anchor.placement === 'up' ? anchor.y - 4 : anchor.y + 4 }}
-        onContextMenu={(e) => {
-          e.preventDefault()
-          e.stopPropagation()
+      {onAddKanbanBoard && (
+        <MenuItem
+          icon={<Columns3 size={13} className="text-secondary" />}
+          label={t('kanban.actions.addBoard')}
+          onClick={() => {
+            onAddKanbanBoard()
+            onClose()
+          }}
+        />
+      )}
+      <MenuItem
+        icon={<RefreshCw size={13} className={busy ? 'animate-spin text-accent' : 'text-secondary'} />}
+        label={busy ? t('threads.actions.syncing') : t('threads.actions.syncMailbox')}
+        trailing={<Hint id="mail.sync" />}
+        onClick={() => syncMail()}
+      />
+      <MenuItem
+        icon={<Settings size={13} className="text-secondary" />}
+        label={t('settings.label')}
+        trailing={<Hint id="settings.open" />}
+        onClick={() => {
+          ui$.settingsOpen.set(true)
+          onClose()
         }}
-      >
-        <MenuItem
-          icon={<SquareChevronRight size={13} className="text-secondary" />}
-          label={t('palette.label')}
-          trailing={<Hint id="palette.open" />}
-          onClick={() => {
-            onClose()
-            openCommandPalette()
-          }}
-        />
-        <MenuItem
-          icon={<Plus size={13} className="text-secondary" />}
-          label={t('accounts.actions.addAccount')}
-          onClick={() => {
-            ui$.setupOpen.set(true)
-            onClose()
-          }}
-        />
-        {onAddKanbanBoard && (
-          <MenuItem
-            icon={<Columns3 size={13} className="text-secondary" />}
-            label={t('kanban.actions.addBoard')}
-            onClick={() => {
-              onAddKanbanBoard()
-              onClose()
-            }}
-          />
-        )}
-        <MenuItem
-          icon={<RefreshCw size={13} className={busy ? 'animate-spin text-accent' : 'text-secondary'} />}
-          label={busy ? t('threads.actions.syncing') : t('threads.actions.syncMailbox')}
-          trailing={<Hint id="mail.sync" />}
-          onClick={() => syncMail()}
-        />
-        <MenuItem
-          icon={<Settings size={13} className="text-secondary" />}
-          label={t('settings.label')}
-          trailing={<Hint id="settings.open" />}
-          onClick={() => {
-            ui$.settingsOpen.set(true)
-            onClose()
-          }}
-        />
-        <MenuItem
-          icon={<Info size={13} className="text-secondary" />}
-          label={t('about.title')}
-          onClick={() => {
-            ui$.aboutOpen.set(true)
-            onClose()
-          }}
-        />
-      </div>
-    </>
+      />
+      <MenuItem
+        icon={<Info size={13} className="text-secondary" />}
+        label={t('about.title')}
+        onClick={() => {
+          ui$.aboutOpen.set(true)
+          onClose()
+        }}
+      />
+    </FloatingContextMenu>
   )
 }

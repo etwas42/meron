@@ -7,7 +7,7 @@ import { useEscapeKey } from '../../lib/useEscapeKey'
 import { ui$, closeCommandPalette } from '../../states/ui'
 import { formatShortcut, isMac } from '../../lib/shortcuts'
 import { useCommandList } from './useCommandList'
-import { matchesCommand } from './paletteCommands'
+import { filterCommands } from './paletteCommands'
 
 export function CommandPalette() {
   const { t } = useTranslation()
@@ -17,7 +17,7 @@ export function CommandPalette() {
   const inputRef = useRef<HTMLInputElement | null>(null)
 
   const commands = useCommandList()
-  const filtered = useMemo(() => commands.filter((command) => matchesCommand(command, query)), [commands, query])
+  const filtered = useMemo(() => filterCommands(commands, query), [commands, query])
 
   // Focus the search field whenever the palette opens.
   useEffect(() => {
