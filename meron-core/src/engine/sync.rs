@@ -100,6 +100,7 @@ pub async fn delete_to_trash(
 pub struct SyncMessagesResult {
     pub count: usize,
     pub messages: Vec<imap::MessageHeader>,
+    pub arrivals: Vec<imap::MessageHeader>,
 }
 
 /// Rebuild what the batched sync would have produced, for a folder holding at
@@ -289,61 +290,102 @@ pub async fn sync_messages(
     folder: &str,
     limit: u32,
 ) -> anyhow::Result<SyncMessagesResult> {
+    sync_messages_with_policy(engine, account, folder, limit, false).await
+}
+
+/// Automatic desktop refresh: bounded network work, respecting pause state.
+/// IDLE recovery and explicit mobile refresh retain their original policy.
+pub async fn sync_background_messages(
+    engine: &Arc<Engine>,
+    account: &str,
+    folder: &str,
+    limit: u32,
+) -> anyhow::Result<SyncMessagesResult> {
+    sync_messages_with_policy(engine, account, folder, limit, true).await
+}
+
+async fn sync_messages_with_policy(
+    engine: &Arc<Engine>,
+    account: &str,
+    folder: &str,
+    limit: u32,
+    background: bool,
+) -> anyhow::Result<SyncMessagesResult> {
     // Read the prior sync position before any network I/O so we can ask the
     // server for only the flag changes since then (CONDSTORE CHANGEDSINCE).
-    let (prior_modseq, prior_validity) = {
-        let db = engine.db.lock().unwrap();
-        store::backfill_observed_mail_identities(&db, account)?;
+    // Callers must await this operation rather than timing out the whole sync;
+    // only the network phase below is cancellable by the sync budget.
+    let prepare_engine = engine.clone();
+    let prepare_account = account.to_string();
+    let prepare_folder = folder.to_string();
+    let (prior_modseq, prior_validity) = tokio::task::spawn_blocking(move || {
+        let engine = prepare_engine;
+        let account = prepare_account.as_str();
+        let folder = prepare_folder.as_str();
+        let db = crate::log::timed_db_lock(&engine.db, "sync_messages.prepare/backfill");
+        if background && store::account_paused(&db, account)? {
+            return Err(anyhow::Error::new(BackgroundSyncCancelled));
+        }
         let modseq = store::get_folder_modseq(&db, account, folder)?;
         let validity = store::get_folder_state(&db, account, folder)?
             .map(|(v, _)| v)
             .unwrap_or(0);
-        (modseq, validity)
-    };
+        anyhow::Ok((modseq, validity))
+    })
+    .await??;
 
-    let attempt = engine
-        .with_read_session(account, |session| {
-            let folder = folder.to_string();
-            Box::pin(async move {
-                let batch = imap::fetch_recent(session, &folder, limit).await?;
-                // Reconcile \Seen across the whole folder (catches reads on other
-                // devices, even for messages older than the recent window).
-                // Best-effort: a no-op when there's no baseline, UIDVALIDITY changed,
-                // or the server lacks CONDSTORE.
-                let validity_matches = prior_validity != 0 && prior_validity == batch.uidvalidity;
-                let flag_sync = imap::sync_flags(session, &folder, prior_modseq, validity_matches)
-                    .await
-                    .ok();
-                // Server-side UID set so we can drop locally cached messages another
-                // client moved or deleted. Best-effort: a failure here skips the prune.
-                let server_uids = imap::list_all_uids(session, &folder).await.ok();
-                anyhow::Ok((batch, flag_sync, server_uids))
+    let fetch = || async {
+        let attempt = engine
+            .with_read_session(account, |session| {
+                let folder = folder.to_string();
+                Box::pin(async move {
+                    let batch = imap::fetch_recent(session, &folder, limit).await?;
+                    // Reconcile \Seen across the whole folder (catches reads on other
+                    // devices, even for messages older than the recent window).
+                    // Best-effort: a no-op when there's no baseline, UIDVALIDITY changed,
+                    // or the server lacks CONDSTORE.
+                    let validity_matches =
+                        prior_validity != 0 && prior_validity == batch.uidvalidity;
+                    let flag_sync =
+                        imap::sync_flags(session, &folder, prior_modseq, validity_matches)
+                            .await
+                            .ok();
+                    // Server-side UID set so we can drop locally cached messages another
+                    // client moved or deleted. Best-effort: a failure here skips the prune.
+                    let server_uids = imap::list_all_uids(session, &folder).await.ok();
+                    anyhow::Ok((batch, flag_sync, server_uids))
+                })
             })
-        })
-        .await;
-    // A message whose FETCH response we cannot parse takes the whole batch down
-    // with it, and does so again on every later sync. Re-read the window a
-    // narrower range at a time so the rest of the folder still syncs.
-    let (batch, flag_sync, server_uids) = match attempt {
-        Ok(state) => state,
-        Err(err) if imap::is_unparseable_response(&err) => {
-            crate::mlog!(
-                crate::log::Level::Warn,
-                "mail.sync",
-                "account={account} folder={folder}: unparseable FETCH response, \
+            .await;
+        // A message whose FETCH response we cannot parse takes the whole batch down
+        // with it, and does so again on every later sync. Re-read the window a
+        // narrower range at a time so the rest of the folder still syncs.
+        match attempt {
+            Ok(state) => Ok(state),
+            Err(err) if imap::is_unparseable_response(&err) => {
+                crate::mlog!(
+                    crate::log::Level::Warn,
+                    "mail.sync",
+                    "account={account} folder={folder}: unparseable FETCH response, \
                  re-reading the window message by message: {err:#}"
-            );
-            sync_state_isolating_unparseable(
-                engine,
-                account,
-                folder,
-                limit,
-                prior_modseq,
-                prior_validity,
-            )
-            .await?
+                );
+                sync_state_isolating_unparseable(
+                    engine,
+                    account,
+                    folder,
+                    limit,
+                    prior_modseq,
+                    prior_validity,
+                )
+                .await
+            }
+            Err(err) => Err(err),
         }
-        Err(err) => return Err(err),
+    };
+    let (batch, flag_sync, server_uids) = if background {
+        retry_background_sync(&format!("sync {folder} for {account}"), || true, fetch).await?
+    } else {
+        fetch().await?
     };
 
     let synced_messages = batch.messages.clone();
@@ -357,15 +399,35 @@ pub async fn sync_messages(
         batch.uid_next,
         server_uids.as_ref().map_or(-1, |u| u.len() as i64)
     );
-    let db = engine.db.lock().unwrap();
+    let engine = engine.clone();
+    let account = account.to_string();
+    let folder = folder.to_string();
+    // Outside the network timeout: always observe the committed result.
+    tokio::task::spawn_blocking(move || {
+    let account = account.as_str();
+    let folder = folder.as_str();
+    let db = crate::log::timed_db_lock(&engine.db, "sync_messages.persist");
+    let current = store::get_folder_state(&db, account, folder)?;
+    let arrivals = if folder.eq_ignore_ascii_case("INBOX") && current.is_some_and(|(validity, _)| validity == batch.uidvalidity) {
+        store::classify_inbox_arrivals(&db, account, current.unwrap().1, batch.uid_next, &batch.messages)?
+    } else { Vec::new() };
+    let persist_started = std::time::Instant::now();
+    let phase_started = std::time::Instant::now();
     if prior_validity != 0 && prior_validity != batch.uidvalidity {
         store::clear_folder_messages(&db, account, folder)?;
     }
+    let clear_time = phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
     store::upsert_messages(&db, account, folder, &batch.messages)?;
+    let upsert_time = phase_started.elapsed();
     // Make sure the folder is represented in the folders table so its unread
     // count surfaces (tray dot / badges) even before a full folder LIST sync —
     // which, in the unified view, may never run for this account.
+    let phase_started = std::time::Instant::now();
     store::ensure_folder(&db, account, folder)?;
+    let ensure_time = phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
+    let mut pruned = 0;
     if let Some(uids) = server_uids.as_ref() {
         let validity_ok = prior_validity == 0 || prior_validity == batch.uidvalidity;
         // An empty UID set means "the server holds nothing here" only if the
@@ -375,7 +437,7 @@ pub async fn sync_messages(
         // pruning against it would delete the very messages just stored.
         let uids_credible = !uids.is_empty() || count == 0;
         if validity_ok && uids_credible {
-            store::prune_missing_messages(&db, account, folder, uids)?;
+            pruned = store::prune_missing_messages(&db, account, folder, uids)?;
         } else if !uids_credible {
             crate::mlog!(
                 crate::log::Level::Warn,
@@ -385,6 +447,9 @@ pub async fn sync_messages(
             );
         }
     }
+    let prune_time = phase_started.elapsed();
+    let flag_count = flag_sync.as_ref().map_or(0, |fs| fs.changes.len());
+    let phase_started = std::time::Instant::now();
     if let Some(fs) = flag_sync {
         for &(uid, seen, starred) in &fs.changes {
             store::update_message_seen(&db, account, folder, uid, seen)?;
@@ -394,11 +459,33 @@ pub async fn sync_messages(
             store::set_folder_modseq(&db, account, folder, fs.highest_modseq)?;
         }
     }
+    let flags_time = phase_started.elapsed();
+    let phase_started = std::time::Instant::now();
     store::set_folder_state(&db, account, folder, batch.uidvalidity, batch.uid_next)?;
+    let state_time = phase_started.elapsed();
+    let total = persist_started.elapsed();
+    drop(db);
+    if total.as_millis() >= 100 {
+        crate::mlog!(
+            crate::log::Level::Warn,
+            "sync.persist.timing",
+            "account={account} folder={folder:?} fetched={count} server_uids={} pruned={pruned} flag_changes={flag_count} clear_ms={} upsert_ms={} ensure_ms={} prune_ms={} flags_ms={} state_ms={} total_ms={}",
+            server_uids.as_ref().map_or(0, |uids| uids.len()),
+            clear_time.as_millis(),
+            upsert_time.as_millis(),
+            ensure_time.as_millis(),
+            prune_time.as_millis(),
+            flags_time.as_millis(),
+            state_time.as_millis(),
+            total.as_millis()
+        );
+    }
     Ok(SyncMessagesResult {
         count,
         messages: synced_messages,
+        arrivals,
     })
+    }).await?
 }
 
 pub(super) const DEFAULT_BACKGROUND_SYNC_TIMEOUT_SECS: u64 = 30;
@@ -474,15 +561,7 @@ pub async fn sync_companion_folders(
     let drafts = cached_drafts_folder(engine, account, folder);
     let mut outcomes = Vec::new();
     for (role, companion) in companion_folders(sent, drafts) {
-        let result = match tokio::time::timeout(
-            background_sync_timeout(),
-            sync_messages(engine, account, &companion, limit),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!("timed out")),
-        };
+        let result = sync_background_messages(engine, account, &companion, limit).await;
         outcomes.push(CompanionSync {
             role,
             folder: companion,

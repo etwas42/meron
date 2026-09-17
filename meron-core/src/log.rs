@@ -7,6 +7,54 @@
 
 use std::sync::RwLock;
 
+/// Diagnostic guard for selected database operations. Release the mutex before
+/// logging so a slow log sink does not extend the database critical section.
+pub(crate) struct TimedDbGuard<'a> {
+    guard: Option<std::sync::MutexGuard<'a, rusqlite::Connection>>,
+    acquired: std::time::Instant,
+    wait: std::time::Duration,
+    operation: &'static str,
+}
+
+pub(crate) fn timed_db_lock<'a>(
+    db: &'a std::sync::Mutex<rusqlite::Connection>,
+    operation: &'static str,
+) -> TimedDbGuard<'a> {
+    let started = std::time::Instant::now();
+    let guard = db.lock().unwrap();
+    TimedDbGuard {
+        guard: Some(guard),
+        acquired: std::time::Instant::now(),
+        wait: started.elapsed(),
+        operation,
+    }
+}
+
+impl std::ops::Deref for TimedDbGuard<'_> {
+    type Target = rusqlite::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.as_deref().unwrap()
+    }
+}
+
+impl Drop for TimedDbGuard<'_> {
+    fn drop(&mut self) {
+        let held = self.acquired.elapsed();
+        drop(self.guard.take());
+        if held.as_millis() >= 100 || self.wait.as_millis() >= 100 {
+            crate::mlog!(
+                Level::Warn,
+                "db.timing",
+                "operation={} lock_wait_ms={} held_ms={}",
+                self.operation,
+                self.wait.as_millis(),
+                held.as_millis()
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     Debug,

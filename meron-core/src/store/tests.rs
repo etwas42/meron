@@ -13,6 +13,153 @@ fn test_conn() -> Connection {
     conn
 }
 
+#[test]
+fn migration_records_cached_identities_and_retires_pending_queue() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::migrate_to_v8(&conn).unwrap();
+    insert_message(&conn, 1, "cached", "", "", None);
+    db::run_migrations(&conn).unwrap();
+    let pending = || -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'pending_mail_identities'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let observed = || -> i64 {
+        conn.query_row("SELECT count(*) FROM observed_mail_identities", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(pending(), 0, "queue must be retired");
+    assert_eq!(pending(), 0);
+    assert_eq!(observed(), 1);
+    let before = conn.total_changes();
+    conn.execute("UPDATE messages SET json = json", []).unwrap();
+    assert_eq!(
+        conn.total_changes(),
+        before + 1,
+        "unchanged metadata must only update the message row"
+    );
+
+    insert_message(&conn, 2, "arrival", "", "", None);
+    assert_eq!(pending(), 0);
+    assert_eq!(observed(), 2, "cached rows must be observed immediately");
+    assert_eq!(pending(), 0);
+    assert_eq!(observed(), 2);
+    conn.execute("UPDATE messages SET json = json, seen = 1", [])
+        .unwrap();
+    assert_eq!(pending(), 0, "unchanged metadata must not requeue rows");
+    conn.execute(
+        "UPDATE messages SET json = '{\"message_id\":\"identity@example.com\"}' WHERE uid = 2",
+        [],
+    )
+    .unwrap();
+    assert_eq!(observed(), 3, "changed identities are observed immediately");
+    assert_eq!(observed(), 3);
+    insert_message(&conn, 3, "deleted", "", "", None);
+    conn.execute("DELETE FROM messages WHERE uid = 3", [])
+        .unwrap();
+    assert_eq!(pending(), 0, "deletion cleans the queue");
+}
+
+#[test]
+fn migration_v9_skips_fts_writes_for_unchanged_headers() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::migrate_to_v8(&conn).unwrap();
+    insert_message(
+        &conn,
+        1,
+        "originalsubject",
+        "sendername",
+        "sender@example.com",
+        Some("cachedbody"),
+    );
+    conn.execute(
+        "UPDATE messages SET recipients = 'recipient@example.com'",
+        [],
+    )
+    .unwrap();
+    let refresh = "UPDATE messages SET subject = subject, from_name = from_name,
+        from_addr = from_addr, body = body, recipients = recipients, seen = 1, starred = 1";
+    let before = conn.total_changes();
+    conn.execute(refresh, []).unwrap();
+    assert!(conn.total_changes() - before > 1, "v8 refresh rewrites FTS");
+
+    db::run_migrations(&conn).unwrap();
+    let before = conn.total_changes();
+    conn.execute(refresh, []).unwrap();
+    assert_eq!(
+        conn.total_changes() - before,
+        1,
+        "only the message row should be written"
+    );
+    // Migrating replaces triggers without losing the existing index contents.
+    for (table, term) in [
+        ("messages_fts", "cachedbody"),
+        ("messages_recipients_fts", "recipient"),
+    ] {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {table} MATCH ?1"),
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    db::run_migrations(&conn).unwrap();
+}
+
+#[test]
+fn fts_updates_follow_changed_text_and_null_transitions() {
+    let conn = test_conn();
+    insert_message(&conn, 1, "", "", "", None);
+    for (column, table) in [
+        ("subject", "messages_fts"),
+        ("from_name", "messages_fts"),
+        ("from_addr", "messages_fts"),
+        ("body", "messages_fts"),
+        ("recipients", "messages_recipients_fts"),
+    ] {
+        let count = |term: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT count(*) FROM {table} WHERE {table} MATCH ?1"),
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        for (old, new) in [("absenttoken", "firsttoken"), ("firsttoken", "secondtoken")] {
+            conn.execute(&format!("UPDATE messages SET {column} = ?1"), [new])
+                .unwrap();
+            assert_eq!(count(old), 0, "{column}: stale term");
+            assert_eq!(count(new), 1, "{column}: new term");
+        }
+        conn.execute(&format!("UPDATE messages SET {column} = NULL"), [])
+            .unwrap();
+        assert_eq!(count("secondtoken"), 0, "{column}: cleared term");
+        let before = conn.total_changes();
+        conn.execute(&format!("UPDATE messages SET {column} = NULL"), [])
+            .unwrap();
+        assert_eq!(
+            conn.total_changes() - before,
+            1,
+            "{column}: NULL to NULL must skip FTS"
+        );
+        conn.execute(
+            &format!("UPDATE messages SET {column} = 'restoredtoken'"),
+            [],
+        )
+        .unwrap();
+        assert_eq!(count("restoredtoken"), 1, "{column}: NULL to text");
+        conn.execute(&format!("UPDATE messages SET {column} = NULL"), [])
+            .unwrap();
+    }
+}
+
 fn insert_message(
     conn: &Connection,
     uid: u32,
@@ -944,6 +1091,7 @@ fn new_unread_inbox_messages_counts_uid_window_and_latest_unread() {
             ..Default::default()
         },
     ];
+    let arrivals = classify_inbox_arrivals(&conn, "acct", 2, 5, &inbox_messages).unwrap();
     upsert_messages(&conn, "acct", "INBOX", &inbox_messages).unwrap();
     upsert_messages(
         &conn,
@@ -959,10 +1107,6 @@ fn new_unread_inbox_messages_counts_uid_window_and_latest_unread() {
     )
     .unwrap();
 
-    let synced = inbox_messages[1..4].to_vec();
-    let arrivals = new_unread_inbox_messages(&conn, "acct", 2, 5, &synced)
-        .unwrap()
-        .unwrap();
     assert_eq!(arrivals.len(), 2);
     let latest = &arrivals[0];
     assert_eq!(latest.uid, 4);
@@ -977,13 +1121,11 @@ fn new_unread_inbox_messages_counts_uid_window_and_latest_unread() {
         thread_key: String::new(),
         ..Default::default()
     }];
-    upsert_messages(&conn, "acct", "INBOX", &lower).unwrap();
-    let lower_bound = new_unread_inbox_messages(&conn, "acct", 2, 3, &lower)
-        .unwrap()
+    let lower_bound = classify_inbox_arrivals(&conn, "acct", 2, 3, &lower)
         .unwrap()
         .remove(0);
     assert_eq!(lower_bound.uid, 2);
-    assert_eq!(lower_bound.thread_key, "uid:2");
+    assert_eq!(lower_bound.thread_key, "");
 }
 
 #[test]
@@ -1039,6 +1181,57 @@ fn cached_body_preview_collapses_body_and_misses_without_a_cached_body() {
 }
 
 #[test]
+fn cached_archive_identity_suppresses_inbox_arrival_and_survives_deletion() {
+    let conn = test_conn();
+    let mut message = MessageHeader {
+        uid: 5,
+        message_id: "known@example.com".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "Archive", &[message.clone()]).unwrap();
+    delete_messages_by_uid(&conn, "acct", "Archive", &[5]).unwrap();
+    message.uid = 20;
+    assert!(
+        classify_inbox_arrivals(&conn, "acct", 20, 21, &[message])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn classified_arrivals_survive_companion_writes_and_later_inbox_sync() {
+    let conn = test_conn();
+    let arrival = MessageHeader {
+        uid: 20,
+        message_id: "arrival@example.com".into(),
+        thread_key: "arrival@example.com".into(),
+        ..Default::default()
+    };
+    let notified = classify_inbox_arrivals(&conn, "acct", 20, 21, &[arrival.clone()]).unwrap();
+    upsert_messages(&conn, "acct", "INBOX", &[arrival.clone()]).unwrap();
+    for folder in ["Sent", "Drafts"] {
+        upsert_messages(
+            &conn,
+            "acct",
+            folder,
+            &[MessageHeader {
+                uid: 1,
+                message_id: format!("old-{folder}@example.com"),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+    }
+    assert!(
+        classify_inbox_arrivals(&conn, "acct", 20, 21, &[arrival])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(notified.len(), 1);
+    assert_eq!(notified[0].uid, 20);
+}
+
+#[test]
 fn new_unread_inbox_messages_ignores_empty_or_non_growing_windows() {
     let conn = test_conn();
     upsert_messages(
@@ -1084,7 +1277,6 @@ fn new_unread_inbox_messages_ignores_observed_gmail_message_restored_with_new_ui
         ..Default::default()
     }];
     upsert_messages(&conn, "acct", "INBOX", &old).unwrap();
-    backfill_observed_mail_identities(&conn, "acct").unwrap();
     delete_messages_by_uid(&conn, "acct", "INBOX", &[10]).unwrap();
 
     let restored = vec![MessageHeader {
@@ -1095,12 +1287,10 @@ fn new_unread_inbox_messages_ignores_observed_gmail_message_restored_with_new_ui
         gmail_msg_id: Some(999),
         ..Default::default()
     }];
-    upsert_messages(&conn, "acct", "INBOX", &restored).unwrap();
-
     assert!(
-        new_unread_inbox_messages(&conn, "acct", 20, 21, &restored)
+        classify_inbox_arrivals(&conn, "acct", 20, 21, &restored)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 
@@ -1116,7 +1306,6 @@ fn new_unread_inbox_messages_ignores_observed_message_id_restored_with_new_uid()
         ..Default::default()
     }];
     upsert_messages(&conn, "acct", "INBOX", &old).unwrap();
-    backfill_observed_mail_identities(&conn, "acct").unwrap();
     delete_messages_by_uid(&conn, "acct", "INBOX", &[10]).unwrap();
 
     let restored = vec![MessageHeader {
@@ -1127,12 +1316,10 @@ fn new_unread_inbox_messages_ignores_observed_message_id_restored_with_new_uid()
         message_id: "mid@example.com".to_string(),
         ..Default::default()
     }];
-    upsert_messages(&conn, "acct", "INBOX", &restored).unwrap();
-
     assert!(
-        new_unread_inbox_messages(&conn, "acct", 20, 21, &restored)
+        classify_inbox_arrivals(&conn, "acct", 20, 21, &restored)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 
@@ -1992,7 +2179,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     for table in [
         "accounts",
@@ -2024,7 +2211,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -2052,7 +2239,7 @@ fn concurrent_first_open_runs_migrations_once() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2138,7 +2325,15 @@ fn delete_account_removes_account_scoped_state_only() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(other_count, 1, "{table} removed another account's row");
+        let expected = if table == "observed_mail_identities" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            other_count, expected,
+            "{table} removed another account's row"
+        );
     }
 }
 

@@ -801,16 +801,9 @@ pub(crate) fn mobile_new_messages_detail(
     crate::mail_model::new_messages_detail(&conn, account, &account_name, muted, headers)
 }
 
-pub(crate) fn mobile_inbox_uid_next(data_dir: &str, account: &str) -> Option<u32> {
-    let conn = mobile_db(data_dir).ok()?;
-    crate::store::get_folder_state(&conn, account, "INBOX")
-        .ok()
-        .flatten()
-        .map(|(_, uid_next)| uid_next)
-}
-
 /// Inbox messages that arrived between the two `uid_next` snapshots and are
 /// still unread, newest first; None when nothing new landed.
+#[cfg(test)]
 pub(crate) fn mobile_new_unread_inbox_messages(
     data_dir: &str,
     account: &str,

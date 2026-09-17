@@ -191,11 +191,34 @@ async fn handle(engine: Arc<Engine>, req: Request, out: &Writer) {
 }
 
 async fn write_line(out: &Writer, value: Value) {
+    let started = std::time::Instant::now();
+    let id = value.get("id").and_then(Value::as_u64);
+    let event = value.get("event").and_then(Value::as_str).unwrap_or("");
     let mut line = value.to_string();
     line.push('\n');
+    let serialized = started.elapsed();
+    let lock_started = std::time::Instant::now();
     let mut guard = out.lock().await;
-    let _ = guard.write_all(line.as_bytes()).await;
-    let _ = guard.flush().await;
+    let lock_wait = lock_started.elapsed();
+    let write_started = std::time::Instant::now();
+    let write_result = guard.write_all(line.as_bytes()).await;
+    let write_time = write_started.elapsed();
+    let flush_started = std::time::Instant::now();
+    let flush_result = guard.flush().await;
+    let flush_time = flush_started.elapsed();
+    drop(guard);
+    if started.elapsed().as_millis() >= 100 {
+        eprintln!(
+            "meron-core: response timing: id={id:?} event={event} bytes={} serialize_ms={} output_lock_wait_ms={} write_ms={} flush_ms={} total_ms={} failed={}",
+            line.len(),
+            serialized.as_millis(),
+            lock_wait.as_millis(),
+            write_time.as_millis(),
+            flush_time.as_millis(),
+            started.elapsed().as_millis(),
+            write_result.is_err() || flush_result.is_err()
+        );
+    }
 }
 
 async fn emit(out: &Writer, name: &str, detail: Value) {

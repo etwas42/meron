@@ -331,7 +331,7 @@ fn store_parsed_feed(tx: &Connection, account: &str, parsed: &FetchedParsed) -> 
 /// the entries that actually arrived.
 pub fn sync_account(db: &Mutex<Connection>, account: &str) -> Result<Vec<NewItem>> {
     let subs = {
-        let conn = db.lock().unwrap();
+        let conn = crate::log::timed_db_lock(db, "rss.sync.load_subscriptions");
         load_subscriptions(&conn, account)?
     };
     let mut new_items: Vec<NewItem> = Vec::new();
@@ -339,7 +339,7 @@ pub fn sync_account(db: &Mutex<Connection>, account: &str) -> Result<Vec<NewItem
         match sync_subscription(db, &sub) {
             Ok(items) => new_items.extend(items),
             Err(e) => {
-                let conn = db.lock().unwrap();
+                let conn = crate::log::timed_db_lock(db, "rss.sync.save_error");
                 let _ = conn.execute(
                     "UPDATE subscriptions SET last_error = ?2, updated_at = ?3 WHERE id = ?1",
                     params![sub.id, format!("{e:#}"), now_unix()],
@@ -417,7 +417,7 @@ fn sync_subscription(db: &Mutex<Connection>, sub: &Subscription) -> Result<Vec<N
     let now = now_unix();
     let fetched = fetch_feed(&sub.url, &sub.etag, &sub.last_modified)?;
     if fetched.not_modified {
-        let conn = db.lock().unwrap();
+        let conn = crate::log::timed_db_lock(db, "rss.sync.not_modified");
         conn.execute(
             "UPDATE subscriptions SET last_sync_at = ?2, last_error = '', updated_at = ?2 WHERE id = ?1",
             params![sub.id, now],
@@ -450,7 +450,7 @@ fn sync_subscription(db: &Mutex<Connection>, sub: &Subscription) -> Result<Vec<N
         sub.title.clone()
     };
 
-    let conn = db.lock().unwrap();
+    let conn = crate::log::timed_db_lock(db, "rss.sync.persist_items");
     let tx = conn.unchecked_transaction()?;
     let mut new_items = Vec::new();
     for item in &items {

@@ -435,11 +435,6 @@ pub(crate) fn sync_mobile_mail(data_dir: &str, params: &Value) -> Result<Value, 
     }
     let creds_ms = started.elapsed().as_millis();
     let is_inbox = folder.eq_ignore_ascii_case("INBOX");
-    let inbox_uid_next_before = if is_inbox {
-        crate::ffi::mobile_inbox_uid_next(data_dir, &account_id).unwrap_or(0)
-    } else {
-        0
-    };
 
     let folders_started = std::time::Instant::now();
     let folders_count = if sync_folders {
@@ -457,21 +452,15 @@ pub(crate) fn sync_mobile_mail(data_dir: &str, params: &Value) -> Result<Value, 
     ))?;
     let messages_ms = messages_started.elapsed().as_millis();
     let new_messages = if is_inbox {
-        let after = crate::ffi::mobile_inbox_uid_next(data_dir, &account_id).unwrap_or(0);
-        crate::ffi::mobile_new_unread_inbox_messages(
-            data_dir,
-            &account_id,
-            inbox_uid_next_before,
-            after,
-            &synced.messages,
-        )
-        .and_then(|headers| {
-            // Fetch the arrivals' own bodies before building the detail: the
-            // notification shows a snippet of each, and the general prefetch in
-            // the sync tail runs too late (and may be deferred entirely).
-            fetch_notification_bodies(data_dir, &engine, &account_id, &headers);
-            crate::ffi::mobile_new_messages_detail(data_dir, &account_id, &headers)
-        })
+        (!synced.arrivals.is_empty())
+            .then_some(synced.arrivals)
+            .and_then(|headers| {
+                // Fetch the arrivals' own bodies before building the detail: the
+                // notification shows a snippet of each, and the general prefetch in
+                // the sync tail runs too late (and may be deferred entirely).
+                fetch_notification_bodies(data_dir, &engine, &account_id, &headers);
+                crate::ffi::mobile_new_messages_detail(data_dir, &account_id, &headers)
+            })
     } else {
         None
     };

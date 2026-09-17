@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use meron_core::engine::*;
+use super::background_sync_timeout;
 
 pub(crate) const BACKGROUND_SYNC_RETRY_DELAY: Duration = if cfg!(test) {
     Duration::ZERO
@@ -72,7 +72,7 @@ pub(crate) fn is_transient_sync_error(error: &anyhow::Error) -> bool {
 }
 
 #[derive(Debug)]
-pub(crate) struct BackgroundSyncCancelled;
+pub struct BackgroundSyncCancelled;
 
 impl std::fmt::Display for BackgroundSyncCancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,7 +83,7 @@ impl std::fmt::Display for BackgroundSyncCancelled {
 impl std::error::Error for BackgroundSyncCancelled {}
 
 #[derive(Debug)]
-pub(crate) struct BackgroundSyncTimedOut(u64);
+pub struct BackgroundSyncTimedOut(u64);
 
 impl std::fmt::Display for BackgroundSyncTimedOut {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,10 +96,24 @@ impl std::error::Error for BackgroundSyncTimedOut {}
 /// Retry a background read once when it fails for a recognizable transport
 /// reason. Both attempts share the configured per-folder ceiling so a stuck
 /// sync does not hold its dedup key indefinitely.
-pub(crate) async fn retry_background_sync<T, C, F, Fut>(
+pub async fn retry_background_sync<T, C, F, Fut>(
+    label: &str,
+    can_attempt: C,
+    operation: F,
+) -> anyhow::Result<T>
+where
+    C: FnMut() -> bool,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    retry_with_budget(label, can_attempt, operation, background_sync_timeout()).await
+}
+
+async fn retry_with_budget<T, C, F, Fut>(
     label: &str,
     mut can_attempt: C,
     mut operation: F,
+    sync_timeout: Duration,
 ) -> anyhow::Result<T>
 where
     C: FnMut() -> bool,
@@ -109,7 +123,6 @@ where
     if !can_attempt() {
         return Err(anyhow::Error::new(BackgroundSyncCancelled));
     }
-    let sync_timeout = background_sync_timeout();
     let deadline = tokio::time::Instant::now() + sync_timeout;
     let first = tokio::time::timeout_at(deadline, operation()).await;
     let first_error = match first {
@@ -158,6 +171,50 @@ where
 mod tests {
     use super::{BackgroundSyncCancelled, is_transient_sync_error, retry_background_sync};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn network_budget_expires_without_starting_persistence() {
+        let result = super::retry_with_budget(
+            "stalled network",
+            || true,
+            || std::future::pending::<anyhow::Result<()>>(),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(result.unwrap_err().is::<super::BackgroundSyncTimedOut>());
+    }
+
+    #[tokio::test]
+    async fn completed_network_budget_does_not_cancel_later_commit_or_notification() {
+        let budget = std::time::Duration::from_millis(5);
+        let messages = super::retry_with_budget(
+            "network",
+            || true,
+            || async {
+                anyhow::Ok(vec![crate::imap::MessageHeader {
+                    uid: 20,
+                    message_id: "arrival@example.com".into(),
+                    ..Default::default()
+                }])
+            },
+            budget,
+        )
+        .await
+        .unwrap();
+        let notification = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(budget * 4);
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::store::run_migrations(&conn).unwrap();
+            let arrivals =
+                crate::store::classify_inbox_arrivals(&conn, "acct", 20, 21, &messages).unwrap();
+            crate::store::upsert_messages(&conn, "acct", "INBOX", &messages).unwrap();
+            crate::store::set_folder_state(&conn, "acct", "INBOX", 1, 21).unwrap();
+            arrivals
+        })
+        .await
+        .unwrap();
+        assert_eq!(notification[0].uid, 20);
+    }
 
     #[test]
     fn imap_disconnect_errors_are_transient() {

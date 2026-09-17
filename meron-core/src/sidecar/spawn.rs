@@ -6,7 +6,6 @@ use meron_core::engine::Engine;
 use meron_core::engine::*;
 use meron_core::{rss, store};
 
-use crate::sidecar::background_sync::*;
 use crate::sidecar::idle::*;
 use crate::{Writer, emit};
 
@@ -88,6 +87,17 @@ pub(crate) fn maybe_spawn_fill_thread_gaps(
 /// Refresh a folder's messages from IMAP in the background (deduped), then emit
 /// `mail.synced` so the UI re-reads the now-fresh store. Keeps network I/O off
 /// the bridge's synchronous request path (which runs on the app's UI thread).
+struct MessageSyncClaim {
+    engine: Arc<Engine>,
+    key: String,
+}
+
+impl Drop for MessageSyncClaim {
+    fn drop(&mut self) {
+        self.engine.syncing.lock().unwrap().remove(&self.key);
+    }
+}
+
 pub(crate) fn spawn_message_sync(
     engine: Arc<Engine>,
     out: Writer,
@@ -102,19 +112,15 @@ pub(crate) fn spawn_message_sync(
     if !engine.syncing.lock().unwrap().insert(key.clone()) {
         return;
     }
+    let claim = MessageSyncClaim {
+        engine: engine.clone(),
+        key,
+    };
     tokio::spawn(async move {
-        let uid_next_before = if folder.eq_ignore_ascii_case("INBOX") {
-            inbox_uid_next(&engine, &account)
-        } else {
-            0
-        };
-        let result = retry_background_sync(
-            &format!("sync {folder} for {account}"),
-            || !engine.is_paused(&account),
-            || sync_messages(&engine, &account, &folder, limit),
-        )
-        .await;
-        engine.syncing.lock().unwrap().remove(&key);
+        // sync_messages owns its network-only budget. Never time out its DB
+        // phases: their completion must reach notification processing below.
+        let result = sync_background_messages(&engine, &account, &folder, limit).await;
+        drop(claim);
         match result {
             Ok(synced) => {
                 // Warm full bodies for the unread/recent set now that envelopes
@@ -129,18 +135,7 @@ pub(crate) fn spawn_message_sync(
                         eprintln!("meron-core: sync {} {account}: {err:#}", sync.role);
                     }
                 }
-                let uid_next_after = if folder.eq_ignore_ascii_case("INBOX") {
-                    inbox_uid_next(&engine, &account)
-                } else {
-                    0
-                };
-                let new_inbox = new_unread_inbox_messages(
-                    &engine,
-                    &account,
-                    uid_next_before,
-                    uid_next_after,
-                    &synced.messages,
-                );
+                let new_inbox = (!synced.arrivals.is_empty()).then_some(synced.arrivals);
                 if let Some(headers) = new_inbox
                     && let Some(detail) = new_messages_detail(&engine, &account, &headers).await
                 {

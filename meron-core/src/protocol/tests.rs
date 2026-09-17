@@ -1014,13 +1014,12 @@ fn mobile_new_messages_detail_summarizes_new_unread_inbox_mail() {
             ..Default::default()
         },
     ];
+    let arrivals =
+        store::classify_inbox_arrivals(&conn, "me@example.com", 2, 4, &messages).unwrap();
     store::upsert_messages(&conn, "me@example.com", "INBOX", &messages).unwrap();
     drop(conn);
     let dir = data_dir.to_str().unwrap();
 
-    let arrivals =
-        crate::ffi::mobile_new_unread_inbox_messages(dir, "me@example.com", 2, 4, &messages)
-            .unwrap();
     let detail = crate::ffi::mobile_new_messages_detail(dir, "me@example.com", &arrivals).unwrap();
     assert_eq!(detail["account"], "me@example.com");
     assert_eq!(detail["accountName"], "me@example.com");

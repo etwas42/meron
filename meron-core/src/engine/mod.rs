@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Notify};
 use crate::{imap, secrets, store};
 
 mod append;
+mod background_sync;
 mod folders;
 mod prefetch;
 mod read;
@@ -19,6 +20,7 @@ mod search;
 mod sync;
 
 pub use append::*;
+pub use background_sync::{BackgroundSyncCancelled, BackgroundSyncTimedOut, retry_background_sync};
 pub use folders::*;
 pub use prefetch::*;
 pub use read::*;

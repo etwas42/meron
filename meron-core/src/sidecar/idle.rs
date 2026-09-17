@@ -11,28 +11,6 @@ use crate::{Writer, emit};
 
 pub(crate) const IDLE_LIMIT: u32 = 50;
 
-/// Unread messages in the UID range that appeared during the last sync.
-/// Startup syncs can advance UIDNEXT for messages that were already read on the
-/// server; those should refresh the UI without raising a desktop notification.
-pub(crate) fn new_unread_inbox_messages(
-    engine: &Arc<Engine>,
-    account: &str,
-    uid_next_before: u32,
-    uid_next_after: u32,
-    synced_messages: &[imap::MessageHeader],
-) -> Option<Vec<imap::MessageHeader>> {
-    let db = engine.db.lock().unwrap();
-    store::new_unread_inbox_messages(
-        &db,
-        account,
-        uid_next_before,
-        uid_next_after,
-        synced_messages,
-    )
-    .ok()
-    .flatten()
-}
-
 /// Longest a notification waits on the body fetch its snippets need. Past this
 /// the event goes out with whatever bodies are cached: a late notification is
 /// worse than one showing subjects alone, and the general prefetch fills the
@@ -67,17 +45,6 @@ pub(crate) async fn new_messages_detail(
 pub(crate) fn account_label(engine: &Arc<Engine>, account: &str) -> String {
     let db = engine.db.lock().unwrap();
     store::account_label(&db, account)
-}
-
-/// Cached UIDNEXT for an account's INBOX (0 if unknown). Used to detect whether
-/// an IDLE wake brought new mail (UIDNEXT advanced) or only a flag change.
-pub(crate) fn inbox_uid_next(engine: &Arc<Engine>, account: &str) -> u32 {
-    let db = engine.db.lock().unwrap();
-    store::get_folder_state(&db, account, "INBOX")
-        .ok()
-        .flatten()
-        .map(|(_, uid_next)| uid_next)
-        .unwrap_or(0)
 }
 
 pub(crate) fn watch_key(account: &str, folder: &str) -> String {
@@ -159,30 +126,10 @@ pub(crate) async fn sync_and_notify(
     // read on another device). UIDNEXT only advances for new arrivals, so
     // compare it across the refresh to tell them apart.
     let is_inbox = folder.eq_ignore_ascii_case("INBOX");
-    let uid_next_before = if is_inbox {
-        inbox_uid_next(engine, account)
-    } else {
-        0
-    };
     // Refresh on a separate connection (the IDLE one stays dedicated to IDLE).
     let synced = sync_messages(engine, account, folder, IDLE_LIMIT).await?;
-    let uid_next_after = if is_inbox {
-        inbox_uid_next(engine, account)
-    } else {
-        0
-    };
 
-    let new_inbox = if is_inbox {
-        new_unread_inbox_messages(
-            engine,
-            account,
-            uid_next_before,
-            uid_next_after,
-            &synced.messages,
-        )
-    } else {
-        None
-    };
+    let new_inbox = (!synced.arrivals.is_empty()).then_some(synced.arrivals);
 
     if let Some(headers) = new_inbox {
         // Building the detail fetches the arrivals' own bodies (the notification

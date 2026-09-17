@@ -4,6 +4,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::imap::MessageHeader;
@@ -247,6 +248,7 @@ pub fn get_recent_page(
     Ok((out, next_cursor))
 }
 
+#[cfg(test)]
 pub(super) fn now_epoch_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -274,32 +276,14 @@ pub(super) fn message_identity(header: &MessageHeader, folder: &str) -> String {
     mail_identity_from_parts(folder, header.uid, header.gmail_msg_id, &header.message_id)
 }
 
+#[cfg(test)]
 pub(super) fn gmail_msg_id_from_json(value: Option<String>) -> Option<u64> {
     value.and_then(|value| value.parse::<u64>().ok())
 }
 
-pub fn backfill_observed_mail_identities(conn: &Connection, account: &str) -> Result<()> {
-    let now = now_epoch_seconds();
-    conn.execute(
-        "INSERT OR IGNORE INTO observed_mail_identities(account, identity, first_seen_at)
-         SELECT account,
-                CASE
-                  WHEN json_extract(json, '$.gmail_msg_id') IS NOT NULL
-                    THEN 'gmail:' || json_extract(json, '$.gmail_msg_id')
-                  WHEN COALESCE(json_extract(json, '$.message_id'), '') <> ''
-                    THEN 'message-id:' || lower(json_extract(json, '$.message_id'))
-                  ELSE 'uid:' || lower(folder) || ':' || uid
-                END,
-                ?2
-         FROM messages
-         WHERE account = ?1 AND uid <> 0",
-        params![account, now],
-    )?;
-    Ok(())
-}
-
 /// Record message identities and return the subset that had not been observed
 /// before this call.
+#[cfg(test)]
 pub(super) fn record_observed_mail_identities(
     conn: &Connection,
     account: &str,
@@ -330,6 +314,39 @@ pub(super) fn record_observed_mail_identities(
 /// newest first. Returns the whole batch rather than just its latest message so
 /// notifications can post one entry per arrival; `None` when nothing new and
 /// unread landed.
+pub fn classify_inbox_arrivals(
+    conn: &Connection,
+    account: &str,
+    before: u32,
+    after: u32,
+    messages: &[MessageHeader],
+) -> Result<Vec<MessageHeader>> {
+    let mut arrivals = Vec::new();
+    if before == 0 || after <= before {
+        return Ok(arrivals);
+    }
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM observed_mail_identities WHERE account = ?1 AND identity = ?2")?;
+    let mut identities = HashSet::new();
+    for message in messages {
+        if message.seen || message.uid < before || message.uid >= after {
+            continue;
+        }
+        let identity = message_identity(message, "INBOX");
+        if stmt
+            .query_row(params![account, &identity], |_| Ok(()))
+            .optional()?
+            .is_none()
+            && identities.insert(identity)
+        {
+            arrivals.push(message.clone());
+        }
+    }
+    arrivals.sort_by_key(|message| std::cmp::Reverse(message.uid));
+    Ok(arrivals)
+}
+
+#[cfg(test)]
 pub fn new_unread_inbox_messages(
     conn: &Connection,
     account: &str,
