@@ -275,6 +275,9 @@ func (a *App) threadRead(payload map[string]any) (any, error) {
 			// The sidecar shapes final bridge-ready message JSON and needs the
 			// frontend's exact thread id for the messages' id/thread_id fields.
 			params["thread_id"] = threadID
+			if forPrint, _ := payload["for_print"].(bool); forPrint {
+				params["for_print"] = true
+			}
 			if hasLimit {
 				params["limit"] = limit
 			}

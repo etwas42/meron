@@ -404,6 +404,7 @@ internal fun MessageRowHeader(
         }
         MessageActionsButton(
             message = message,
+            isRss = isRss,
             tint = mutedColor,
             actionsEnabled = actionsEnabled,
             itemActionsEnabled = itemActionsEnabled,

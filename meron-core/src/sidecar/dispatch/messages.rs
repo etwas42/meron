@@ -313,6 +313,7 @@ pub(crate) async fn dispatch(
                     thread_key: &thread_key,
                     subject_filter: subject_filter.as_deref(),
                     limit,
+                    for_print: p.get("for_print").and_then(Value::as_bool).unwrap_or(false),
                     before_cursor,
                     media_root: parse::media_root(),
                     bake_html_policy: true,

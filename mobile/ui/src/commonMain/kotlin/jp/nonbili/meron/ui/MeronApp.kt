@@ -884,6 +884,8 @@ private fun MeronMobileScreenContent(
                     if (selectedCoreThread == null) popAppBack()
                 }
                 ThreadScreen(
+                    loadPrintMessages = ::loadThreadForPrinting,
+                    onPrintError = { status = it },
                     thread = selectedCoreThread,
                     messages = visibleThreadMessages(),
                     accountEmail = selectedThreadAccount?.email.orEmpty(),

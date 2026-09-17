@@ -8,9 +8,11 @@ import {
   Code,
   Copy,
   FileText,
+  LoaderCircle,
   Mail,
   MoreVertical,
   PanelRight,
+  Printer,
   ReplyAll,
   Search,
   SquarePen,
@@ -19,6 +21,7 @@ import {
   X,
 } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
+import { printThread } from '../../lib/printMail'
 import { useTranslation } from '../../lib/i18n'
 import { showToast, ui$ } from '../../states/ui'
 import { starThread } from '../../states/mailFlags'
@@ -64,6 +67,7 @@ export function ConversationHeader({
   const mediaOpen = useValue(thread$.mediaOpen)
   const normalizedThreadSearch = threadSearch.trim().toLowerCase()
 
+  const [printing, setPrinting] = useState(false)
   const [actionsMenuOpen, setActionsMenuOpen] = useState(false)
   const [senderMenu, setSenderMenu] = useState<{ x: number; y: number } | null>(null)
   const actionsMenuRef = useRef<HTMLDivElement | null>(null)
@@ -112,6 +116,14 @@ export function ConversationHeader({
   return (
     <>
       <header className="relative z-40 flex h-16 shrink-0 items-center gap-3 border-b border-border bg-header px-2 select-none">
+        {printing && (
+          <LoaderCircle
+            size={16}
+            className="shrink-0 animate-spin text-secondary"
+            role="status"
+            aria-label={t('chat.actions.printThread')}
+          />
+        )}
         <button
           className="flex h-8 w-8 items-center justify-center rounded-full hover:bg-hover text-secondary min-[769px]:hidden cursor-pointer"
           onClick={() => ui$.mobilePane.set('threads')}
@@ -260,6 +272,18 @@ export function ConversationHeader({
                   <FileText size={15} className="shrink-0" /> {t('chat.viewAsPlainText')}
                 </button>
                 <div className="my-1 h-px bg-border" />
+                {!isRSS && (
+                  <MenuItem
+                    icon={<Printer size={15} />}
+                    label={t('chat.actions.printThread')}
+                    disabled={printing}
+                    onClick={() => {
+                      setActionsMenuOpen(false)
+                      setPrinting(true)
+                      void printThread(activeThread.thread_id).finally(() => setPrinting(false))
+                    }}
+                  />
+                )}
                 {!isRSS && replyAll && (
                   <button
                     onClick={() => {

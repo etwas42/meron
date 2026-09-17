@@ -596,3 +596,21 @@ internal fun MeronMobileState.loadMoreThreadMessages() {
         }
     }
 }
+
+// Fetch a separate snapshot: printing must not change scroll position or the
+// open conversation, and must include messages outside the currently loaded page.
+internal suspend fun MeronMobileState.loadThreadForPrinting(): List<MessageBody> {
+    val thread = checkNotNull(selectedCoreThread)
+    check(coreLoaded)
+    val threadId = thread.backendThreadId()
+    return withContext(ioDispatcher) {
+        val client = MobileMailCommandClient(core)
+        loadPrintThread { cursor ->
+            parseThreadReadPage(
+                withManagedGoogleAuth(client, thread.accountId) {
+                    client.readThread(ThreadReadParams(threadId = threadId, forPrint = true, beforeCursor = cursor))
+                },
+            )
+        }
+    }
+}

@@ -35,6 +35,8 @@ pub struct ThreadReadArgs<'a> {
     /// Present for UI reads (page size); absent for full-scan reads (markRead,
     /// compose threading), which fetch every missing body synchronously.
     pub limit: Option<u32>,
+    /// Bounded best-effort body fetch for printing; never fail for missing bodies.
+    pub for_print: bool,
     /// Opaque cursor from a previous page's `next_cursor`: `message:<base64
     /// folder>:<uid>`, since UIDs are only unique within one mailbox. Legacy
     /// `uid:N` cursors are still accepted, but match on UID alone and so can
@@ -73,6 +75,7 @@ pub async fn read_thread_page(
         thread_key,
         subject_filter,
         limit,
+        for_print,
         before_cursor,
         media_root,
         bake_html_policy,
@@ -182,7 +185,23 @@ pub async fn read_thread_page(
         .map(|(idx, _)| idx)
         .collect();
     if !missing.is_empty() {
-        if limit.is_none() {
+        if for_print {
+            // Fetch the page as a batch, but leave room under the desktop's
+            // 30s bridge deadline. Offline/failed bodies remain explicit slots.
+            // Do not start background work for this independent print snapshot.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                fetch_into_slots(engine, account, &headers, &mut slots, &missing, &media_root),
+            )
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                crate::mlog!(
+                    crate::log::Level::Warn,
+                    "mail",
+                    "print body fetch incomplete for {account}"
+                );
+            }
+        } else if limit.is_none() {
             // Full-scan path (markRead, compose threading): every message must
             // be present — a reply built off a body-less copy has no
             // Message-ID and would orphan the thread on the recipient's side.

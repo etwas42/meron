@@ -1,6 +1,7 @@
-import { Code, FileText, X } from 'lucide-react'
+import { Code, FileText, Printer, X } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
+import { printMail } from '../../lib/printMail'
 import { accounts$ } from '../../states/accounts'
 import { closeMessageTab, setTabViewMode } from '../../states/compose'
 import { normalizeSenderAddr, settings$ } from '../../states/settings'
@@ -34,6 +35,7 @@ export function ReaderTabView({ tab }: { tab: MessageTab }) {
   // decision as it stands now: the account toggle, the sender allowlist, or a
   // reveal the user made on this message in the conversation.
   const account = accounts.find((acc) => acc.id === tab.accountId)
+  const isRSS = account?.provider === 'rss' || account?.auth_type === 'rss'
   const sender = normalizeSenderAddr(tab.fromRaw ?? '')
   const allowRemote =
     (account?.load_remote_images ?? false) ||
@@ -94,6 +96,17 @@ export function ReaderTabView({ tab }: { tab: MessageTab }) {
           senderAddress={tab.outgoing ? '' : sender}
           size={16}
         />
+        {!isRSS && (
+          <button
+            disabled={tab.bodyMissing}
+            onClick={() => void printMail(tab)}
+            className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-hover text-secondary cursor-pointer"
+            title={t('chat.actions.print')}
+            aria-label={t('chat.actions.print')}
+          >
+            <Printer size={16} />
+          </button>
+        )}
         <button
           onClick={() => void closeMessageTab(tab.id)}
           className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-hover text-secondary cursor-pointer"

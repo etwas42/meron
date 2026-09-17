@@ -72,6 +72,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -134,6 +135,8 @@ internal fun ThreadScreen(
     canLoadOlder: Boolean,
     loadingOlder: Boolean,
     onLoadOlder: () -> Unit,
+    loadPrintMessages: suspend () -> List<MessageBody>,
+    onPrintError: (String) -> Unit,
     onQuickReplyChange: (String) -> Unit,
     quickReplyAttachments: List<DraftAttachment>,
     quickReplyFailure: String,
@@ -195,6 +198,10 @@ internal fun ThreadScreen(
     var galleryIndex by remember(thread?.id) { mutableStateOf<Int?>(null) }
     var moveDialogOpen by remember(thread?.id) { mutableStateOf(false) }
     var copyDialogOpen by remember(thread?.id) { mutableStateOf(false) }
+    val printThread = rememberPrintThread()
+    val printError = tr("chat.couldNotPrintThread")
+    var printing by remember(thread?.id) { mutableStateOf(false) }
+    val printScope = rememberCoroutineScope()
     var overflowOpen by remember(thread?.id) { mutableStateOf(false) }
     val closeSearch = {
         threadSearch = ""
@@ -601,6 +608,7 @@ internal fun ThreadScreen(
                         }
                     },
                     actions = {
+                        if (printing) CircularProgressIndicator(Modifier.size(20.dp))
                         IconButton(onClick = onToggleStar) {
                             Icon(
                                 if (thread?.starred == true) Icons.Filled.Star else Icons.Filled.StarBorder,
@@ -638,6 +646,27 @@ internal fun ThreadScreen(
                                     },
                                 )
                                 if (!isRss) {
+                                    DropdownMenuItem(
+                                        text = { Text(tr("chat.actions.printThread")) },
+                                        trailingIcon = { if (printing) CircularProgressIndicator(Modifier.size(16.dp)) },
+                                        enabled = !printing && thread != null,
+                                        onClick = {
+                                            overflowOpen = false
+                                            printing = true
+                                            val subject = thread?.subject.orEmpty()
+                                            printScope.launch {
+                                                try {
+                                                    printThread(subject, loadPrintMessages())
+                                                } catch (error: kotlinx.coroutines.CancellationException) {
+                                                    throw error
+                                                } catch (_: Exception) {
+                                                    onPrintError(printError)
+                                                } finally {
+                                                    printing = false
+                                                }
+                                            }
+                                        },
+                                    )
                                     // Hidden when the reply target has no other
                                     // recipients: a reply-all identical to the
                                     // reply is a second name for the same action.

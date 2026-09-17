@@ -1796,6 +1796,49 @@ fn mobile_protocol_inherits_parent_thread_key_for_sent_reply_chain() {
 }
 
 #[test]
+fn print_thread_read_keeps_uncached_messages_when_connection_is_unavailable() {
+    let data_dir = unique_data_dir("print-thread-offline");
+    let conn = store::open_at(data_dir.join("meron.db")).unwrap();
+    store::ensure_folder(&conn, "offline@example.com", "INBOX").unwrap();
+    let headers: Vec<_> = (1..=60)
+        .map(|uid| MessageHeader {
+            uid,
+            subject: "Print topic".to_string(),
+            thread_key: "topic".to_string(),
+            date: uid as i64,
+            ..Default::default()
+        })
+        .collect();
+    store::upsert_messages(&conn, "offline@example.com", "INBOX", &headers).unwrap();
+    drop(conn);
+    // No credentials: every body fetch fails, including pages with no cache.
+    let mut cursor = serde_json::Value::Null;
+    let mut count = 0;
+    for expected in [50, 10] {
+        let request = serde_json::json!({
+            "id": 1, "method": "mail.threadRead",
+            "params": { "thread_id": "offline@example.com#INBOX#t.dG9waWM",
+                "limit": 50, "for_print": true, "before_cursor": cursor }
+        });
+        let response =
+            invoke_mobile_protocol_json(&request.to_string(), Some(data_dir.to_str().unwrap()));
+        assert!(response.get("error").is_none(), "{response}");
+        let messages = response["result"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), expected);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["body_missing"] == true)
+        );
+        count += messages.len();
+        cursor = response["result"]["next_cursor"].clone();
+    }
+    assert_eq!(count, 60);
+    assert!(cursor.is_null());
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
 fn mobile_protocol_reads_cached_thread_messages_from_store() {
     let data_dir = unique_data_dir("thread-read");
     seed_mobile_account(&data_dir, "me@example.com");

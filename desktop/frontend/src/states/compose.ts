@@ -180,6 +180,22 @@ compose$.tabs.onChange(({ value: tabs }) => {
   }
 })
 
+// Keep pending reader snapshots in sync when background body fetching completes.
+mail$.messages.onChange(({ value: messages }) => {
+  const loaded = new Map(messages.filter((message) => !message.body_missing).map((message) => [message.id, message]))
+  for (const [index, tab] of compose$.tabs.peek().entries()) {
+    if (tab.kind !== 'reader' || !tab.bodyMissing) continue
+    const message = loaded.get(tab.messageId)
+    if (!message) continue
+    compose$.tabs[index].assign({
+      body: message.body,
+      bodyHtml: message.body_html,
+      bodyMissing: false,
+      attachments: message.attachments,
+    })
+  }
+})
+
 // Open a single message in its own reader tab. The HTML is already on the
 // message (shipped with threadRead), so this is instant — no fetch. Re-opening
 // an already-open message just re-activates its tab.
@@ -219,6 +235,7 @@ export function openMessageTab(message: Message) {
     date: message.date,
     body: message.body,
     bodyHtml: message.body_html,
+    bodyMissing: message.body_missing,
     attachments: message.attachments,
     viewMode: message.body_html && preferHtml ? 'html' : 'plain',
   }

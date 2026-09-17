@@ -3589,6 +3589,17 @@ describe('revealMessageRemote', () => {
     resetThreadView()
   })
 
+  it('refreshes a pending reader body and enables printing when it arrives', () => {
+    openMessageTab(message({ id: 'pending-reader', body: '', body_missing: true }))
+    mail$.messages.set([
+      message({ id: 'pending-reader', body: 'Downloaded body', body_html: '<p>Downloaded body</p>' }),
+    ])
+    const tab = compose$.tabs.get().find((tab) => tab.messageId === 'pending-reader')
+    expect(tab?.bodyMissing).toBe(false)
+    expect(tab?.body).toBe('Downloaded body')
+    expect(tab?.bodyHtml).toBe('<p>Downloaded body</p>')
+  })
+
   it('marks an open reader tab so a thread switch cannot re-block it', () => {
     openMessageTab(message({ id: 'm1', body_html: '<p>hi</p>' }))
     openMessageTab(message({ id: 'm2', body_html: '<p>other</p>' }))

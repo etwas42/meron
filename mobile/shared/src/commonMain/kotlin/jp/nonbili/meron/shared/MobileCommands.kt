@@ -654,12 +654,14 @@ data class ThreadReadParams(
     val threadId: String,
     val beforeCursor: String? = null,
     val limit: Int? = CONVERSATION_PAGE_SIZE,
+    val forPrint: Boolean = false,
 ) {
     fun toJson(): String =
         jsonObject(
             "thread_id" to threadId.jsonString(),
             "before_cursor" to beforeCursor?.jsonString(),
             "limit" to limit?.toString(),
+            "for_print" to if (forPrint) "true" else null,
         )
 }
 

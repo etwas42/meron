@@ -276,6 +276,7 @@ internal fun MessageBubble(
                 }
                 MessageActionsButton(
                     message = message,
+                    isRss = isRss,
                     tint = textColor.copy(alpha = 0.55f),
                     actionsEnabled = actionsEnabled,
                     itemActionsEnabled = itemActionsEnabled,
@@ -325,6 +326,7 @@ internal fun MessageBubble(
 @Composable
 internal fun MessageActionsButton(
     message: MessageBody,
+    isRss: Boolean,
     tint: Color,
     actionsEnabled: Boolean,
     itemActionsEnabled: Boolean,
@@ -339,6 +341,7 @@ internal fun MessageActionsButton(
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Box {
+        val printMessage = rememberPrintMessage()
         val messageTextLabel = tr("chat.messageText")
         val subjectLabel = tr("composer.fields.subject")
         val messageIdLabel = tr("chat.messageId")
@@ -352,6 +355,16 @@ internal fun MessageActionsButton(
             )
         }
         DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            if (!isRss) {
+                DropdownMenuItem(
+                    text = { Text(tr("chat.actions.print")) },
+                    enabled = !message.bodyMissing,
+                    onClick = {
+                        menuOpen = false
+                        printMessage(message)
+                    },
+                )
+            }
             DropdownMenuItem(
                 text = { Text(tr("chat.copyMessageText")) },
                 onClick = {

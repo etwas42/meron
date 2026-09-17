@@ -79,6 +79,7 @@ internal fun MessageReaderScreen(
     onOpenHtmlImage: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
 ) {
+    val printMessage = rememberPrintMessage()
     val messageTextLabel = tr("chat.messageText")
     val subjectLabel = tr("composer.fields.subject")
     val messageIdLabel = tr("chat.messageId")
@@ -226,6 +227,14 @@ internal fun MessageReaderScreen(
                                 Icon(Icons.Filled.MoreVert, contentDescription = tr("chat.moreMessageActions"))
                             }
                             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text(tr("chat.actions.print")) },
+                                    enabled = !message.bodyMissing,
+                                    onClick = {
+                                        menuOpen = false
+                                        printMessage(message)
+                                    },
+                                )
                                 DropdownMenuItem(
                                     text = { Text(tr("chat.copyMessageText")) },
                                     onClick = {

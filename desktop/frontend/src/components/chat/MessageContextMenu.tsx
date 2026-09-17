@@ -8,6 +8,7 @@ import {
   Mail,
   MailOpen,
   ReplyAll,
+  Printer,
   SquarePen,
   Star,
   Trash2,
@@ -21,6 +22,7 @@ import {
   replyAllToMessage,
 } from '../../states/compose'
 import { messageCanReplyAll } from '../../states/composeReply'
+import { printMail } from '../../lib/printMail'
 import { saveMessageAsEml } from '../../states/mail'
 import { markMessageReadState, starMessage } from '../../states/mailFlags'
 import { isDraftFolder } from '../../states/mailFolders'
@@ -184,6 +186,16 @@ export function MessageContextMenu({
                 const message = state.message
                 onClose()
                 void saveMessageAsEml(message)
+              }}
+            />
+          )}
+          {!headerOnly && !state.message.body_missing && !isRSS && (
+            <MenuItem
+              icon={<Printer size={13} className="text-accent" />}
+              label={t('chat.actions.print')}
+              onClick={() => {
+                onClose()
+                void printMail(state.message)
               }}
             />
           )}

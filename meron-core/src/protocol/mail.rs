@@ -933,6 +933,10 @@ pub(crate) fn read_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
             thread_key: &thread_key,
             subject_filter: parsed.subject_filter.as_deref(),
             limit,
+            for_print: params
+                .get("for_print")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             before_cursor: before_cursor.as_deref(),
             media_root: std::path::PathBuf::from(data_dir).join("attachments"),
             // The mobile WebView applies the remote-image policy at render

@@ -269,6 +269,7 @@ export type MessageTab = {
   date?: number
   body: string
   bodyHtml?: string
+  bodyMissing?: boolean
   attachments?: Attachment[]
   viewMode: 'html' | 'plain'
   /** Whether the user revealed this message's remote content. Kept on the tab

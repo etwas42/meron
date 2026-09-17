@@ -115,7 +115,7 @@ func TestThreadReadPassesBranchKeyThrough(t *testing.T) {
 		},
 	}})
 
-	out, err := app.threadRead(map[string]any{"thread_id": threadID, "limit": float64(20), "before_cursor": "c1"})
+	out, err := app.threadRead(map[string]any{"thread_id": threadID, "limit": float64(20), "before_cursor": "c1", "for_print": true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +129,7 @@ func TestThreadReadPassesBranchKeyThrough(t *testing.T) {
 		"thread_id":     threadID,
 		"limit":         float64(20),
 		"before_cursor": "c1",
+		"for_print":     true,
 	})
 
 	messages, _ := out.(map[string]any)["messages"].([]any)
