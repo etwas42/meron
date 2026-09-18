@@ -5,14 +5,20 @@ package main
 /*
 #cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework AppKit -framework WebKit
-int printMailDocument(void);
+#include <stdlib.h>
+int printMailDocument(const char *html);
 */
 import "C"
 
-import "fmt"
+import (
+	"fmt"
+	"unsafe"
+)
 
-func printNativeMail() (bool, error) {
-	result := C.printMailDocument()
+func printNativeMail(html string) (bool, error) {
+	document := C.CString(html)
+	defer C.free(unsafe.Pointer(document))
+	result := C.printMailDocument(document)
 	if result < 0 {
 		return false, nil
 	}

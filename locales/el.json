@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Δεν ήταν δυνατή η αντιγραφή της εικόνας",
   "chat.couldNotOpenAttachment": "Δεν ήταν δυνατό το άνοιγμα του {filename}",
   "chat.couldNotPrintMessage": "Δεν ήταν δυνατή η εκτύπωση του μηνύματος",
+  "chat.preparingPrint": "Προετοιμασία εκτύπωσης…",
   "chat.couldNotPrintThread": "Δεν ήταν δυνατή η εκτύπωση ολόκληρης της συνομιλίας. Ελέγξτε τη σύνδεσή σας και δοκιμάστε ξανά.",
   "chat.couldNotSaveAttachment": "Δεν ήταν δυνατή η αποθήκευση του {filename}",
   "chat.couldNotSaveMessage": "Δεν ήταν δυνατή η αποθήκευση του μηνύματος",

@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Bild konnte nicht kopiert werden",
   "chat.couldNotOpenAttachment": "{filename} konnte nicht geöffnet werden",
   "chat.couldNotPrintMessage": "Nachricht konnte nicht gedruckt werden",
+  "chat.preparingPrint": "Druck wird vorbereitet…",
   "chat.couldNotPrintThread": "Die vollständige Unterhaltung konnte nicht gedruckt werden. Prüfen Sie Ihre Verbindung und versuchen Sie es erneut.",
   "chat.couldNotSaveAttachment": "{filename} konnte nicht gespeichert werden",
   "chat.couldNotSaveMessage": "Nachricht konnte nicht gespeichert werden",

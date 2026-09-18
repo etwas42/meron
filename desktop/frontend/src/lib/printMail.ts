@@ -3,7 +3,7 @@ import { CONVERSATION_PAGE_SIZE } from './pagination'
 import { htmlToText } from './html'
 import { t } from './i18n'
 import { formatFullTimestamp, htmlReferencesMedia } from '../components/chat/messageHelpers'
-import { showToast } from '../states/ui'
+import { showToast, ui$ } from '../states/ui'
 import { accounts$ } from '../states/accounts'
 import { settings$ } from '../states/settings'
 import { thread$ } from '../states/thread'
@@ -13,6 +13,22 @@ import { applyRemoteContentPolicy } from '../components/chat/remoteContentCsp'
 import type { Message, MessageTab } from '../types'
 
 let disposePrint: (() => void) | undefined
+
+function printPreparationFeedback() {
+  const message = t('chat.preparingPrint')
+  let shown = false
+  const timer = window.setTimeout(() => {
+    shown = true
+    showToast(message, 'success', 0)
+  }, 1000)
+  return () => {
+    window.clearTimeout(timer)
+    if (shown && ui$.toast.peek() === message) {
+      ui$.toast.set('')
+      ui$.toastUndo.set(null)
+    }
+  }
+}
 
 function printAttachmentNames(mail: Message | MessageTab, renderedHtml = false): string[] {
   const html = 'from_addr' in mail ? mail.body_html : mail.bodyHtml
@@ -76,15 +92,23 @@ export async function loadPrintThread(threadId: string): Promise<Message[]> {
 }
 
 export async function printThread(threadId: string) {
+  const stopPreparing = printPreparationFeedback()
   try {
-    await printMails(await loadPrintThread(threadId), 'chat.couldNotPrintThread')
+    await printMails(await loadPrintThread(threadId), 'chat.couldNotPrintThread', undefined, stopPreparing)
   } catch {
     showToast(t('chat.couldNotPrintThread'), 'error')
+  } finally {
+    stopPreparing()
   }
 }
 
 export async function printMail(mail: Message | MessageTab, allowRemote?: boolean) {
-  await printMails([mail], 'chat.couldNotPrintMessage', allowRemote)
+  const stopPreparing = printPreparationFeedback()
+  try {
+    await printMails([mail], 'chat.couldNotPrintMessage', allowRemote, stopPreparing)
+  } finally {
+    stopPreparing()
+  }
 }
 
 /** Keep the backend-sanitized email and its CSS/CSP in a separate document. */
@@ -115,12 +139,28 @@ export function mailPrintHtml(mail: Message | MessageTab, allowRemote: boolean):
   doc.querySelectorAll('img').forEach((img) => {
     img.loading = 'eager'
   })
+  // Keep headers and body in one pagination context. A separately measured
+  // iframe can otherwise move the entire body to the page after the headers.
+  const header = doc.createElement('pre')
+  header.className = 'meron-print-summary'
+  header.textContent = mailPrintText({ ...mail, body: ' ', attachments: [] }).trimEnd()
+  header.style.marginBottom = '16px'
+  doc.body.prepend(header)
+  const attachmentNames = printAttachmentNames(mail, true)
+  if (attachmentNames.length) {
+    const attachments = doc.createElement('pre')
+    attachments.className = 'meron-print-summary'
+    attachments.textContent = `\n${t('chat.printAttachments')}:\n${attachmentNames.join('\n')}`
+    doc.body.append(attachments)
+  }
   const style = doc.createElement('style')
   style.textContent = `html, body { height: auto !important; overflow: visible !important; }
     body { margin: 0; overflow-wrap: anywhere; }
     img, video, table { max-width: 100% !important; }
     img { height: auto !important; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    body > pre.meron-print-summary { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+      font: 11pt/1.5 sans-serif; color: black; }
     * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }`
   doc.head.append(style)
   return '<!doctype html>' + doc.documentElement.outerHTML
@@ -137,14 +177,80 @@ function printRemoteAllowed(mail: Message | MessageTab): boolean {
   )
 }
 
+// Shadow roots isolate each email's CSS without introducing iframe page slicing.
+// Native WebKit on Linux/macOS attaches these templates before printing the document.
+export function nativePrintHtml(root: HTMLElement): string | undefined {
+  const doc = document.implementation.createHTMLDocument('')
+  const title = doc.createElement('title')
+  title.textContent = root.dataset.printTitle || t('threads.noSubject')
+  doc.head.querySelector('title')?.remove()
+  doc.head.append(title)
+  const policy = doc.createElement('meta')
+  policy.httpEquiv = 'Content-Security-Policy'
+  policy.content = "script-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
+  doc.head.append(policy)
+  const style = doc.createElement('style')
+  style.textContent = `@page { margin: 0; }
+    body { margin: 0; color: black; background: white; }
+    section + section { break-before: page; page-break-before: always; }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11pt/1.5 sans-serif; }`
+  doc.head.append(style)
+  let resourcePolicy: string | undefined
+  for (const source of root.querySelectorAll(':scope > section')) {
+    const section = doc.createElement('section')
+    const frame = source.querySelector('iframe')
+    if (frame) {
+      if (!frame.contentDocument?.body) throw new Error('Print HTML unavailable')
+      const mail = frame.contentDocument
+      const policies = Array.from(mail.querySelectorAll('meta[http-equiv="Content-Security-Policy" i]'))
+      const signature = policies
+        .map((meta) => meta.getAttribute('content'))
+        .sort()
+        .join('\n')
+      // A top-level document cannot enforce different CSPs per shadow root.
+      // Keep the isolated-frame fallback for mixed-policy threads rather than
+      // intersecting policies (missing images) or broadening them (remote leaks).
+      if (resourcePolicy !== undefined && resourcePolicy !== signature) return undefined
+      if (resourcePolicy === undefined) policies.forEach((meta) => doc.head.append(doc.importNode(meta, true)))
+      resourcePolicy = signature
+      const template = doc.createElement('template')
+      template.setAttribute('data-print-message', '')
+      const html = doc.importNode(mail.documentElement, true)
+      const summaries = html.querySelectorAll('body > pre.meron-print-summary')
+      summaries.forEach((summary) => summary.remove())
+      if (summaries[0]) section.append(summaries[0])
+      html.querySelectorAll('meta, script').forEach((el) => el.remove())
+      // Store as escaped text so the outer HTML parser cannot discard the
+      // nested html/head/body elements needed by the email's CSS selectors.
+      template.content.append(doc.createTextNode(html.outerHTML))
+      // Only the email body is a shadow host. Attaching to section would hide
+      // its light-DOM header and attachment summary (there is no slot).
+      const host = doc.createElement('div')
+      host.setAttribute('data-print-body', '')
+      host.append(template)
+      section.append(host)
+      for (const summary of Array.from(summaries).slice(1)) section.append(summary)
+    } else {
+      section.innerHTML = source.innerHTML
+    }
+    doc.body.append(section)
+  }
+  return '<!doctype html>' + doc.documentElement.outerHTML
+}
+
 async function printMails(
   mails: (Message | MessageTab)[],
   errorKey = 'chat.couldNotPrintMessage',
   allowRemote?: boolean,
+  stopPreparing: () => void = () => {},
 ) {
   disposePrint?.()
   const root = document.createElement('div')
   root.id = 'meron-print-document'
+  const printTitle = mails[0]?.subject || t('threads.noSubject')
+  root.dataset.printTitle = printTitle
+  const originalTitle = document.title
+  let changedTitle = false
   const style = document.createElement('style')
   style.textContent = `
     #meron-print-document { position: absolute; left: -100000px; top: 0; width: 180mm; }
@@ -173,6 +279,20 @@ async function printMails(
     })
   }
   const beforePrint = () => measureFrames()
+  const browserPrint = () => {
+    // Browser fallback retains iframe CSP isolation; summaries belong outside
+    // that email-controlled style scope.
+    for (const frame of frames) {
+      const summaries = frame.contentDocument?.querySelectorAll('body > pre.meron-print-summary')
+      if (summaries?.[0]) frame.before(summaries[0])
+      for (const summary of Array.from(summaries ?? []).slice(1)) frame.after(summary)
+    }
+    measureFrames()
+    stopPreparing()
+    document.title = printTitle
+    changedTitle = true
+    window.print()
+  }
   for (const mail of mails) {
     const section = document.createElement('section')
     root.append(section)
@@ -183,9 +303,6 @@ async function printMails(
       section.append(content)
       continue
     }
-    content.textContent = mailPrintText({ ...mail, body: ' ', attachments: [] }).trimEnd()
-    content.style.marginBottom = '16px'
-    section.append(content)
     const frame = document.createElement('iframe')
     frame.title = mail.subject
     frame.setAttribute('sandbox', 'allow-same-origin')
@@ -211,15 +328,11 @@ async function printMails(
     )
     frame.srcdoc = html
     section.append(frame)
-    const attachmentNames = printAttachmentNames(mail, true)
-    if (attachmentNames.length) {
-      const attachments = document.createElement('pre')
-      attachments.textContent = `\n${t('chat.printAttachments')}:\n${attachmentNames.join('\n')}`
-      section.append(attachments)
-    }
   }
   document.body.append(root)
   const cleanup = () => {
+    stopPreparing()
+    if (changedTitle && document.title === printTitle) document.title = originalTitle
     root.remove()
     timers.forEach((timer) => window.clearTimeout(timer))
     window.removeEventListener('beforeprint', beforePrint)
@@ -234,17 +347,11 @@ async function printMails(
     if (!root.isConnected) return
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
     if ((window as any).go?.main?.App) {
-      // NSPrintInfo supplies native margins. Restore CSS margins on fallback.
-      const browserStyles = style.textContent
-      style.textContent += '\n@media print { @page { margin: 0; } }'
-      const native = await invoke<boolean>('mail.print')
+      const html = nativePrintHtml(root)
+      const native = html !== undefined && (await invoke<boolean>('mail.print', { html }))
       if (native) cleanup()
-      else {
-        style.textContent = browserStyles
-        root.style.removeProperty('width')
-        window.print()
-      }
-    } else window.print()
+      else browserPrint()
+    } else browserPrint()
   } catch {
     cleanup()
     showToast(t(errorKey), 'error')

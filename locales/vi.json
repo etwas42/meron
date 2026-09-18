@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Không thể sao chép hình ảnh",
   "chat.couldNotOpenAttachment": "Không thể mở {filename}",
   "chat.couldNotPrintMessage": "Không thể in thư",
+  "chat.preparingPrint": "Đang chuẩn bị in…",
   "chat.couldNotPrintThread": "Không thể in toàn bộ cuộc hội thoại. Hãy kiểm tra kết nối và thử lại.",
   "chat.couldNotSaveAttachment": "Không thể lưu {filename}",
   "chat.couldNotSaveMessage": "Không thể lưu tin nhắn",

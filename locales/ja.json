@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "画像をコピーできませんでした",
   "chat.couldNotOpenAttachment": "{filename} を開けませんでした",
   "chat.couldNotPrintMessage": "メッセージを印刷できませんでした",
+  "chat.preparingPrint": "印刷を準備中…",
   "chat.couldNotPrintThread": "スレッド全体を印刷できませんでした。接続を確認して再試行してください。",
   "chat.couldNotSaveAttachment": "{filename} を保存できませんでした",
   "chat.couldNotSaveMessage": "メッセージを保存できませんでした",

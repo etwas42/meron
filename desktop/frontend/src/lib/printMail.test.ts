@@ -1,10 +1,11 @@
 import { beforeEach, afterEach, expect, spyOn, test } from 'bun:test'
-import { loadPrintThread, mailPrintHtml, mailPrintText, printMail, printThread } from './printMail'
+import { loadPrintThread, mailPrintHtml, mailPrintText, nativePrintHtml, printMail, printThread } from './printMail'
 import type { Message, MessageTab } from '../types'
 import { CONVERSATION_PAGE_SIZE } from './pagination'
 import { thread$ } from '../states/thread'
 import { accounts$ } from '../states/accounts'
 import type { Account } from '../types'
+import { ui$ } from '../states/ui'
 
 beforeEach(() => {
   thread$.conversationModeOverrides.set({ a: 'html' })
@@ -181,11 +182,12 @@ test('HTML print jobs wait for isolated frames and include headers and attachmen
           const frame = document.querySelector<HTMLIFrameElement>('#meron-print-document iframe')!
           expect(frame.getAttribute('sandbox')).toBe('allow-same-origin')
           expect(frame.srcdoc).toContain('<strong>Formatted body</strong>')
-          expect(document.querySelector('#meron-print-document pre')?.textContent).toContain(
-            'Alice <alice@example.com>',
-          )
-          expect(document.querySelector('#meron-print-document')?.textContent).toContain('report.pdf')
-          expect(document.querySelector('#meron-print-document')?.textContent).not.toContain('logo-proton.png')
+          const doc = new DOMParser().parseFromString(frame.srcdoc, 'text/html')
+          expect(doc.body.firstElementChild?.textContent).toContain('Alice <alice@example.com>')
+          expect(doc.body.lastElementChild?.textContent).toContain('report.pdf')
+          expect(doc.body.textContent).not.toContain('logo-proton.png')
+          // No separate header or footer can strand the body iframe on another page.
+          expect(frame.parentElement?.children).toHaveLength(1)
           printed = true
           return true
         },
@@ -269,9 +271,52 @@ test('slow resources still print and beforeprint remeasures frame height', async
   }
 })
 
+test('slow print preparation stays visible through native preparation and clears on return', async () => {
+  const scheduledDelays: number[] = []
+  let toastAtPrint = ''
+  let showPreparing: (() => void) | undefined
+  let finishLoading: (() => void) | undefined
+  const timeout = spyOn(window, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    scheduledDelays.push(delay)
+    if (delay === 1000) showPreparing = callback
+    if (delay === 15000) finishLoading = callback
+    return 0
+  }) as typeof window.setTimeout)
+  let printed = false
+  ;(window as any).go = {
+    main: {
+      App: {
+        Invoke: async () => {
+          printed = true
+          toastAtPrint = ui$.toast.peek()
+          return true
+        },
+      },
+    },
+  }
+  ui$.toast.set('')
+  try {
+    const job = printMail({ ...message, body_html: '<p>Body</p>' })
+    expect(ui$.toast.peek()).toBe('')
+    showPreparing!()
+    expect(ui$.toast.peek()).toBe('Preparing print…')
+    expect(scheduledDelays).not.toContain(2200)
+    finishLoading!()
+    await job
+    expect(printed).toBe(true)
+    expect(toastAtPrint).toBe('Preparing print…')
+    expect(ui$.toast.peek()).toBe('')
+  } finally {
+    timeout.mockRestore()
+    ui$.toast.set('')
+  }
+})
+
 test('non-native printing calls window.print directly and cleans up afterprint', async () => {
+  const originalTitle = document.title
   ;(window as any).go = { main: { App: { Invoke: async () => false } } }
   const print = spyOn(window, 'print').mockImplementation(() => {
+    expect(document.title).toBe(message.subject)
     expect(document.querySelector('#meron-print-document pre')?.textContent).toContain(message.body)
     window.dispatchEvent(new Event('afterprint'))
   })
@@ -279,8 +324,74 @@ test('non-native printing calls window.print directly and cleans up afterprint',
     await printMail(message)
     expect(print).toHaveBeenCalledTimes(1)
     expect(document.getElementById('meron-print-document')).toBeNull()
+    expect(document.title).toBe(originalTitle)
   } finally {
     print.mockRestore()
+  }
+})
+
+test('native document removes iframe pagination while retaining isolated markup and CSP', () => {
+  const root = document.createElement('div')
+  root.dataset.printTitle = message.subject
+  root.innerHTML = '<section><iframe></iframe></section><section><pre>Plain &lt;text&gt;</pre></section>'
+  document.body.append(root)
+  try {
+    const frame = root.querySelector('iframe')!
+    const html = mailPrintHtml(
+      {
+        ...message,
+        body_html:
+          '<style>body { color: purple }</style><div>hi<img width="562" height="562" src="/media/cat"></div><div>s2</div>',
+      },
+      false,
+    )!
+    frame.contentDocument!.write(html)
+    const doc = new DOMParser().parseFromString(nativePrintHtml(root)!, 'text/html')
+    expect(doc.title).toBe(message.subject)
+    expect(doc.querySelector('iframe')).toBeNull()
+    expect(doc.body.children).toHaveLength(2)
+    const template = doc.querySelector('template')!
+    const mail = new DOMParser().parseFromString(template.content.textContent!, 'text/html')
+    expect(doc.querySelector('section > pre')?.textContent).toContain('Alice <alice@example.com>')
+    expect(mail.body.textContent).not.toContain('Alice <alice@example.com>')
+    expect(mail.body.textContent).toContain('s2')
+    expect(mail.querySelector('img')?.getAttribute('src')).toBe('/media/cat')
+    expect(
+      Array.from(mail.querySelectorAll('style'))
+        .map((style) => style.textContent)
+        .join('\n'),
+    ).toContain('body { color: purple }')
+    expect(mail.querySelector('meta')).toBeNull()
+    expect(doc.head.textContent).not.toContain('purple')
+    expect(doc.head.querySelectorAll('meta[http-equiv="Content-Security-Policy"]')).toHaveLength(2)
+    expect(doc.body.lastElementChild?.textContent).toBe('Plain <text>')
+    // Run the native attachment step, rather than only inspecting inert markup.
+    const host = template.parentElement!
+    host.attachShadow({ mode: 'open' }).append(doc.importNode(mail.documentElement, true))
+    template.remove()
+    expect(host.matches('[data-print-body]')).toBe(true)
+    expect(host.parentElement?.shadowRoot).toBeNull()
+    expect(host.previousElementSibling?.textContent).toContain('Alice <alice@example.com>')
+    expect(host.shadowRoot?.textContent).toContain('s2')
+  } finally {
+    root.remove()
+  }
+})
+
+test('native printing falls back for mixed CSPs and rejects inaccessible frames', () => {
+  const root = document.createElement('div')
+  root.innerHTML = '<section><iframe></iframe></section><section><iframe></iframe></section>'
+  document.body.append(root)
+  try {
+    const frames = root.querySelectorAll('iframe')
+    for (const [index, frame] of Array.from(frames).entries()) {
+      frame.contentDocument!.write(mailPrintHtml({ ...message, body_html: '<p>Body</p>' }, index === 0)!)
+    }
+    expect(nativePrintHtml(root)).toBeUndefined()
+    Object.defineProperty(frames[0], 'contentDocument', { configurable: true, value: null })
+    expect(() => nativePrintHtml(root)).toThrow('Print HTML unavailable')
+  } finally {
+    root.remove()
   }
 })
 

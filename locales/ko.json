@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "이미지를 복사할 수 없습니다.",
   "chat.couldNotOpenAttachment": "{filename}를 열 수 없습니다.",
   "chat.couldNotPrintMessage": "메시지를 인쇄할 수 없습니다",
+  "chat.preparingPrint": "인쇄 준비 중…",
   "chat.couldNotPrintThread": "전체 대화를 인쇄할 수 없습니다. 연결을 확인하고 다시 시도하세요.",
   "chat.couldNotSaveAttachment": "{filename}를 저장할 수 없습니다.",
   "chat.couldNotSaveMessage": "메시지를 저장할 수 없습니다.",

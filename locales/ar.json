@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "تعذر نسخ الصورة",
   "chat.couldNotOpenAttachment": "تعذر فتح {filename}",
   "chat.couldNotPrintMessage": "تعذرت طباعة الرسالة",
+  "chat.preparingPrint": "جارٍ التحضير للطباعة…",
   "chat.couldNotPrintThread": "تعذرت طباعة المحادثة كاملة. تحقق من اتصالك وحاول مرة أخرى.",
   "chat.couldNotSaveAttachment": "تعذر حفظ {filename}",
   "chat.couldNotSaveMessage": "تعذر حفظ الرسالة",

@@ -113,16 +113,18 @@ export function focusGlobalSearch() {
 
 // Show a transient toast for ~2.2s. Clears only if it's still showing this
 // message, so a newer toast isn't cut short. Pass tone "error" for failures.
-export function showToast(msg: string, tone: ToastTone = 'success') {
+// A duration of 0 stays visible until the caller dismisses it.
+export function showToast(msg: string, tone: ToastTone = 'success', duration = 2200) {
   ui$.toastUndo.set(null)
   ui$.toastTone.set(tone)
   ui$.toast.set(msg)
+  if (duration === 0) return
   setTimeout(() => {
     if (ui$.toast.get() === msg) {
       ui$.toast.set('')
       ui$.toastUndo.set(null)
     }
-  }, 2200)
+  }, duration)
 }
 
 // Like showToast but pairs the message with an Undo affordance. Given a longer

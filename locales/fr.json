@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Impossible de copier l'image",
   "chat.couldNotOpenAttachment": "Impossible d'ouvrir {filename}",
   "chat.couldNotPrintMessage": "Impossible d’imprimer le message",
+  "chat.preparingPrint": "Préparation de l’impression…",
   "chat.couldNotPrintThread": "Impossible d’imprimer la conversation complète. Vérifiez votre connexion et réessayez.",
   "chat.couldNotSaveAttachment": "Impossible d'enregistrer {filename}",
   "chat.couldNotSaveMessage": "Impossible d'enregistrer le message",

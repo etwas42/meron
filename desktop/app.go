@@ -311,7 +311,8 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 	case "mail.openAttachment":
 		return a.openAttachment(payload)
 	case "mail.print":
-		return printNativeMail()
+		html, _ := payload["html"].(string)
+		return printNativeMail(html)
 	case "mail.saveEml":
 		return a.saveMessageEml(payload)
 	case "mail.copyImage":

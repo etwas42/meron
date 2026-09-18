@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Couldn't copy image",
   "chat.couldNotOpenAttachment": "Couldn't open {filename}",
   "chat.couldNotPrintMessage": "Could not print message",
+  "chat.preparingPrint": "Preparing print…",
   "chat.couldNotPrintThread": "Could not print the complete thread. Check your connection and try again.",
   "chat.couldNotSaveAttachment": "Couldn't save {filename}",
   "chat.couldNotSaveMessage": "Couldn't save message",

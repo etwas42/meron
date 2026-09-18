@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "無法複製影像",
   "chat.couldNotOpenAttachment": "無法開啟 {filename}",
   "chat.couldNotPrintMessage": "無法列印郵件",
+  "chat.preparingPrint": "正在準備列印…",
   "chat.couldNotPrintThread": "無法列印完整對話。請檢查連線後重試。",
   "chat.couldNotSaveAttachment": "無法儲存 {filename}",
   "chat.couldNotSaveMessage": "無法保存訊息",

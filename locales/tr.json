@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Resim kopyalanamadı",
   "chat.couldNotOpenAttachment": "{filename} açılamadı",
   "chat.couldNotPrintMessage": "İleti yazdırılamadı",
+  "chat.preparingPrint": "Yazdırma hazırlanıyor…",
   "chat.couldNotPrintThread": "Yazışmanın tamamı yazdırılamadı. Bağlantınızı kontrol edip tekrar deneyin.",
   "chat.couldNotSaveAttachment": "{filename} kaydedilemedi",
   "chat.couldNotSaveMessage": "Mesaj kaydedilemedi",

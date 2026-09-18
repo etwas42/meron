@@ -150,6 +150,7 @@
   "chat.couldNotCopyImage": "Nevarēja nokopēt attēlu",
   "chat.couldNotOpenAttachment": "Nevarēja atvērt {filename}",
   "chat.couldNotPrintMessage": "Neizdevās izdrukāt ziņojumu",
+  "chat.preparingPrint": "Sagatavo drukāšanu…",
   "chat.couldNotPrintThread": "Neizdevās izdrukāt visu saraksti. Pārbaudiet savienojumu un mēģiniet vēlreiz.",
   "chat.couldNotSaveAttachment": "Nevarēja saglabāt {filename}",
   "chat.couldNotSaveMessage": "Nevarēja saglabāt ziņojumu",
