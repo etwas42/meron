@@ -14,6 +14,10 @@ import platform.UIKit.UIPrintInfo
 import platform.UIKit.UIPrintInteractionController
 import platform.UIKit.UIUserInterfaceIdiomPad
 
+// UIMarkupTextPrintFormatter has no verified resource-policy enforcement.
+// Keep email markup out until a controlled WebKit print renderer replaces it.
+internal actual val supportsHtmlMailPrinting = false
+
 @OptIn(ExperimentalForeignApi::class)
 @Composable
 internal actual fun rememberMailPrinter(errorText: String): (String, String) -> Unit {

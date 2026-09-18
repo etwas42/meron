@@ -79,7 +79,7 @@ internal fun MessageReaderScreen(
     onOpenHtmlImage: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
 ) {
-    val printMessage = rememberPrintMessage()
+    val printMessage = rememberPrintMessage(preferHtml, remoteContent.allowRemote)
     val messageTextLabel = tr("chat.messageText")
     val subjectLabel = tr("composer.fields.subject")
     val messageIdLabel = tr("chat.messageId")

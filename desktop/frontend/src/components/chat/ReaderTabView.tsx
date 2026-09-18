@@ -99,7 +99,7 @@ export function ReaderTabView({ tab }: { tab: MessageTab }) {
         {!isRSS && (
           <button
             disabled={tab.bodyMissing}
-            onClick={() => void printMail(tab)}
+            onClick={() => void printMail(tab, allowRemote)}
             className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-hover text-secondary cursor-pointer"
             title={t('chat.actions.print')}
             aria-label={t('chat.actions.print')}

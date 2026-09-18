@@ -403,6 +403,8 @@ internal fun MessageRowHeader(
             )
         }
         MessageActionsButton(
+            preferHtml = preferHtml,
+            allowRemote = remoteContent.allowRemote,
             message = message,
             isRss = isRss,
             tint = mutedColor,

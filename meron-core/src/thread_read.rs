@@ -186,13 +186,17 @@ pub async fn read_thread_page(
         .collect();
     if !missing.is_empty() {
         if for_print {
-            // Fetch the page as a batch, but leave room under the desktop's
-            // 30s bridge deadline. Offline/failed bodies remain explicit slots.
+            // Persist each completed body before starting the next one, so the
+            // page deadline cannot discard progress and retries converge.
+            // Leave room under the desktop's 30s bridge deadline.
             // Do not start background work for this independent print snapshot.
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                fetch_into_slots(engine, account, &headers, &mut slots, &missing, &media_root),
-            )
+            let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                for &idx in &missing {
+                    fetch_into_slots(engine, account, &headers, &mut slots, &[idx], &media_root)
+                        .await?;
+                }
+                anyhow::Ok(())
+            })
             .await;
             if !matches!(result, Ok(Ok(()))) {
                 crate::mlog!(

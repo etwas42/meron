@@ -12,15 +12,19 @@ import android.print.PrintDocumentAdapter
 import android.print.PrintManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import java.io.ByteArrayInputStream
 
 // Android requires a strong reference while the document loads and prints.
 private val activePrintViews = mutableSetOf<WebView>()
+
+internal actual val supportsHtmlMailPrinting = true
 
 @Composable
 internal actual fun rememberMailPrinter(errorText: String): (String, String) -> Unit {
@@ -51,9 +55,26 @@ internal actual fun rememberMailPrinter(errorText: String): (String, String) -> 
             loadTimeout = Runnable { if (!started) fail() }
             handler.postDelayed(loadTimeout, 30_000)
             webView.settings.javaScriptEnabled = false
-            webView.settings.blockNetworkLoads = true
+            // The document CSP gates remote images; cached media uses the reader's loader.
+            webView.settings.allowFileAccess = false
+            webView.settings.allowContentAccess = false
             webView.webViewClient =
                 object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): WebResourceResponse? {
+                        val uri = request?.url ?: return null
+                        localMailMediaResponse(context, uri.scheme, uri.host, uri.path)?.let { return it }
+                        if (isMailWebViewOrigin(uri.host)) return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                        return null
+                    }
+
+                    override fun shouldOverrideUrlLoading(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): Boolean = true
+
                     override fun onReceivedError(
                         view: WebView,
                         request: WebResourceRequest,
@@ -111,7 +132,7 @@ internal actual fun rememberMailPrinter(errorText: String): (String, String) -> 
                     }
                 }
             try {
-                webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                webView.loadDataWithBaseURL(MAIL_WEB_VIEW_ORIGIN, html, "text/html", "UTF-8", null)
             } catch (_: Exception) {
                 fail()
             }

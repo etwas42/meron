@@ -30,7 +30,7 @@ import java.io.FileInputStream
 import java.net.URI
 import kotlin.math.roundToInt
 
-private const val MAIL_WEB_VIEW_ORIGIN = "https://appassets.androidplatform.net/"
+internal const val MAIL_WEB_VIEW_ORIGIN = "https://appassets.androidplatform.net/"
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -224,7 +224,7 @@ actual fun MailWebView(
     )
 }
 
-private fun localMailMediaResponse(
+internal fun localMailMediaResponse(
     context: Context,
     scheme: String?,
     host: String?,
@@ -272,7 +272,7 @@ internal fun mailImageRef(src: String): String? {
     return value.takeIf { uri.scheme?.lowercase() in setOf("http", "https") }
 }
 
-private fun isMailWebViewOrigin(host: String?): Boolean = host.equals("appassets.androidplatform.net", ignoreCase = true)
+internal fun isMailWebViewOrigin(host: String?): Boolean = host.equals("appassets.androidplatform.net", ignoreCase = true)
 
 private fun encodeIllegalUriCharacters(value: String): String =
     buildString(value.length) {

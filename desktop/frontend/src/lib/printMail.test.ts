@@ -1,7 +1,14 @@
-import { afterEach, expect, spyOn, test } from 'bun:test'
-import { loadPrintThread, mailPrintText, printMail, printThread } from './printMail'
-import type { Message } from '../types'
+import { beforeEach, afterEach, expect, spyOn, test } from 'bun:test'
+import { loadPrintThread, mailPrintHtml, mailPrintText, printMail, printThread } from './printMail'
+import type { Message, MessageTab } from '../types'
 import { CONVERSATION_PAGE_SIZE } from './pagination'
+import { thread$ } from '../states/thread'
+import { accounts$ } from '../states/accounts'
+import type { Account } from '../types'
+
+beforeEach(() => {
+  thread$.conversationModeOverrides.set({ a: 'html' })
+})
 
 const message: Message = {
   id: 'm',
@@ -23,6 +30,8 @@ const message: Message = {
 afterEach(() => {
   window.dispatchEvent(new Event('afterprint'))
   delete (window as any).go
+  thread$.conversationModeOverrides.set({})
+  accounts$.set([])
 })
 
 test('includes headers, full quoted body, and attachment names', () => {
@@ -53,6 +62,87 @@ test('extracts HTML-only text without scripts, styles, or image requests', () =>
   expect(text).not.toContain('tracker.test')
 })
 
+test('plain attachment summaries retain embedded images and standalone files', () => {
+  const inline = { key: 'logo', filename: 'logo-proton.png', mime: 'image/png', size: 100 }
+  const mail = { ...message, body_html: '<img src="/media/logo">', attachments: [inline] }
+  expect(mailPrintText(mail)).toContain('Attachments:')
+  expect(mailPrintText(mail)).toContain(inline.filename)
+  const text = mailPrintText({
+    ...mail,
+    attachments: [
+      inline,
+      { key: 'photo', filename: 'photo.png', mime: 'image/png', size: 100 },
+      { key: 'report', filename: 'report.pdf', mime: 'application/pdf', size: 42 },
+    ],
+  })
+  expect(text).toContain('photo.png')
+  expect(text).toContain('report.pdf')
+  expect(text).toContain(inline.filename)
+})
+
+test('message printing follows account mode and conversation overrides', () => {
+  const mail = { ...message, body_html: '<b>HTML</b>' }
+  thread$.conversationModeOverrides.set({})
+  accounts$.set([{ id: 'a', conversation_html: false } as Account])
+  expect(mailPrintHtml(mail, true)).toBeUndefined()
+  thread$.conversationModeOverrides.set({ a: 'html' })
+  expect(mailPrintHtml(mail, false)).toContain('<b>HTML</b>')
+  accounts$.set([{ id: 'a', conversation_html: true } as Account])
+  thread$.conversationModeOverrides.set({ a: 'plain' })
+  expect(mailPrintHtml(mail, true)).toBeUndefined()
+})
+
+test('HTML printing preserves formatting and images even when a plain body exists', () => {
+  const html = mailPrintHtml(
+    {
+      ...message,
+      body_html:
+        '<style>p { color: purple }</style><p><strong>Calendar</strong></p><img src="/media/logo" width="200" height="100">',
+    },
+    false,
+  )!
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  expect(doc.querySelector('strong')?.textContent).toBe('Calendar')
+  expect(doc.querySelector('img')?.getAttribute('src')).toBe('/media/logo')
+  expect(doc.querySelector('img')?.getAttribute('loading')).toBe('eager')
+  expect(html).toContain('color: purple')
+  expect(html).not.toContain(message.body)
+})
+
+test('printing honors plain mode, missing bodies, and text-only messages', () => {
+  const tab = { body: 'Plain', bodyHtml: '<b>HTML</b>', viewMode: 'plain' } as MessageTab
+  expect(mailPrintHtml(tab, false)).toBeUndefined()
+  expect(mailPrintHtml({ ...tab, viewMode: 'html' }, false)).toContain('<b>HTML</b>')
+  expect(mailPrintHtml({ ...tab, viewMode: 'html', bodyMissing: true }, false)).toBeUndefined()
+  expect(mailPrintHtml({ ...message, body_html: '<b>HTML</b>', body_missing: true }, false)).toBeUndefined()
+  expect(mailPrintHtml(message, false)).toBeUndefined()
+  const missingTab = { ...tab, bodyMissing: true, body: 'Stale body' }
+  expect(mailPrintText(missingTab)).toContain('Could not print')
+  expect(mailPrintText(missingTab)).not.toContain('Stale body')
+})
+
+test('HTML print CSP respects current remote policy and isolates active content', () => {
+  const mail = {
+    ...message,
+    body_html: `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data: http: https:; style-src 'unsafe-inline'">
+    <script>bad()</script><iframe></iframe>
+    <img src="https://example.com/banner" width="600" height="200">`,
+  }
+  for (const allowed of [false, true]) {
+    const doc = new DOMParser().parseFromString(mailPrintHtml(mail, allowed)!, 'text/html')
+    expect(doc.querySelector('script, iframe')).toBeNull()
+    const policies = Array.from(doc.querySelectorAll('meta[http-equiv="Content-Security-Policy"]'))
+    expect(policies).toHaveLength(2)
+    for (const policy of policies) {
+      const images = policy
+        .getAttribute('content')!
+        .split(';')
+        .find((part) => part.trim().startsWith('img-src'))!
+      expect(images.includes('https:')).toBe(allowed)
+    }
+  }
+})
+
 test('native printing gets an escaped document, replaces previous jobs, and cleans up', async () => {
   const calls: string[] = []
   ;(window as any).go = {
@@ -79,6 +169,42 @@ test('native printing gets an escaped document, replaces previous jobs, and clea
   await printMail(message)
   expect(document.querySelectorAll('#meron-print-document')).toHaveLength(0)
   window.dispatchEvent(new Event('afterprint'))
+  expect(document.getElementById('meron-print-document')).toBeNull()
+})
+
+test('HTML print jobs wait for isolated frames and include headers and attachments', async () => {
+  let printed = false
+  ;(window as any).go = {
+    main: {
+      App: {
+        Invoke: async () => {
+          const frame = document.querySelector<HTMLIFrameElement>('#meron-print-document iframe')!
+          expect(frame.getAttribute('sandbox')).toBe('allow-same-origin')
+          expect(frame.srcdoc).toContain('<strong>Formatted body</strong>')
+          expect(document.querySelector('#meron-print-document pre')?.textContent).toContain(
+            'Alice <alice@example.com>',
+          )
+          expect(document.querySelector('#meron-print-document')?.textContent).toContain('report.pdf')
+          expect(document.querySelector('#meron-print-document')?.textContent).not.toContain('logo-proton.png')
+          printed = true
+          return true
+        },
+      },
+    },
+  }
+  const job = printMail({
+    ...message,
+    body_html: '<strong>Formatted body</strong><img src="/media/logo">',
+    attachments: [
+      { key: 'report', filename: 'report.pdf', mime: 'application/pdf', size: 42 },
+      { key: 'logo', filename: 'logo-proton.png', mime: 'image/png', size: 100 },
+    ],
+  })
+  expect(printed).toBe(false)
+  // Happy DOM does not provide browser layout; signal the frame's load explicitly.
+  document.querySelector('#meron-print-document iframe')!.dispatchEvent(new Event('load'))
+  await job
+  expect(printed).toBe(true)
   expect(document.getElementById('meron-print-document')).toBeNull()
 })
 
@@ -113,6 +239,34 @@ test('thread printing fetches all pages, deduplicates, and prints oldest first',
   expect(sections).toHaveLength(2)
   expect(sections[0]).toContain('Oldest')
   expect(sections[1]).toContain('Newest')
+})
+
+test('slow resources still print and beforeprint remeasures frame height', async () => {
+  let finishLoading: (() => void) | undefined
+  const timeout = spyOn(window, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    if (delay === 15000) finishLoading = callback
+    return 0
+  }) as typeof window.setTimeout)
+  const print = spyOn(window, 'print').mockImplementation(() => {
+    const frame = document.querySelector<HTMLIFrameElement>('#meron-print-document iframe')!
+    const body = frame.contentDocument!.body
+    Object.defineProperty(body, 'scrollHeight', { configurable: true, value: 1200 })
+    window.dispatchEvent(new Event('beforeprint'))
+    expect(frame.style.height).toBe('1200px')
+    Object.defineProperty(body, 'scrollHeight', { configurable: true, value: 600 })
+    window.dispatchEvent(new Event('beforeprint'))
+    expect(frame.style.height).toBe('600px')
+    window.dispatchEvent(new Event('afterprint'))
+  })
+  try {
+    const job = printMail({ ...message, body_html: '<p>Available body</p>' })
+    finishLoading!()
+    await job
+    expect(print).toHaveBeenCalledTimes(1)
+  } finally {
+    timeout.mockRestore()
+    print.mockRestore()
+  }
 })
 
 test('non-native printing calls window.print directly and cleans up afterprint', async () => {

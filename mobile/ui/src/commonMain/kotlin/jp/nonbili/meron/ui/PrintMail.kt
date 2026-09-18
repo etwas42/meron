@@ -3,11 +3,16 @@ package jp.nonbili.meron.ui
 import androidx.compose.runtime.Composable
 import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.ThreadReadPage
+import jp.nonbili.meron.shared.applyRemoteContentPolicy
+import jp.nonbili.meron.shared.mailBodyCsp
+import jp.nonbili.meron.shared.standaloneAttachments
 
 @Composable
 internal expect fun rememberMailPrinter(errorText: String): (String, String) -> Unit
 
-// Print only text: message markup never runs or loads remote tracking images.
+internal expect val supportsHtmlMailPrinting: Boolean
+
+// HTML bodies arrive sanitized by the core. Printing never enables email scripts.
 internal fun mailPrintHtml(
     message: MessageBody,
     fromLabel: String,
@@ -17,7 +22,36 @@ internal fun mailPrintHtml(
     replyToLabel: String,
     attachmentsLabel: String,
     noSubject: String,
-): String = printHtmlDocument(listOf(mailPrintText(message, fromLabel, toLabel, ccLabel, bccLabel, replyToLabel, attachmentsLabel, noSubject)))
+    preferHtml: Boolean = true,
+    allowRemote: Boolean = false,
+): String = printHtmlSections(listOf(mailPrintSection(message, fromLabel, toLabel, ccLabel, bccLabel, replyToLabel, attachmentsLabel, noSubject, preferHtml, allowRemote)), allowRemote)
+
+private fun escapePrintText(text: String): String = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+private fun mailPrintSection(
+    message: MessageBody,
+    fromLabel: String,
+    toLabel: String,
+    ccLabel: String,
+    bccLabel: String,
+    replyToLabel: String,
+    attachmentsLabel: String,
+    noSubject: String,
+    preferHtml: Boolean,
+    allowRemote: Boolean,
+): String {
+    if (!preferHtml || message.bodyHtml.isBlank() || message.bodyMissing) {
+        return "<pre>" + escapePrintText(mailPrintText(message, fromLabel, toLabel, ccLabel, bccLabel, replyToLabel, attachmentsLabel, noSubject)) + "</pre>"
+    }
+    val header = mailPrintText(message.copy(body = " ", bodyHtml = "", attachments = emptyList()), fromLabel, toLabel, ccLabel, bccLabel, replyToLabel, attachmentsLabel, noSubject).trimEnd()
+    val body =
+        applyRemoteContentPolicy(message.bodyHtml, allowRemote)
+            .replace(Regex("<(script|iframe|object|embed)\\b[^>]*>.*?</\\1\\s*>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)), "")
+            .replace(Regex("<!doctype[^>]*>|</?(html|head|body)\\b[^>]*>|<meta\\b[^>]*>", RegexOption.IGNORE_CASE), "")
+    val attachments = standaloneAttachments(message)
+    val footer = if (attachments.isEmpty()) "" else "<pre>" + escapePrintText("$attachmentsLabel:\n" + attachments.joinToString("\n") { it.filename }) + "</pre>"
+    return "<pre>${escapePrintText(header)}</pre><div>$body</div>$footer"
+}
 
 private fun mailPrintText(
     message: MessageBody,
@@ -40,11 +74,12 @@ private fun mailPrintText(
             if (message.dateEpochSeconds != 0L) appendLine(formatMessageFullTimestamp(message.dateEpochSeconds))
             appendLine()
             append(printMessagePlainText(message))
-            if (message.attachments.isNotEmpty()) {
+            val attachments = message.attachments
+            if (attachments.isNotEmpty()) {
                 appendLine()
                 appendLine()
                 appendLine("$attachmentsLabel:")
-                message.attachments.forEach { appendLine(it.filename) }
+                attachments.forEach { appendLine(it.filename) }
             }
         }
     return text
@@ -60,21 +95,30 @@ internal fun printMessagePlainText(message: MessageBody): String =
         ),
     )
 
-internal fun printHtmlDocument(messages: List<String>): String {
-    val sections =
-        messages.joinToString("\n") { text ->
-            "<pre>" + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>"
-        }
+private fun printHtmlSections(
+    messages: List<String>,
+    allowRemote: Boolean,
+): String {
+    val sections = messages.joinToString("\n") { "<section>$it</section>" }
+    val csp = mailBodyCsp(allowRemote, "print-disabled").replace("script-src 'nonce-print-disabled'", "script-src 'none'")
     return """<!doctype html><html><head><meta charset="utf-8">
+        <meta http-equiv="Content-Security-Policy" content="$csp">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>@page { margin: 15mm; } body { color: black; background: white; }
-        pre + pre { break-before: page; page-break-before: always; }
-        pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11pt/1.5 sans-serif; }</style>
-        </head><body>$sections</body></html>"""
+        <style>body { color: black; background: white; }</style>
+        </head><body>$sections
+        <style>@page { margin: 15mm; }
+        html, body { height: auto !important; overflow: visible !important; }
+        body > section + section { break-before: page; page-break-before: always; }
+        img, table { max-width: 100% !important; } img { height: auto !important; }
+        section > pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11pt/1.5 sans-serif; color: black; }
+        * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }</style></body></html>"""
 }
 
 @Composable
-internal fun rememberPrintMessage(): (MessageBody) -> Unit {
+internal fun rememberPrintMessage(
+    preferHtml: Boolean = true,
+    allowRemote: Boolean = false,
+): (MessageBody) -> Unit {
     val print = rememberMailPrinter(tr("chat.couldNotPrintMessage"))
     val from = tr("composer.fields.from")
     val to = tr("composer.fields.to")
@@ -84,7 +128,7 @@ internal fun rememberPrintMessage(): (MessageBody) -> Unit {
     val attachments = tr("chat.printAttachments")
     val noSubject = tr("threads.noSubject")
     return { message ->
-        print(message.subject.ifBlank { noSubject }, mailPrintHtml(message, from, to, cc, bcc, replyTo, attachments, noSubject))
+        print(message.subject.ifBlank { noSubject }, mailPrintHtml(message, from, to, cc, bcc, replyTo, attachments, noSubject, preferHtml && supportsHtmlMailPrinting, allowRemote))
     }
 }
 
@@ -105,7 +149,7 @@ internal suspend fun loadPrintThread(fetchPage: suspend (String?) -> ThreadReadP
 }
 
 @Composable
-internal fun rememberPrintThread(): (String, List<MessageBody>) -> Unit {
+internal fun rememberPrintThread(preferHtml: Boolean): (String, List<MessageBody>) -> Unit {
     val print = rememberMailPrinter(tr("chat.couldNotPrintThread"))
     val unavailableBody = tr("chat.couldNotPrintMessage")
     val from = tr("composer.fields.from")
@@ -118,10 +162,11 @@ internal fun rememberPrintThread(): (String, List<MessageBody>) -> Unit {
     return { subject, messages ->
         print(
             subject.ifBlank { noSubject },
-            printHtmlDocument(
+            printHtmlSections(
                 messages.map {
-                    mailPrintText(if (it.bodyMissing) it.copy(body = unavailableBody) else it, from, to, cc, bcc, replyTo, attachments, noSubject)
+                    mailPrintSection(if (it.bodyMissing) it.copy(body = unavailableBody) else it, from, to, cc, bcc, replyTo, attachments, noSubject, preferHtml && supportsHtmlMailPrinting, false)
                 },
+                false,
             ),
         )
     }

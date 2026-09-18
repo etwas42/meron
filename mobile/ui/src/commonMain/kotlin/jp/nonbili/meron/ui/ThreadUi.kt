@@ -198,7 +198,7 @@ internal fun ThreadScreen(
     var galleryIndex by remember(thread?.id) { mutableStateOf<Int?>(null) }
     var moveDialogOpen by remember(thread?.id) { mutableStateOf(false) }
     var copyDialogOpen by remember(thread?.id) { mutableStateOf(false) }
-    val printThread = rememberPrintThread()
+    val printThread = rememberPrintThread(preferHtml)
     val printError = tr("chat.couldNotPrintThread")
     var printing by remember(thread?.id) { mutableStateOf(false) }
     val printScope = rememberCoroutineScope()

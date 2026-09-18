@@ -275,6 +275,8 @@ internal fun MessageBubble(
                     )
                 }
                 MessageActionsButton(
+                    preferHtml = preferHtml,
+                    allowRemote = remoteContent.allowRemote,
                     message = message,
                     isRss = isRss,
                     tint = textColor.copy(alpha = 0.55f),
@@ -325,6 +327,8 @@ internal fun MessageBubble(
  *  per-message read/star and mail actions the caller enables. */
 @Composable
 internal fun MessageActionsButton(
+    preferHtml: Boolean,
+    allowRemote: Boolean,
     message: MessageBody,
     isRss: Boolean,
     tint: Color,
@@ -341,7 +345,7 @@ internal fun MessageActionsButton(
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Box {
-        val printMessage = rememberPrintMessage()
+        val printMessage = rememberPrintMessage(preferHtml, allowRemote)
         val messageTextLabel = tr("chat.messageText")
         val subjectLabel = tr("composer.fields.subject")
         val messageIdLabel = tr("chat.messageId")

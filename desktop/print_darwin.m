@@ -30,9 +30,33 @@ int printMailDocument(void) {
                 info.verticallyCentered = NO;
                 info.leftMargin = info.rightMargin = 15.0 * 72.0 / 25.4;
                 info.topMargin = info.bottomMargin = 15.0 * 72.0 / 25.4;
+                // Choose paper/margins before measuring HTML. WKWebView's native
+                // print operation does not send the JavaScript beforeprint event.
+                if ([[NSPrintPanel printPanel] runModalWithPrintInfo:info] != NSModalResponseOK) {
+                    [info release];
+                    presented = 1;
+                    return;
+                }
+                CGFloat width = (info.paperSize.width - info.leftMargin - info.rightMargin) * 96.0 / 72.0;
+                NSString *script = [NSString stringWithFormat:
+                    @"document.getElementById('meron-print-document').style.setProperty('width', '%.4fpx', 'important'); window.dispatchEvent(new Event('beforeprint'));", width];
+                __block BOOL measured = NO;
+                __block BOOL measurementFailed = NO;
+                [webView evaluateJavaScript:script completionHandler:^(id result, NSError *error) {
+                    measurementFailed = error != nil;
+                    measured = YES;
+                }];
+                NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:5.0];
+                while (!measured && [deadline timeIntervalSinceNow] > 0) {
+                    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+                }
+                if (!measured || measurementFailed) {
+                    [info release];
+                    return;
+                }
                 NSPrintOperation *operation = [webView printOperationWithPrintInfo:info];
                 [info release];
-                operation.showsPrintPanel = YES;
+                operation.showsPrintPanel = NO;
                 operation.showsProgressPanel = YES;
                 [operation runOperation];
                 // A false result also means normal user cancellation.

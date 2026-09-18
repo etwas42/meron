@@ -274,9 +274,10 @@ export function ConversationHeader({
                 <div className="my-1 h-px bg-border" />
                 {!isRSS && (
                   <MenuItem
-                    icon={<Printer size={15} />}
+                    icon={<Printer size={15} className="shrink-0" />}
                     label={t('chat.actions.printThread')}
                     disabled={printing}
+                    className="h-auto! gap-2.5! px-3! py-2 text-xs! font-medium! disabled:opacity-50 disabled:cursor-default disabled:hover:bg-transparent"
                     onClick={() => {
                       setActionsMenuOpen(false)
                       setPrinting(true)
