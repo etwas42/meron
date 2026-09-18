@@ -63,6 +63,18 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.3.7" date="2026-09-18">
+      <description>
+        <ul>
+          <li>Support printing messages and threads</li>
+          <li>Move compose to side navigation</li>
+          <li>Make Meron Light the default theme</li>
+          <li>List all senders on thread cards</li>
+          <li>Refine unread badges across views</li>
+          <li>Refine palette search and quick settings</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.6" date="2026-09-13">
       <description>
         <ul>
