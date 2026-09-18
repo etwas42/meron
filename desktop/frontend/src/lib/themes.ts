@@ -130,6 +130,7 @@ export function deriveThemeTokens(input: CustomThemeInput): ThemeTokens {
 
 // "Meron Light" / "Meron Dark" lean melon green to match the app icon, over
 // neutrals with a faint green cast.
+// MERON_LIGHT mirrors the `:root` fallback in index.css; keep both in sync.
 const MERON_LIGHT: ThemeTokens = {
   bgApp: '#f0f2f1',
   bgChat: '#f8faf9',
@@ -180,9 +181,6 @@ const MERON_DARK: ThemeTokens = {
   bubbleShadowOut: '0 4px 12px -3px rgba(0, 0, 0, 0.4), 0 1px 4px -2px rgba(0, 0, 0, 0.3)',
 }
 
-// "Indigo" / "Indigo Dark" are the defaults and mirror the `:root` / `.dark`
-// blocks in index.css exactly (those blocks are the no-JS fallback paint —
-// keep both sides in sync when tuning).
 const INDIGO_LIGHT: ThemeTokens = {
   bgApp: '#f1f5f9',
   bgChat: '#f8fafc',
@@ -208,6 +206,7 @@ const INDIGO_LIGHT: ThemeTokens = {
   bubbleShadowOut: '0 2px 8px -2px rgba(101, 88, 204, 0.12), 0 1px 3px -1px rgba(101, 88, 204, 0.06)',
 }
 
+// Mirrors the `.dark` fallback in index.css; keep both in sync.
 const INDIGO_DARK: ThemeTokens = {
   bgApp: '#090d16',
   bgChat: '#090d16',
@@ -476,9 +475,9 @@ const EMBER: ThemeTokens = {
 }
 
 export const BUILTIN_THEMES: ThemeDef[] = [
+  { id: 'light', name: 'Meron Light', appearance: 'light', tokens: MERON_LIGHT },
   { id: 'indigo', name: 'Indigo', appearance: 'light', tokens: INDIGO_LIGHT },
   { id: 'indigo-dark', name: 'Indigo Dark', appearance: 'dark', tokens: INDIGO_DARK },
-  { id: 'light', name: 'Meron Light', appearance: 'light', tokens: MERON_LIGHT },
   { id: 'dark', name: 'Meron Dark', appearance: 'dark', tokens: MERON_DARK },
   { id: 'mist', name: 'Mist', appearance: 'light', tokens: MIST },
   { id: 'paper', name: 'Paper', appearance: 'light', tokens: PAPER },
@@ -492,7 +491,7 @@ export const BUILTIN_THEMES: ThemeDef[] = [
   { id: 'ember', name: 'Ember', appearance: 'dark', tokens: EMBER },
 ]
 
-export const DEFAULT_LIGHT_ID = 'indigo'
+export const DEFAULT_LIGHT_ID = 'light'
 export const DEFAULT_DARK_ID = 'indigo-dark'
 
 export function builtinTheme(id: string): ThemeDef | undefined {
@@ -506,7 +505,7 @@ export function defaultThemeId(appearance: Appearance): string {
 /** Editor seed for a new custom theme: the default theme's source palette. */
 export function defaultCustomInput(appearance: Appearance): CustomThemeInput {
   return appearance === 'light'
-    ? { appearance, bgApp: '#f1f5f9', surface: '#ffffff', sideNav: '#0f172a', accent: '#6558cc', text: '#0f172a' }
+    ? { appearance, bgApp: '#f0f2f1', surface: '#ffffff', sideNav: '#121a16', accent: '#0e7a58', text: '#1b211e' }
     : { appearance, bgApp: '#090d16', surface: '#0f172a', sideNav: '#05070c', accent: '#7165c4', text: '#f8fafc' }
 }
 

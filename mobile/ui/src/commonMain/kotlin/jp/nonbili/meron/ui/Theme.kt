@@ -1,6 +1,5 @@
 package jp.nonbili.meron.ui
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -15,9 +14,9 @@ enum class AppAppearanceMode(
     val label: String,
 ) {
     System("system", "System"),
+    Light("light", "Meron Light"),
     Indigo("indigo", "Indigo"),
     IndigoDark("indigo-dark", "Indigo Dark"),
-    Light("light", "Meron Light"),
     Dark("dark", "Meron Dark"),
     Mist("mist", "Mist"),
     Paper("paper", "Paper"),
@@ -356,9 +355,8 @@ internal data class ThemePreviewColors(
 /** Swatch colors for [mode], so a theme can be previewed without being applied. */
 internal fun themePreviewColors(
     mode: AppAppearanceMode,
-    systemDark: Boolean = false,
 ): ThemePreviewColors =
-    mobileThemeSpec(mode, systemDark).let { spec ->
+    mobileThemeSpec(mode).let { spec ->
         ThemePreviewColors(
             dark = spec.dark,
             bgApp = spec.bgApp,
@@ -374,12 +372,11 @@ internal fun themePreviewColors(
 
 @Composable
 fun MeronTheme(
-    appearanceMode: AppAppearanceMode = AppAppearanceMode.System,
+    appearanceMode: AppAppearanceMode = AppAppearanceMode.Light,
     messageFontScale: Int = DEFAULT_MESSAGE_FONT_SCALE,
     content: @Composable () -> Unit,
 ) {
-    val systemDark = isSystemInDarkTheme()
-    val spec = mobileThemeSpec(appearanceMode, systemDark)
+    val spec = mobileThemeSpec(appearanceMode)
     SyncSystemBarAppearance(spec.dark)
     androidx.compose.runtime.CompositionLocalProvider(
         LocalChatColors provides chatColors(spec),
@@ -391,10 +388,9 @@ fun MeronTheme(
 
 private fun mobileThemeSpec(
     mode: AppAppearanceMode,
-    systemDark: Boolean,
 ): MobileThemeSpec =
     when (mode) {
-        AppAppearanceMode.System -> if (systemDark) IndigoDark else IndigoLight
+        AppAppearanceMode.System -> MeronLight
         AppAppearanceMode.Indigo -> IndigoLight
         AppAppearanceMode.IndigoDark -> IndigoDark
         AppAppearanceMode.Light -> MeronLight

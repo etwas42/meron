@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { isValidColor, luminance } from './color'
 import {
   BUILTIN_THEMES,
@@ -31,6 +32,25 @@ describe('BUILTIN_THEMES', () => {
     const dark = BUILTIN_THEMES.find((t) => t.id === DEFAULT_DARK_ID)
     expect(light?.appearance).toBe('light')
     expect(dark?.appearance).toBe('dark')
+  })
+
+  it('keeps CSS fallback colors in sync with the default theme palettes', () => {
+    const css = readFileSync(new URL('../index.css', import.meta.url), 'utf8')
+    for (const [id, selector] of [
+      [DEFAULT_LIGHT_ID, ':root'],
+      [DEFAULT_DARK_ID, '.dark'],
+    ]) {
+      const tokens = BUILTIN_THEMES.find((theme) => theme.id === id)!.tokens
+      const declarations = Object.fromEntries(
+        [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+          .filter((match) => match[1].trim().endsWith(selector))
+          .flatMap((match) => [...match[2].matchAll(/(--me-[\w-]+):\s*([^;]+);/g)])
+          .map((match) => [match[1], match[2].trim()]),
+      )
+      for (const key of THEME_TOKEN_KEYS) {
+        expect(declarations[TOKEN_CSS_VAR[key]]).toBe(tokens[key])
+      }
+    }
   })
 
   it('every builtin fills every token slot with a non-empty string', () => {

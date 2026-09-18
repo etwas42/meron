@@ -80,33 +80,33 @@
   --font-cjk: 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans CJK KR', sans-serif;
 }
 
-/* These two blocks are the default "Indigo" / "Indigo Dark" themes and the no-JS
+/* These two blocks are the default "Meron Light" / "Indigo Dark" themes and the no-JS
    fallback paint. Other themes override the vars inline on <html> (see
-   applyTheme in states/settings.ts). Keep values in sync with the INDIGO_LIGHT /
+   applyActiveTheme in states/settings.ts). Keep values in sync with the MERON_LIGHT /
    INDIGO_DARK registries in lib/themes.ts. */
 :root {
-  --me-bg-app: #f1f5f9;
-  --me-bg-chat: #f8fafc;
-  --me-bg-chat-overlay: rgba(248, 250, 252, 0.94);
-  --me-bg-sidenav: #0f172a;
+  --me-bg-app: #f0f2f1;
+  --me-bg-chat: #f8faf9;
+  --me-bg-chat-overlay: rgba(248, 250, 249, 0.94);
+  --me-bg-sidenav: #121a16;
   --me-bg-chats: #ffffff;
   --me-bg-header: #ffffff;
-  --me-bg-hover: #f1f5f9;
-  --me-bg-raised: #f8fafc;
-  --me-bg-active: #e2e8f0;
-  --me-border: #e2e8f0;
-  --me-text-primary: #0f172a;
-  --me-text-secondary: #64748b;
-  --me-accent: #6558cc;
-  --me-accent-hover: #594dbb;
+  --me-bg-hover: #eef1f0;
+  --me-bg-raised: #f7f9f8;
+  --me-bg-active: #e2e7e4;
+  --me-border: #e0e6e2;
+  --me-text-primary: #1b211e;
+  --me-text-secondary: #68746e;
+  --me-accent: #0e7a58;
+  --me-accent-hover: #0b6448;
   --me-bubble-in: #ffffff;
-  --me-bubble-in-text: #0f172a;
-  --me-bubble-out: #e0e7ff;
-  --me-bubble-out-text: #312e81;
+  --me-bubble-in-text: #1b211e;
+  --me-bubble-out: #ddeee6;
+  --me-bubble-out-text: #14543e;
   --me-composer-bg: #ffffff;
-  --me-composer-border: #e2e8f0;
-  --me-bubble-shadow-in: 0 2px 8px -2px rgba(15, 23, 42, 0.08), 0 1px 3px -1px rgba(15, 23, 42, 0.04);
-  --me-bubble-shadow-out: 0 2px 8px -2px rgba(101, 88, 204, 0.12), 0 1px 3px -1px rgba(101, 88, 204, 0.06);
+  --me-composer-border: #e0e6e2;
+  --me-bubble-shadow-in: 0 2px 8px -2px rgba(27, 33, 30, 0.08), 0 1px 3px -1px rgba(27, 33, 30, 0.04);
+  --me-bubble-shadow-out: 0 2px 8px -2px rgba(14, 122, 88, 0.12), 0 1px 3px -1px rgba(14, 122, 88, 0.06);
   --me-wallpaper-overlay: color-mix(in srgb, var(--me-bg-chat) 50%, transparent);
 
   color-scheme: light;

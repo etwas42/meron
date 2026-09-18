@@ -75,9 +75,9 @@ internal fun saveLastMailLocation(
 }
 
 fun loadAppearanceMode(prefs: AppPreferences): AppAppearanceMode {
-    val stored = prefs.getString(APPEARANCE_MODE_PREF, AppAppearanceMode.Indigo.storageValue)
+    val stored = prefs.getString(APPEARANCE_MODE_PREF, AppAppearanceMode.Light.storageValue)
     return AppAppearanceMode.entries.firstOrNull { it.storageValue == stored && it != AppAppearanceMode.System }
-        ?: AppAppearanceMode.Indigo
+        ?: AppAppearanceMode.Light
 }
 
 fun saveAppearanceMode(

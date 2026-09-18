@@ -712,7 +712,7 @@ internal fun SettingsGeneralPage(
         item { SettingsSectionLabel(tr("settings.pages.appearance")) }
         item {
             val displayedAppearanceMode =
-                if (appearanceMode == AppAppearanceMode.System) AppAppearanceMode.Indigo else appearanceMode
+                if (appearanceMode == AppAppearanceMode.System) AppAppearanceMode.Light else appearanceMode
             SettingsRow(
                 icon = Icons.Filled.Visibility,
                 title = tr("common.theme"),
