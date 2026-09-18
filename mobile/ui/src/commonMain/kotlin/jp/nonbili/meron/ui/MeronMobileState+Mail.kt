@@ -106,7 +106,17 @@ internal fun MeronMobileState.runCoreThreadAction(
 }
 
 private fun MeronMobileState.applyCoreFolderUnreadChanges(response: String) {
-    val changes = parseFolderUnreadChanges(response)
+    applyCoreFolderUnreadChangesAt(response, null)
+}
+
+private fun MeronMobileState.applyCoreFolderUnreadChangesAt(
+    response: String,
+    started: Long?,
+) {
+    val changes =
+        parseFolderUnreadChanges(response).map { change ->
+            change.copy(unread = folderReadGuard.recordMutation(change.accountId, change.folderId, change.unread, started))
+        }
     if (changes.isEmpty()) return
     val nextByAccount = foldersByAccount.toMutableMap()
     changes.groupBy { it.accountId }.forEach { (accountId, accountChanges) ->
@@ -119,14 +129,15 @@ private fun MeronMobileState.applyCoreFolderUnreadChanges(response: String) {
                     ?.let { folder.copy(unread = it.unread) } ?: folder
             }
     }
-    foldersByAccount = nextByAccount
-    coreFolders =
+    val nextCoreFolders =
         coreFolders.map { folder ->
             changes
                 .firstOrNull {
                     it.accountId == folder.accountId && folder.name.equals(it.folderId, ignoreCase = folder.role == "inbox")
                 }?.let { folder.copy(unread = it.unread) } ?: folder
         }
+    coreFolders = nextCoreFolders
+    foldersByAccount = nextByAccount
 }
 
 // The drawer's unread badges read the folder caches, not the list rows, so
@@ -137,7 +148,7 @@ private fun MeronMobileState.applyCoreFolderUnreadChanges(response: String) {
 private fun MeronMobileState.cachedFolderUnread(
     accountId: String,
     folderId: String,
-): Int = folderUnread(foldersByAccount[accountId].orEmpty(), folderId)
+): Int = folderUnread(foldersByAccount[accountId] ?: coreFolders.filter { it.accountId == accountId }, folderId)
 
 private fun MeronMobileState.applyLocalFolderUnread(counts: Map<Pair<String, String>, Int>) {
     if (counts.isEmpty()) return
@@ -693,6 +704,7 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                 folderUnreadBefore,
             )
         }
+    val folderTargets = plans.flatMap { it.folderUnread.keys }.toSet()
     for (plan in plans) {
         val readIds = plan.unread.map { it.id }.toSet()
         updateKanbanColumn(plan.key) { state ->
@@ -706,11 +718,15 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
     val optimisticIds = plans.flatMap { plan -> plan.unread.map { it.id } }.toSet()
     val coreUnreadBefore = coreThreads.filter { it.id in optimisticIds }.associate { it.id to it.unread }
     coreThreads = coreThreads.map { if (it.id in optimisticIds) it.copy(unread = false) else it }
-    scope.launch {
+    scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+        folderReadGuard.begin(folderTargets)
+        val boardReadVersion = folderReadGuard.version
+        val confirmedFolders = mutableMapOf<Pair<String, String>, Int>()
         val succeededIds = mutableSetOf<String>()
         val failedIds = mutableSetOf<String>()
         try {
             val requests = KanbanReadRequests()
+            val writeVersions = mutableMapOf<String, Long>()
             var failures = 0
             val marked = mutableSetOf<Pair<String, String>>()
             for (plan in plans) {
@@ -729,6 +745,7 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                         null
                     }
                 val writeColumn = unifiedTarget ?: column
+                val writeVersion = writeVersions.getOrPut(kanbanColumnKey(writeColumn)) { folderReadGuard.version }
                 val result =
                     runCatching {
                         withContext(ioDispatcher) {
@@ -783,7 +800,19 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                             )
                         }
                         coreThreads = coreThreads.map { if (it.id in readIds) it.copy(unread = false) else it }
-                        responses.forEach(::applyCoreFolderUnreadChanges)
+                        responses.forEach { applyCoreFolderUnreadChangesAt(it, writeVersion) }
+                        val changes = responses.flatMap(::parseFolderUnreadChanges)
+                        for ((target, count) in plan.folderUnread) {
+                            confirmedFolders[folderReadTarget(target.first, target.second)] = changes
+                                .lastOrNull {
+                                    it.accountId == target.first && it.folderId.equals(target.second, ignoreCase = target.second.equals(INBOX_FOLDER, true))
+                                }?.unread ?: count
+                        }
+                        applyLocalFolderUnread(
+                            plan.folderUnread.mapValues { (target, _) ->
+                                folderReadGuard.resolveMutation(target.first, target.second, confirmedFolders.getValue(folderReadTarget(target.first, target.second)), writeVersion)
+                            },
+                        )
                         succeededIds += readIds
                         marked += unread.map { it.accountId to it.backendThreadId() }
                     }.onFailure {
@@ -798,7 +827,11 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                                 unreadCount = if (plan.writes) plan.unreadCountBefore else state.unreadCount,
                             )
                         }
-                        applyLocalFolderUnread(plan.folderUnreadBefore)
+                        applyLocalFolderUnread(
+                            plan.folderUnreadBefore.mapValues { (target, previous) ->
+                                folderReadGuard.resolveMutation(target.first, target.second, confirmedFolders[folderReadTarget(target.first, target.second)] ?: previous, boardReadVersion)
+                            },
+                        )
                     }
             }
             // A row shared with a column that did succeed is read on the server.
@@ -814,6 +847,7 @@ private fun MeronMobileState.markKanbanColumnsAllRead(columns: List<KanbanColumn
                     localizedString(language, "mail.toast.markedReadCount", mapOf("count" to marked.size))
                 }
         } finally {
+            folderReadGuard.end(folderTargets)
             kanbanMarkingRead = false
         }
     }

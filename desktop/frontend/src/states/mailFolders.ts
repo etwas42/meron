@@ -17,6 +17,71 @@ export function folderMatches(folder: Folder, accountId: string | undefined, fol
   return idMatches && (!accountId || folder.account_id === accountId || folder.account_id === 'unified')
 }
 
+// Only refreshes are held. Mutation results and rollbacks must remain visible.
+type FolderCountObservation = { unread: number; version: number }
+type FolderReadHold = { pending: number; confirmed?: FolderCountObservation; mutation?: FolderCountObservation }
+const pendingFolderReads = new Map<string, FolderReadHold>()
+let folderReadVersion = 0
+let oldestFolderReadVersion = 0
+const folderReadVersions = new Map<string, number>()
+
+function folderReadKey(accountId: string, folderId: string): string {
+  return JSON.stringify([accountId, folderId.toLowerCase() === 'inbox' ? 'inbox' : folderId])
+}
+
+function touchFolderRead(key: string) {
+  folderReadVersions.delete(key)
+  folderReadVersions.set(key, ++folderReadVersion)
+  // Old requests conservatively retain cached counts after history is evicted.
+  if (folderReadVersions.size > 512) {
+    const oldest = folderReadVersions.keys().next().value!
+    oldestFolderReadVersion = folderReadVersions.get(oldest)!
+    folderReadVersions.delete(oldest)
+  }
+}
+
+// Capture before issuing the read, not when its response arrives.
+export function captureFolderUnreadVersion(): number {
+  return ++folderReadVersion
+}
+
+export function holdFolderUnread(
+  accountId: string,
+  folderId: string,
+): (unread: number, confirmed: boolean, version?: number) => void {
+  const key = folderReadKey(accountId, folderId)
+  const hold = pendingFolderReads.get(key) ?? { pending: 0 }
+  hold.pending++
+  pendingFolderReads.set(key, hold)
+  touchFolderRead(key)
+  const started = folderReadVersion
+  return (unread, confirmed, version = started) => {
+    if (confirmed && (!hold.confirmed || version >= hold.confirmed.version)) hold.confirmed = { unread, version }
+    const latest =
+      hold.mutation && (!hold.confirmed || hold.mutation.version > hold.confirmed.version)
+        ? hold.mutation
+        : hold.confirmed
+    updateCachedFolderUnread(accountId, folderId, latest?.unread ?? unread, 'local')
+    if (--hold.pending === 0) pendingFolderReads.delete(key)
+    touchFolderRead(key)
+  }
+}
+
+function folderUnreadHeld(accountId: string, folder: Folder): boolean {
+  return pendingFolderReads.has(folderReadKey(accountId, folder.id))
+}
+
+function reconcileFolderCounts(accountId: string, folders: Folder[], version: number): Folder[] {
+  const current = mail$.foldersByAccount[accountId].get() ?? []
+  return folders.map((folder) => {
+    const key = folderReadKey(accountId, folder.id)
+    const changed = version < oldestFolderReadVersion || (folderReadVersions.get(key) ?? 0) > version
+    if (!changed && !folderUnreadHeld(accountId, folder)) return folder
+    const cached = current.find((item) => folderReadKey(accountId, item.id) === key)
+    return cached ? { ...folder, unread: cached.unread } : folder
+  })
+}
+
 export function decrementFolderUnread(accountId: string | undefined, folderId: string | undefined, count: number) {
   if (count <= 0 || !folderId) return
   const dec = (folder: Folder) =>
@@ -210,6 +275,7 @@ export async function loadFolders(accountId: string, refresh = true) {
       const foldersList = await Promise.all(
         accounts.map(async (acc) => {
           try {
+            const version = folderReadVersion
             const res = await invoke<{ folders: Folder[] }>('mail.folderList', {
               account_id: acc.id,
               // Propagate the caller's refresh so sub-accounts get a real folder
@@ -219,7 +285,7 @@ export async function loadFolders(accountId: string, refresh = true) {
               // mail.synced({folders:true}) it emits triggers a refresh:false reload.
               refresh,
             })
-            const folders = res.folders || []
+            const folders = reconcileFolderCounts(acc.id, res.folders || [], version)
             mail$.foldersByAccount[acc.id].set(folders)
             return folders
           } catch {
@@ -243,10 +309,11 @@ export async function loadFolders(accountId: string, refresh = true) {
     return
   }
 
+  const version = folderReadVersion
   const result = await invoke<{ folders: Folder[] }>('mail.folderList', { account_id: accountId, refresh })
   // A response without a folders array (an empty JSON object from the sidecar)
   // must not leave the stores holding `undefined`: every reader spreads them.
-  const folders = result.folders || []
+  const folders = reconcileFolderCounts(accountId, result.folders || [], version)
   mail$.folders.set(folders)
   mail$.foldersByAccount[accountId].set(folders)
 }
@@ -254,10 +321,11 @@ export async function loadFolders(accountId: string, refresh = true) {
 export async function refreshAccountFoldersCache(accountId: string, refresh = false): Promise<Folder[]> {
   if (!accountId || accountId === 'unified') return []
   try {
+    const version = folderReadVersion
     const result = await invoke<{ folders: Folder[] }>('mail.folderList', { account_id: accountId, refresh })
-    const folders = result.folders || []
+    const folders = reconcileFolderCounts(accountId, result.folders || [], version)
     mail$.foldersByAccount[accountId].set(folders)
-    return folders
+    return result.folders || []
   } catch (error) {
     console.error('refreshAccountFoldersCache failed:', error)
     return []
@@ -283,15 +351,27 @@ export function folderUnread(folders: Folder[] | undefined, folderId: string): n
 // Apply an unread total returned with a thread page to the same per-account
 // folder cache used by side-navigation badges. This keeps a freshly loaded
 // mailbox/Kanban column and the navigation chrome on one core-owned value.
-export function updateCachedFolderUnread(accountId: string, folderId: string, unread: number) {
+export function updateCachedFolderUnread(
+  accountId: string,
+  folderId: string,
+  unread: number,
+  source: 'refresh' | 'mutation' | 'local' = 'refresh',
+) {
   if (!accountId || accountId === 'unified' || !folderId || !Number.isFinite(unread)) return
   const count = Math.max(0, Math.floor(unread))
+  if (source === 'mutation') {
+    const key = folderReadKey(accountId, folderId)
+    const hold = pendingFolderReads.get(key)
+    touchFolderRead(key)
+    if (hold) hold.mutation = { unread: count, version: folderReadVersion }
+  }
   const patch = (folders: Folder[] | undefined): Folder[] => {
     const current = folders ?? []
     let matched = false
     const next = current.map((folder) => {
       if (!folderMatches(folder, accountId, folderId)) return folder
       matched = true
+      if (source === 'refresh' && folderUnreadHeld(accountId, folder)) return folder
       return folder.unread === count ? folder : { ...folder, unread: count }
     })
     if (matched || folderId.toLowerCase() !== 'inbox') return next
@@ -317,7 +397,7 @@ export type MutationResult = { folder_unreads?: Record<string, Record<string, nu
 export function applyMutationFolderUnreads(result: MutationResult | undefined) {
   for (const [accountId, folders] of Object.entries(result?.folder_unreads ?? {})) {
     for (const [folderId, unread] of Object.entries(folders)) {
-      updateCachedFolderUnread(accountId, folderId, unread)
+      updateCachedFolderUnread(accountId, folderId, unread, 'mutation')
     }
   }
 }
@@ -352,11 +432,12 @@ export async function ensureAccountFolders(
     return cached
   }
   try {
+    const version = folderReadVersion
     const result = await invoke<{ folders: Folder[] }>('mail.folderList', {
       account_id: accountId,
       refresh: options.refreshIfBootstrapOnly || options.forceRefresh,
     })
-    const folders = result.folders || []
+    const folders = reconcileFolderCounts(accountId, result.folders || [], version)
     mail$.foldersByAccount[accountId].set(folders)
     if (options.waitForRefresh && (options.refreshIfBootstrapOnly || options.forceRefresh) && folders.length === 0) {
       for (let attempt = 0; attempt < 10; attempt += 1) {

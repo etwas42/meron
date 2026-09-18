@@ -12,6 +12,12 @@ import {
   switchKanbanColumnFolder,
 } from './kanban'
 import { mail$ } from './mail'
+import {
+  applyMutationFolderUnreads,
+  holdFolderUnread,
+  refreshAccountFoldersCache,
+  updateCachedFolderUnread,
+} from './mailFolders'
 import { settings$ } from './settings'
 import { ui$ } from './ui'
 import { thread$ } from './thread'
@@ -141,6 +147,122 @@ describe('markColumnAllRead', () => {
         },
       },
     }
+  })
+
+  it('holds synthesized lowercase inbox counts against uppercase folder refreshes', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    const settle = holdFolderUnread('acc1', 'inbox')
+    updateCachedFolderUnread('acc1', 'inbox', 0, 'local')
+    ;(window as any).go.main.App.Invoke = async () => ({
+      folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 6 }],
+    })
+    await refreshAccountFoldersCache('acc1')
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+    settle(0, true)
+  })
+
+  it('publishes a failed column rollback while a sibling still holds the folder', () => {
+    updateCachedFolderUnread('acc1', 'inbox', 0)
+    const failed = holdFolderUnread('acc1', 'inbox')
+    const sibling = holdFolderUnread('acc1', 'INBOX')
+    failed(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(6)
+    sibling(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(6)
+  })
+
+  it('preserves confirmed counts when a later sibling cannot refresh after failure', () => {
+    updateCachedFolderUnread('acc1', 'inbox', 0)
+    const succeeded = holdFolderUnread('acc1', 'inbox')
+    const failed = holdFolderUnread('acc1', 'INBOX')
+    succeeded(2, true)
+    failed(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(2)
+  })
+
+  it('lets a post-write refresh supersede a mutation observed before that refresh started', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.markAllRead') await gate
+      if (command === 'mail.folderList') {
+        return { folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 0 }] }
+      }
+      return { ok: true }
+    }
+    const pending = markColumnAllRead({ accountId: 'acc1', folderId: 'inbox' })
+    applyMutationFolderUnreads({ folder_unreads: { acc1: { INBOX: 5 } } })
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(5)
+    release()
+    await pending
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+  })
+
+  it('keeps a concurrent mutation result when a column settles with an older refresh', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    let release = () => {}
+    let started = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const refreshing = new Promise<void>((resolve) => (started = resolve))
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.folderList') {
+        started()
+        await gate
+        return { folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 3 }] }
+      }
+      return { ok: true }
+    }
+    const pending = markColumnAllRead({ accountId: 'acc1', folderId: 'inbox' })
+    await refreshing
+    applyMutationFolderUnreads({ folder_unreads: { acc1: { INBOX: 1 } } })
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
+    release()
+    await pending
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
+  })
+
+  it('keeps navigation counts cleared when stale folder and thread refreshes race a write', async () => {
+    const folder = { id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 6 }
+    mail$.foldersByAccount.set({ acc1: [folder] })
+    settings$.kanbanBoards.set([{ id: 'board', name: 'Board', columns: [{ accountId: 'acc1', folderId: 'INBOX' }] }])
+    let releaseWrite = () => {}
+    let releaseStale = () => {}
+    const writeGate = new Promise<void>((resolve) => (releaseWrite = resolve))
+    const staleGate = new Promise<void>((resolve) => (releaseStale = resolve))
+    let written = false
+    let delayRefresh = false
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.markAllRead') {
+        await writeGate
+        written = true
+      }
+      if (command === 'mail.folderList') {
+        const unread = written ? 0 : 6
+        if (delayRefresh) await staleGate
+        return { folders: [{ ...folder, unread }] }
+      }
+      return { ok: true }
+    }
+
+    const pending = markBoardAllRead('board')
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+    await refreshAccountFoldersCache('acc1')
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+
+    delayRefresh = true
+    const stale = refreshAccountFoldersCache('acc1')
+    delayRefresh = false
+    releaseWrite()
+    await pending
+    releaseStale()
+    await stale
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+
+    // Once the operation is over, fresh incoming mail can raise the badge.
+    updateCachedFolderUnread('acc1', 'inbox', 1)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
   })
 
   it('marks all board columns including unloaded and minimized folders, deduplicating unified overlap', async () => {

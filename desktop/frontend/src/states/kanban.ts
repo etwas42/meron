@@ -2,7 +2,13 @@ import { observable } from '@legendapp/state'
 import type { ChatWallpaper, Folder, Message } from '../types'
 import { isFilterMode, pauseMailFolderPersist, persistMailFolder, ui$, showToast, type FilterMode } from './ui'
 import { mail$ } from './mail'
-import { folderMatches, refreshAccountFoldersCache, updateCachedFolderUnread } from './mailFolders'
+import {
+  captureFolderUnreadVersion,
+  holdFolderUnread,
+  folderMatches,
+  refreshAccountFoldersCache,
+  updateCachedFolderUnread,
+} from './mailFolders'
 import { accounts$ } from './accounts'
 import { filterThreads, isRssAccount } from '../lib/threadActions'
 import { isUnifiedStarredColumn } from '../lib/kanbanData'
@@ -489,13 +495,19 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
     ),
   )
   if (clearsBadge) kanban$.unreadCounts[key].set(0)
-  for (const target of folderTargets.values()) updateCachedFolderUnread(target.accountId, target.folderId, target.next)
+  for (const target of folderTargets.values())
+    updateCachedFolderUnread(target.accountId, target.folderId, target.next, 'local')
+  const settleCounts = new Map(
+    Array.from(folderTargets.values(), (target) => [target, holdFolderUnread(target.accountId, target.folderId)]),
+  )
   const results = await Promise.allSettled(writes.map((write) => write()))
   const refreshed = new Map<string, Folder[]>()
+  const refreshVersions = new Map<string, number>()
   await Promise.all(
     Array.from(new Set([...mailAccountIds, ...itemTargets.map((thread) => thread.account_id)]))
       .filter(Boolean)
       .map(async (accountId) => {
+        refreshVersions.set(accountId, captureFolderUnreadVersion())
         refreshed.set(accountId, await refreshAccountFoldersCache(accountId, false))
       }),
   )
@@ -516,9 +528,23 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
       const server = refreshed
         .get(target.accountId)
         ?.find((folder) => folderMatches(folder, target.accountId, target.folderId))
-      updateCachedFolderUnread(target.accountId, target.folderId, server?.unread ?? target.previous)
+      settleCounts.get(target)!(
+        server?.unread ?? target.previous,
+        !!server,
+        server ? refreshVersions.get(target.accountId) : undefined,
+      )
     }
     throw failure.reason
+  }
+  for (const target of folderTargets.values()) {
+    const server = refreshed
+      .get(target.accountId)
+      ?.find((folder) => folderMatches(folder, target.accountId, target.folderId))
+    settleCounts.get(target)!(
+      server?.unread ?? target.next,
+      true,
+      server ? refreshVersions.get(target.accountId) : undefined,
+    )
   }
   // Reapply on success: a column reload that raced the write may have put the
   // pre-write rows and badge back over the optimistic clear.

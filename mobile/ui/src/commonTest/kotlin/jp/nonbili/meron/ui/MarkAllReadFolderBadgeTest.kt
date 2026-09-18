@@ -79,6 +79,108 @@ class MarkAllReadFolderBadgeTest {
             assertEquals(12, folderUnread(state.coreFolders, INBOX_FOLDER))
         }
 
+    @Test
+    fun staleColumnRefreshCannotRestoreDrawerCountsDuringOrAfterMarkRead() =
+        runBlocking {
+            val core = GatedCore()
+            val state = state(core, this)
+            val column = KanbanColumnSpec(accountId = "a", folderId = "INBOX")
+            state.markKanbanColumnAllRead(column)
+
+            state.loadKanbanColumn(column)
+            waitUntil { state.kanbanColumns["a\nINBOX"]?.loading == false }
+            assertEquals(0, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+
+            core.holdThreads = true
+            state.loadKanbanColumn(column)
+            core.threadsStarted.await()
+            core.gate.complete(Unit)
+            waitUntil { !state.kanbanMarkingRead }
+            core.threadsGate.complete(Unit)
+            waitUntil { state.kanbanColumns["a\nINBOX"]?.loading == false }
+            assertEquals(0, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+            assertEquals(0, folderUnread(state.coreFolders, INBOX_FOLDER))
+
+            // A refresh started after completion can show newly arrived mail.
+            core.holdThreads = false
+            state.loadKanbanColumn(column)
+            waitUntil { state.kanbanColumns["a\nINBOX"]?.loading == false }
+            assertEquals(12, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+        }
+
+    @Test
+    fun failedUnifiedPlanPreservesEarlierSuccessfulSharedFolderCount() =
+        runBlocking {
+            val core =
+                GatedCore().apply {
+                    gate.complete(Unit)
+                    failRss = true
+                    confirmedUnread = 2
+                }
+            val state = state(core, this)
+            val direct = KanbanColumnSpec(accountId = "a", folderId = "INBOX")
+            val unified = KanbanColumnSpec(accountId = UNIFIED_ACCOUNT_ID, folderId = INBOX_FOLDER)
+            state.kanbanBoards = listOf(KanbanBoardSpec(id = "board", name = "Board", columns = listOf(direct, unified)))
+            state.activeKanbanBoardId = "board"
+            state.kanbanColumns = state.kanbanColumns + (
+                kanbanColumnKey(unified) to
+                    KanbanColumnState(
+                        threads = listOf(ThreadSummary(id = "rss-account#rss#feed-1", accountId = "rss-account", folder = "rss", subject = "Feed", sender = "Feed", unread = true)),
+                        unreadCount = 13,
+                    )
+            )
+            state.markKanbanBoardAllRead()
+            waitUntil { !state.kanbanMarkingRead }
+            assertEquals(2, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+            assertEquals(2, folderUnread(state.coreFolders, INBOX_FOLDER))
+        }
+
+    @Test
+    fun cancellationBeforeLaunchDoesNotLeaveFolderHolds() =
+        runBlocking {
+            val job = kotlinx.coroutines.Job().apply { cancel() }
+            val core = GatedCore()
+            val state = state(core, CoroutineScope(coroutineContext + job))
+            state.markKanbanColumnAllRead(KanbanColumnSpec(accountId = "a", folderId = "INBOX"))
+            waitUntil { !state.kanbanMarkingRead }
+            val fresh = listOf(FolderSummary(accountId = "a", name = "INBOX", unread = 7))
+            assertEquals(7, state.reconcileFolderUnread(fresh, state.folderReadGuard.version).single().unread)
+        }
+
+    @Test
+    fun coreFolderCacheProtectsCountsBeforeAccountCacheIsPopulated() =
+        runBlocking {
+            val core = GatedCore()
+            val state = state(core, this)
+            state.foldersByAccount = emptyMap()
+            state.markKanbanColumnAllRead(KanbanColumnSpec(accountId = "a", folderId = "INBOX"))
+            val stale = listOf(FolderSummary(accountId = "a", name = "INBOX", unread = 12))
+            assertEquals(0, state.reconcileFolderUnread(stale, state.folderReadGuard.version).single().unread)
+            core.gate.complete(Unit)
+            waitUntil { !state.kanbanMarkingRead }
+        }
+
+    @Test
+    fun concurrentMutationCountSurvivesAnOlderBoardResponse() =
+        runBlocking {
+            val core = GatedCore()
+            val state = state(core, this)
+            state.markKanbanColumnAllRead(KanbanColumnSpec(accountId = "a", folderId = "INBOX"))
+            state.runCoreThreadAction(
+                thread = state.coreThreads.first(),
+                label = "Mark unread",
+                action = { """{"ok":true,"folder_counts":[{"account_id":"a","folder_id":"INBOX","unread":1}]}""" },
+                update = { it },
+            )
+            waitUntil { state.status == "Mark unread complete" }
+            assertEquals(1, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+            assertEquals(1, folderUnread(state.coreFolders, INBOX_FOLDER))
+            core.gate.complete(Unit)
+            waitUntil { !state.kanbanMarkingRead }
+            assertEquals(1, folderUnread(state.foldersByAccount["a"], INBOX_FOLDER))
+            assertEquals(1, folderUnread(state.coreFolders, INBOX_FOLDER))
+        }
+
     private suspend fun waitUntil(condition: () -> Boolean) {
         withTimeout(5_000) {
             while (!condition()) delay(5)
@@ -124,7 +226,12 @@ class MarkAllReadFolderBadgeTest {
     /** Holds the mark-read write open until [gate] completes, or fails it. */
     private class GatedCore : MeronCore {
         val gate = CompletableDeferred<Unit>()
+        var confirmedUnread = 0
+        var failRss = false
         var markAllReadFails = false
+        var holdThreads = false
+        val threadsStarted = CompletableDeferred<Unit>()
+        val threadsGate = CompletableDeferred<Unit>()
 
         override suspend fun invoke(
             command: String,
@@ -134,14 +241,23 @@ class MarkAllReadFolderBadgeTest {
                 MobileCommand.MarkAllRead -> {
                     gate.await()
                     if (markAllReadFails) error("Server rejected the write")
-                    "{\"ok\":true}"
+                    """{"ok":true,"folder_counts":[{"account_id":"a","folder_id":"INBOX","unread":$confirmedUnread}]}"""
+                }
+
+                MobileCommand.RssMarkRead -> {
+                    if (failRss) error("RSS write failed")
+                    "{}"
                 }
 
                 MobileCommand.FolderList -> {
-                    """{"folders":[{"account_id":"a","name":"INBOX","role":"inbox"}]}"""
+                    """{"folders":[{"account_id":"a","name":"INBOX","role":"inbox","unread":12}]}"""
                 }
 
                 MobileCommand.ThreadList -> {
+                    if (holdThreads) {
+                        threadsStarted.complete(Unit)
+                        threadsGate.await()
+                    }
                     """{"threads":[]}"""
                 }
 

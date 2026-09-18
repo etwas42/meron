@@ -174,6 +174,7 @@ internal fun MeronMobileState.loadKanbanColumn(
     kanbanColumnLoadTokens[key] = token
     updateKanbanColumn(key) { it.copy(loading = true, error = null) }
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -190,7 +191,7 @@ internal fun MeronMobileState.loadKanbanColumn(
             if (kanbanColumnLoadTokens[key] != token) return@onSuccess
             val columnQuery = kanbanColumnSearchQuery(column)
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             updateKanbanColumn(key) {
                 it.copy(
@@ -219,6 +220,7 @@ internal fun MeronMobileState.loadMoreKanbanColumn(column: KanbanColumnSpec) {
     if (state.loadingMore || !hasCursor) return
     updateKanbanColumn(key) { it.copy(loadingMore = true, error = null) }
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -232,7 +234,7 @@ internal fun MeronMobileState.loadMoreKanbanColumn(column: KanbanColumnSpec) {
             }
         }.onSuccess { result ->
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             updateKanbanColumn(key) { current ->
                 val existingIds = current.threads.map { it.id }.toSet()
@@ -504,6 +506,7 @@ internal fun MeronMobileState.ensureAccountFolders(accountId: String) {
     if (accountSummaryIsRss(account)) return
     if (foldersByAccount[accountId].orEmpty().size > 1) return
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -521,7 +524,7 @@ internal fun MeronMobileState.ensureAccountFolders(accountId: String) {
                 loadAccountFolders(client, account)
             }
         }.onSuccess { folders ->
-            if (folders.isNotEmpty()) foldersByAccount = foldersByAccount + (accountId to folders)
+            if (folders.isNotEmpty()) foldersByAccount = foldersByAccount + (accountId to reconcileFolderUnread(folders, folderReadVersion))
         }
     }
 }
@@ -561,6 +564,7 @@ internal fun MeronMobileState.createFolderForKanban(
         return
     }
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -570,7 +574,7 @@ internal fun MeronMobileState.createFolderForKanban(
                 loadAccountFolders(client, account)
             }
         }.onSuccess { folders ->
-            foldersByAccount = foldersByAccount + (account.id to folders)
+            foldersByAccount = foldersByAccount + (account.id to reconcileFolderUnread(folders, folderReadVersion))
             val created = folders.folderCreatedAs(trimmed)?.name ?: trimmed
             addKanbanColumn(KanbanColumnSpec(account.id, created))
             showKanbanCreateFolderDialog = null

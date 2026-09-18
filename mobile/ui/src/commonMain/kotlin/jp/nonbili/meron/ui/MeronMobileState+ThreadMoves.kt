@@ -42,6 +42,7 @@ internal fun MeronMobileState.ensureThreadActionFolders(
     }
     status = "Loading folders..."
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -65,7 +66,7 @@ internal fun MeronMobileState.ensureThreadActionFolders(
                 }
             }
         }.onSuccess { loadedFolders ->
-            foldersByAccount = foldersByAccount + loadedFolders
+            foldersByAccount = foldersByAccount + loadedFolders.mapValues { (_, folders) -> reconcileFolderUnread(folders, folderReadVersion) }
             status = "Loaded folders"
             onReady()
         }.onFailure {
@@ -194,6 +195,7 @@ internal fun MeronMobileState.createFolderAndMoveThread(
     }
     status = "Creating folder..."
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -212,7 +214,7 @@ internal fun MeronMobileState.createFolderAndMoveThread(
                 folders to created
             }
         }.onSuccess { (folders, _) ->
-            foldersByAccount = foldersByAccount + (account.id to folders)
+            foldersByAccount = foldersByAccount + (account.id to reconcileFolderUnread(folders, folderReadVersion))
             removeThreadEverywhere(thread.id)
             if (selectedCoreThread?.id == thread.id) {
                 selectedCoreThread = null

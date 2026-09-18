@@ -454,6 +454,7 @@ internal fun MeronMobileState.openNotificationThread(target: NotificationThreadT
         return
     }
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -496,7 +497,7 @@ internal fun MeronMobileState.openNotificationThread(target: NotificationThreadT
                 coreAccounts = accounts
             }
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             readCoreThread(thread)
         }.onFailure {
@@ -515,6 +516,7 @@ private fun MeronMobileState.openNotificationMailbox(target: NotificationThreadT
     selectedCoreFolder = target.folder
     syncing = true
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -539,9 +541,9 @@ private fun MeronMobileState.openNotificationMailbox(target: NotificationThreadT
             if (coreAccounts.isEmpty()) {
                 coreAccounts = accounts
             }
-            coreFolders = result.folders
+            coreFolders = reconcileFolderUnread(result.folders, folderReadVersion)
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             selectedCoreFolder = result.folder
             coreThreads = withLocalDraftFlags(result.threads)

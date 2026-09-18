@@ -82,9 +82,9 @@ private fun MeronMobileState.restoreCachedMailbox(
 ): Boolean {
     val key = mailboxCacheKey(accountId, folderId, mailSearch, mailFilter)
     val cached = mailboxCache[key] ?: return false
-    coreFolders = cached.folders
+    coreFolders = reconcileFolderUnread(cached.folders, folderReadGuard.version)
     if (cached.folders.isNotEmpty()) {
-        foldersByAccount = foldersByAccount + cached.folders.groupBy { it.accountId }
+        foldersByAccount = foldersByAccount + reconcileFolderUnread(cached.folders, folderReadGuard.version).groupBy { it.accountId }
     }
     selectedCoreFolder = cached.folder
     coreThreads = withLocalDraftFlags(cached.threads)
@@ -270,6 +270,7 @@ internal fun MeronMobileState.syncCoreThreads(
         "sync start account=$accountId folder=$requestedFolder accounts=${selectedAccounts.size} syncFirst=$syncFirst limit=$syncLimit listLimit=$listLimit query=${query.isNotBlank()} filter=${filter.protocolValue()}",
     )
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -325,9 +326,9 @@ internal fun MeronMobileState.syncCoreThreads(
             }
             val wasInitialLoad = !initialThreadsLoaded
             val existingIds = coreThreads.map { it.id }.toSet()
-            coreFolders = result.folders
+            coreFolders = reconcileFolderUnread(result.folders, folderReadVersion)
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             val folder = result.folder
             selectedCoreFolder = folder
@@ -547,6 +548,7 @@ internal fun MeronMobileState.loadMoreCoreThreads(quiet: Boolean = false) {
     if (selectedAccounts.isEmpty()) return
     loadingMoreThreads = true
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -576,8 +578,8 @@ internal fun MeronMobileState.loadMoreCoreThreads(quiet: Boolean = false) {
             }
         }.onSuccess { result ->
             if (result.folders.isNotEmpty()) {
-                coreFolders = result.folders
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                coreFolders = reconcileFolderUnread(result.folders, folderReadVersion)
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             val existingIds = coreThreads.map { it.id }.toSet()
             val appended = withLocalDraftFlags(result.threads).filterNot { it.id in existingIds }
