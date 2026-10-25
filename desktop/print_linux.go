@@ -93,7 +93,9 @@ static gboolean runMailPrint(gpointer data) {
             g_main_context_iteration(NULL, FALSE);
             g_usleep(1000);
         }
+        job->success = -2; // The print document did not finish loading.
         if (!webkit_web_view_is_loading(view)) {
+            job->success = -3; // The message templates could not be attached.
             const char *prepare = "(() => { for (const t of document.querySelectorAll('template[data-print-message]')) { const mail = new DOMParser().parseFromString(t.content.textContent, 'text/html'); t.parentElement.attachShadow({mode:'open'}).append(document.importNode(mail.documentElement, true)); t.remove(); } return true; })()";
             if (evaluateMailPrint(view, prepare, g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND)) {
                 // Template images load after the shadow roots are attached.
@@ -137,7 +139,7 @@ static gboolean runMailPrint(gpointer data) {
 
 static int printLinuxMail(char *html) {
     MailPrintJob job = {0};
-    job.success = -1; // Preparation unavailable: safe to use browser fallback.
+    job.success = -1; // No app web view. Negative results are safe to fall back from.
     job.html = html;
     g_mutex_init(&job.mutex);
     g_cond_init(&job.condition);
@@ -161,15 +163,22 @@ import (
 	"unsafe"
 )
 
-func printNativeMail(html string) (bool, error) {
+var nativePrintFallbacks = map[C.int]string{
+	-1: "no app web view",
+	-2: "print document did not load",
+	-3: "could not attach message templates",
+}
+
+// printNativeMail reports why it declined, so the browser fallback is traceable.
+func printNativeMail(html string) (bool, string, error) {
 	document := C.CString(html)
 	defer C.free(unsafe.Pointer(document))
 	result := C.printLinuxMail(document)
 	if result < 0 {
-		return false, nil
+		return false, nativePrintFallbacks[result], nil
 	}
 	if result == 0 {
-		return false, fmt.Errorf("could not print mail document")
+		return false, "", fmt.Errorf("could not print mail document")
 	}
-	return true, nil
+	return true, "", nil
 }

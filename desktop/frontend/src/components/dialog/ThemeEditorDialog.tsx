@@ -1,18 +1,23 @@
 import { useState } from 'react'
-import { X } from 'lucide-react'
+import { Forward, Upload, X } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
 import { isValidColor, luminance } from '../../lib/color'
+import { copyText } from '../../lib/native'
 import {
   cssVarStyle,
   defaultCustomInput,
   deriveThemeTokens,
   newCustomThemeId,
+  parseThemeSource,
+  serializeThemeSource,
+  withOpaqueSurface,
   type Appearance,
   type CustomTheme,
   type CustomThemeInput,
 } from '../../lib/themes'
 import { upsertCustomTheme } from '../../states/settings'
+import { showToast } from '../../states/ui'
 import { Button } from '../button/Button'
 import { IconButton } from '../button/IconButton'
 import { TextInput } from '../field/Field'
@@ -31,6 +36,13 @@ const COLOR_FIELDS: { key: ColorField; labelKey: string; hintKey: string }[] = [
   { key: 'accent', labelKey: 'theme.fields.accent', hintKey: 'theme.fields.accentHint' },
   { key: 'text', labelKey: 'theme.fields.text', hintKey: 'theme.fields.textHint' },
 ]
+
+/** Copy a theme's share string (see serializeThemeSource) and confirm with a toast. */
+export function copyThemeSource(source: CustomThemeInput, copiedLabel: string) {
+  copyText(serializeThemeSource(source))
+    .then(() => showToast(copiedLabel))
+    .catch(() => undefined)
+}
 
 /** Normalized "#rrggbb" for the native color input, or null if not expressible. */
 function toHex6(value: string): string | null {
@@ -52,8 +64,8 @@ export function ThemeEditorDialog({
   // Until a color is touched, flipping appearance reseeds the palette so a new
   // dark theme doesn't start from light colors.
   const [dirty, setDirty] = useState(initial !== null)
-
-  useEscapeKey(onClose)
+  // null = import field hidden; otherwise the pasted text so far.
+  const [importText, setImportText] = useState<string | null>(null)
 
   const setColor = (key: ColorField, value: string) => {
     setDirty(true)
@@ -64,80 +76,137 @@ export function ThemeEditorDialog({
     setInput((current) => (dirty ? { ...current, appearance: next } : defaultCustomInput(next)))
   }
 
+  // A pasted share string applies as soon as it parses; nothing is saved until Save.
+  const onImportChange = (text: string) => {
+    const parsed = parseThemeSource(text)
+    if (!parsed) {
+      setImportText(text)
+      return
+    }
+    setDirty(true)
+    setInput(parsed)
+    setImportText(null)
+  }
+
   const valid = COLOR_FIELDS.every(({ key }) => isValidColor(input[key]))
-  const tokens = valid ? deriveThemeTokens(input) : null
+  // Preview and save what a reload would produce: a translucent surface flattened.
+  const source = withOpaqueSurface(input)
+  const tokens = valid ? deriveThemeTokens(source) : null
 
   const save = () => {
     if (!tokens) return
     upsertCustomTheme({
       id: initial?.id ?? newCustomThemeId(),
       name: name.trim() || t('theme.customTheme'),
-      appearance: input.appearance,
+      appearance: source.appearance,
       tokens,
-      source: input,
+      source,
     })
     onClose()
   }
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 dark:bg-black/65 backdrop-blur-[3px] p-4 animate-fade-in">
-      <div className="w-full max-w-lg rounded-3xl border border-border bg-chats text-primary shadow-2xl animate-slide-up overflow-hidden">
-        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
-          <h3 className="text-[0.875rem] font-bold leading-tight">{initial ? t('theme.edit') : t('theme.new')}</h3>
-          <IconButton icon={X} iconSize={15} label={t('buttons.cancel')} size="sm" onClick={onClose} />
-        </div>
+    <Dialog
+      onClose={onClose}
+      closeOnBackdrop={false}
+      aria-label={initial ? t('theme.edit') : t('theme.new')}
+      backdropClassName="z-[70] bg-black/45 dark:bg-black/65"
+      className="max-w-lg overflow-hidden"
+    >
+      <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
+        <h3 className="text-[0.875rem] font-bold leading-tight">{initial ? t('theme.edit') : t('theme.new')}</h3>
+        <IconButton icon={X} iconSize={15} label={t('buttons.cancel')} size="sm" onClick={onClose} />
+      </div>
 
-        <div className="flex flex-col gap-4 px-5 py-4 max-h-[65vh] overflow-y-auto">
-          <div className="flex items-center gap-2">
-            <TextInput
-              type="text"
-              value={name}
-              placeholder={t('theme.namePlaceholder')}
-              onChange={(event) => setName(event.target.value)}
-              surface="raised"
-              className="flex-1 rounded-xl px-3 py-2 font-semibold"
-            />
-            <div className="flex shrink-0 items-center gap-0.5 rounded-lg bg-active/70 p-0.5">
-              {(['light', 'dark'] as const).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  onClick={() => setAppearance(mode)}
-                  className={`rounded-md px-2.5 py-1 text-[0.65625rem] font-bold capitalize transition-colors cursor-pointer ${
-                    input.appearance === mode ? 'bg-chats text-accent shadow-sm' : 'text-secondary hover:text-primary'
-                  }`}
-                >
-                  {mode}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex flex-col gap-2">
-            {COLOR_FIELDS.map(({ key, labelKey, hintKey }) => (
-              <ColorRow
-                key={key}
-                label={t(labelKey)}
-                hint={t(hintKey)}
-                value={input[key]}
-                onChange={(value) => setColor(key, value)}
-              />
+      <div className="flex flex-col gap-4 px-5 py-4 max-h-[65vh] overflow-y-auto">
+        <div className="flex items-center gap-2">
+          <TextInput
+            type="text"
+            value={name}
+            placeholder={t('theme.namePlaceholder')}
+            onChange={(event) => setName(event.target.value)}
+            surface="raised"
+            className="flex-1 rounded-xl px-3 py-2 font-semibold"
+          />
+          <div className="flex shrink-0 items-center gap-0.5 rounded-lg bg-active/70 p-0.5">
+            {(['light', 'dark'] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setAppearance(mode)}
+                className={`rounded-md px-2.5 py-1 text-[0.65625rem] font-bold capitalize transition-colors cursor-pointer ${
+                  input.appearance === mode ? 'bg-chats text-accent shadow-sm' : 'text-secondary hover:text-primary'
+                }`}
+              >
+                {mode}
+              </button>
             ))}
           </div>
-
-          {tokens && <ThemePreview tokens={tokens} />}
         </div>
 
-        <div className="flex justify-end gap-2 border-t border-border/70 px-5 py-4">
-          <Button variant="secondary" size="sm" onClick={onClose}>
-            {t('buttons.cancel')}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={Forward}
+            disabled={!valid}
+            onClick={() => copyThemeSource(input, t('theme.shareCopied'))}
+          >
+            {t('theme.share')}
           </Button>
-          <Button size="sm" onClick={save} disabled={!valid}>
-            {t('theme.save')}
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={Upload}
+            onClick={() => setImportText((current) => (current === null ? '' : null))}
+          >
+            {t('theme.import')}
           </Button>
         </div>
+
+        {importText !== null && (
+          <div className="flex flex-col gap-1">
+            <TextInput
+              type="text"
+              autoFocus
+              value={importText}
+              spellCheck={false}
+              placeholder={t('theme.importPlaceholder')}
+              onChange={(event) => onImportChange(event.target.value)}
+              invalid={importText.trim() !== ''}
+              surface="raised"
+              className="rounded-xl px-3 py-2 text-[0.6875rem] font-mono"
+            />
+            {importText.trim() !== '' && (
+              <span className="text-[0.625rem] font-medium text-rose-500">{t('theme.importInvalid')}</span>
+            )}
+          </div>
+        )}
+
+        <div className="flex flex-col gap-2">
+          {COLOR_FIELDS.map(({ key, labelKey, hintKey }) => (
+            <ColorRow
+              key={key}
+              label={t(labelKey)}
+              hint={t(hintKey)}
+              value={input[key]}
+              onChange={(value) => setColor(key, value)}
+            />
+          ))}
+        </div>
+
+        {tokens && <ThemePreview tokens={tokens} />}
       </div>
-    </div>
+
+      <div className="flex justify-end gap-2 border-t border-border/70 px-5 py-4">
+        <Button variant="secondary" size="sm" onClick={onClose}>
+          {t('buttons.cancel')}
+        </Button>
+        <Button size="sm" onClick={save} disabled={!valid}>
+          {t('theme.save')}
+        </Button>
+      </div>
+    </Dialog>
   )
 }
 

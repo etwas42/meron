@@ -394,8 +394,8 @@ internal fun ChatWallpaperPreview(
             modifier = Modifier.fillMaxSize().padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            PreviewBubble("Welcome to the conversation", chat.bubbleIn, chat.bubbleInText, false)
-            PreviewBubble("This is your chat background", chat.bubbleOut, chat.bubbleOutText, true)
+            PreviewBubble(tr("mobile.wallpaper.previewIncoming"), chat.bubbleIn, chat.bubbleInText, false)
+            PreviewBubble(tr("mobile.wallpaper.previewOutgoing"), chat.bubbleOut, chat.bubbleOutText, true)
         }
     }
 }

@@ -1,0 +1,4 @@
+- Add setting to quote the original in replies
+- Warn if a thread is already in Tasks when adding it
+- Float the thread and message reader bars with frosted content underneath
+- Add icons and unify the message menu

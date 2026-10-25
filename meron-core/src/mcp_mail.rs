@@ -137,22 +137,47 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
         "Unknown organization action"
     );
     let account = input.account.clone();
-    let target = engine
-        .with_write_session(&account, |session| {
-            let input = input.clone();
-            Box::pin(async move {
-                match input.action.as_str() {
-                    "mark_read" | "mark_unread" => {
-                        imap::prepare_flag_update(session, &input.folder).await?;
-                        imap::store_seen(session, &input.uids, input.action == "mark_read").await?;
-                        Ok(None)
-                    }
-                    "star" | "unstar" => {
-                        imap::prepare_flag_update(session, &input.folder).await?;
-                        imap::store_starred(session, &input.uids, input.action == "star").await?;
-                        Ok(None)
-                    }
-                    _ => {
+    let target = match input.action.as_str() {
+        "mark_read" | "mark_unread" | "star" | "unstar" => {
+            engine
+                .with_flag_write_session(
+                    &account,
+                    |session| {
+                        let folder = input.folder.clone();
+                        Box::pin(async move { imap::prepare_flag_update(session, &folder).await })
+                    },
+                    |session| {
+                        let input = input.clone();
+                        Box::pin(async move {
+                            match input.action.as_str() {
+                                "mark_read" | "mark_unread" => {
+                                    imap::store_seen(
+                                        session,
+                                        &input.uids,
+                                        input.action == "mark_read",
+                                    )
+                                    .await
+                                }
+                                _ => {
+                                    imap::store_starred(
+                                        session,
+                                        &input.uids,
+                                        input.action == "star",
+                                    )
+                                    .await
+                                }
+                            }
+                        })
+                    },
+                )
+                .await?;
+            None
+        }
+        _ => {
+            engine
+                .with_write_session(&account, |session| {
+                    let input = input.clone();
+                    Box::pin(async move {
                         let target = match input.action.as_str() {
                             "archive" => imap::find_archive_folder(session)
                                 .await?
@@ -170,11 +195,11 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
                         imap::move_to_folder_checked(session, &input.folder, &target, &input.uids)
                             .await?;
                         Ok(Some(target))
-                    }
-                }
-            })
-        })
-        .await?;
+                    })
+                })
+                .await?
+        }
+    };
     if target.is_none() {
         let db = engine.db.lock().unwrap();
         let seen = match input.action.as_str() {
@@ -209,7 +234,7 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
     }
     // Refresh the move destination on a read session. The write is never retried.
     let refresh_folder = target.as_deref().unwrap_or(&input.folder);
-    let refresh = crate::engine::fetch_recent_resilient(
+    let refresh = crate::engine::refresh_written_folder(
         engine,
         &account,
         refresh_folder,
@@ -221,8 +246,9 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
         store::delete_messages_by_uid(&db, &account, &input.folder, &input.uids)?;
         store::ensure_folder(&db, &account, target)?;
     }
-    let warning = match refresh {
-        Ok(batch) => {
+    let warning = match refresh.as_ref() {
+        Some(refresh) => {
+            let batch = &refresh.batch;
             store::upsert_messages(&db, &account, refresh_folder, &batch.messages)?;
             store::set_folder_state(
                 &db,
@@ -233,7 +259,7 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
             )?;
             None
         }
-        Err(_) => {
+        None => {
             Some("The operation completed but the mailbox refresh failed. Do not retry the write.")
         }
     };

@@ -46,6 +46,16 @@ func (a *App) watchFolder(command string, payload map[string]any) (any, error) {
 	return a.sidecar.Call(command, payload)
 }
 
+// searchQuery converts between a search query's text and the search options
+// form's fields. The parser lives in the shared core so every platform reads
+// operators the same way.
+func (a *App) searchQuery(command string, payload map[string]any) (any, error) {
+	if a.sidecar == nil || !a.sidecar.Started() {
+		return nil, a.engineUnavailable()
+	}
+	return a.sidecar.Call(command, payload)
+}
+
 func (a *App) folderList(payload map[string]any) (any, error) {
 	var req FolderListRequest
 	_ = decode(payload, &req)
@@ -88,6 +98,37 @@ func (a *App) folderCreate(payload map[string]any) (any, error) {
 		return nil, a.engineUnavailable()
 	}
 	res, err := a.sidecar.Call("folders.create", map[string]any{"account": req.AccountID, "name": req.Name})
+	if err != nil {
+		return nil, err
+	}
+	return foldersJSON(req.AccountID, res), nil
+}
+
+// folderSetNotify opts a folder in to (or out of) live sync and new-mail
+// notifications. The sidecar keeps the flag and the folder's IDLE watch.
+func (a *App) folderSetNotify(payload map[string]any) (any, error) {
+	var req FolderSetNotifyRequest
+	_ = decode(payload, &req)
+	if req.AccountID == "" {
+		return nil, errors.New("account_id is required")
+	}
+	if strings.TrimSpace(req.FolderID) == "" {
+		return nil, errors.New("folder_id is required")
+	}
+	if isRSSAccountID(req.AccountID) {
+		return nil, errors.New("RSS accounts do not support folders")
+	}
+	if req.AccountID == "unified" {
+		return nil, errors.New("Pick a single account to change folder notifications")
+	}
+	if a.sidecar == nil || !a.sidecar.Started() {
+		return nil, a.engineUnavailable()
+	}
+	res, err := a.sidecar.Call("folders.setNotify", map[string]any{
+		"account": req.AccountID,
+		"folder":  req.FolderID,
+		"enabled": req.Enabled,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -175,14 +216,19 @@ func (a *App) threadList(payload map[string]any) (any, error) {
 			folderRole = req.FolderID
 		}
 	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 50
+	}
 	res, err := a.sidecar.Call(method, map[string]any{
 		"account":       req.AccountID,
 		"folder":        req.FolderID,
 		"folder_role":   folderRole,
 		"query":         req.Query,
 		"filter":        req.Filter,
+		"attachments":   req.Attachments,
 		"before_cursor": req.BeforeCursor,
-		"limit":         50,
+		"limit":         limit,
 		"refresh":       req.Refresh,
 		// Thread grouping (subject branching, root titles, unread counts)
 		// runs in the core, shared with mobile; the bridge only mints ids.
@@ -339,6 +385,7 @@ func (a *App) mailDelete(payload map[string]any) (any, error) {
 func (a *App) mailMove(payload map[string]any) (any, error) {
 	threadID, _ := payload["thread_id"].(string)
 	targetFolder, _ := payload["target_folder_id"].(string)
+	targetAccount, _ := payload["target_account_id"].(string)
 	if threadID == "" || targetFolder == "" {
 		return map[string]any{"ok": true}, nil
 	}
@@ -349,19 +396,23 @@ func (a *App) mailMove(payload map[string]any) (any, error) {
 		return nil, errors.New("feed items cannot be moved between folders")
 	}
 	if ids, ok := parseImapThreadID(threadID); ok {
-		if canonThreadFolder(ids.Folder) == canonThreadFolder(targetFolder) {
+		if (targetAccount == "" || targetAccount == ids.Account) && canonThreadFolder(ids.Folder) == canonThreadFolder(targetFolder) {
 			return map[string]any{"ok": true, "moved": 0}, nil
 		}
 		// Branch-compound thread keys pass through untouched; the sidecar
 		// splits them and scopes the move to the subject branch.
 		params := map[string]any{"account": ids.Account, "folder": ids.Folder, "target_folder": targetFolder, "thread_key": ids.ThreadKey}
+		if targetAccount != "" {
+			params["target_account"] = targetAccount
+		}
 		if uids := imapUIDsFromPayload(threadID, payload); len(uids) > 0 {
 			params["uids"] = uids
 			delete(params, "thread_key")
 			return a.sidecar.Call("messages.move", params)
 		}
 		if ids.ThreadKey == "" && ids.UID > 0 {
-			params = map[string]any{"account": ids.Account, "folder": ids.Folder, "target_folder": targetFolder, "uid": ids.UID}
+			delete(params, "thread_key")
+			params["uid"] = ids.UID
 		}
 		return a.sidecar.Call("messages.move", params)
 	}
@@ -465,7 +516,7 @@ func (a *App) markRead(payload map[string]any) (any, error) {
 		return map[string]any{"ok": true}, nil
 	}
 	if a.sidecar == nil || !a.sidecar.Started() {
-		return map[string]any{"ok": true}, nil
+		return nil, a.engineUnavailable()
 	}
 	// Defaults to read; pass seen:false to mark a thread unread.
 	seen := true
@@ -604,7 +655,7 @@ func (a *App) saveAttachment(payload map[string]any) (any, error) {
 		filename = filepath.Base(src)
 	}
 
-	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+	dest, err := saveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:                "Save attachment",
 		DefaultFilename:      filename,
 		CanCreateDirectories: true,
@@ -734,10 +785,16 @@ func copyFileTo(src, dest string, perm os.FileMode) error {
 }
 
 // emlFilename turns a subject into a safe ".eml" default filename for the save
-// dialog. Path separators, control characters and the Windows-reserved set are
-// dropped so the name can't escape the chosen directory or be rejected by the
-// platform dialog; an empty or unusable subject falls back to "message".
+// dialog; an empty or unusable subject falls back to "message".
 func emlFilename(subject string) string {
+	return safeFilenameBase(subject, "message") + ".eml"
+}
+
+// safeFilenameBase turns free text into a safe filename without its extension.
+// Path separators, control characters and the Windows-reserved set are dropped
+// so the name can't escape the chosen directory or be rejected by the platform
+// dialog; an empty or unusable name becomes fallback.
+func safeFilenameBase(name, fallback string) string {
 	cleaned := strings.Map(func(r rune) rune {
 		switch {
 		case r < 0x20 || r == 0x7f:
@@ -746,10 +803,10 @@ func emlFilename(subject string) string {
 			return -1
 		}
 		return r
-	}, subject)
+	}, name)
 	cleaned = strings.Trim(cleaned, " .")
 	if cleaned == "" {
-		cleaned = "message"
+		cleaned = fallback
 	}
 	// Leave room for the extension inside the common 255-byte name limit.
 	if len(cleaned) > 120 {
@@ -767,7 +824,7 @@ func emlFilename(subject string) string {
 			upper[3] >= '1' && upper[3] <= '9') {
 		cleaned = "_" + cleaned
 	}
-	return cleaned + ".eml"
+	return cleaned
 }
 
 func messageEmlSource(payload map[string]any) (map[string]any, error) {
@@ -810,7 +867,7 @@ func (a *App) saveMessageEml(payload map[string]any) (any, error) {
 	}
 
 	subject, _ := payload["subject"].(string)
-	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+	dest, err := saveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:                "Save message",
 		DefaultFilename:      emlFilename(subject),
 		CanCreateDirectories: true,

@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from 'react'
-import { ExternalLink, Play } from 'lucide-react'
+import { Download, ExternalLink, Play } from 'lucide-react'
 import { clearMediaSession } from '../../lib/mediaSession'
 import { openExternal } from '../../lib/native'
 
@@ -7,6 +7,9 @@ interface VideoAttachmentProps {
   src: string
   externalUrl: string
   externalLabel: string
+  // Shows a save button beside the external-player one when set.
+  onSave?: () => void
+  saveLabel?: string
   className?: string
   videoClassName?: string
   posterClassName?: string
@@ -23,6 +26,8 @@ export function VideoAttachment({
   src,
   externalUrl,
   externalLabel,
+  onSave,
+  saveLabel,
   className = 'group relative w-full max-w-[320px]',
   videoClassName = 'w-full max-h-80 rounded-lg border border-border/20 bg-black',
   posterClassName = 'flex aspect-video w-full items-center justify-center rounded-lg border border-border/20 bg-black text-white/90 transition-colors hover:text-white cursor-pointer',
@@ -63,6 +68,17 @@ export function VideoAttachment({
           <span className="flex h-12 w-12 items-center justify-center rounded-full bg-black/50">
             <Play size={22} fill="currentColor" />
           </span>
+        </button>
+      )}
+      {onSave && (
+        <button
+          type="button"
+          onClick={onSave}
+          title={saveLabel}
+          aria-label={saveLabel}
+          className={`absolute top-1.5 ${externalUrl ? 'right-10' : 'right-1.5'} z-10 flex h-7 w-7 items-center justify-center rounded-full bg-black/45 text-white/90 opacity-0 group-hover:opacity-100 hover:bg-black/70 transition-opacity cursor-pointer`}
+        >
+          <Download size={13} />
         </button>
       )}
       {externalUrl && (

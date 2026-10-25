@@ -1,12 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { closestCenter, DndContext, DragOverlay, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
-import { SortableContext, horizontalListSortingStrategy } from '@dnd-kit/sortable'
-import { Columns3, Plus, Search, SquarePen, X } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import {
+  closestCenter,
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core'
+import { SortableContext, horizontalListSortingStrategy, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
+import { Columns3, Plus, SquarePen } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { invoke } from '../../lib/bridge'
 import { accounts$, isSendableAccount } from '../../states/accounts'
-import { clearBulkSelection, ui$ } from '../../states/ui'
+import { clearBulkSelection, focusGlobalSearch, ui$ } from '../../states/ui'
 import { mail$ } from '../../states/mail'
 import { ensureAccountFolders } from '../../states/mailFolders'
 import { openComposeTab } from '../../states/compose'
@@ -19,6 +27,7 @@ import {
   kanban$,
   removeKanbanColumn,
   setGlobalKanbanFilter,
+  setGlobalKanbanAttachmentsOnly,
   type KanbanColumn,
 } from '../../states/kanban'
 import { settings$ } from '../../states/settings'
@@ -28,36 +37,53 @@ import { AddColumnDialog, type AccountGroup } from './AddColumnDialog'
 import { SortableColumn } from './KanbanBoardColumn'
 import { KanbanDragPreview } from './KanbanThreadCard'
 import { useThreadContextMenu } from '../threads/ThreadContextMenu'
-import { SearchScopeDropdown } from './SearchScopeDropdown'
+import { useTitleBar } from '../titlebar/TitleBar'
+import { expandSearchScope, KanbanSearch } from './KanbanSearch'
 import { BoardMenu, FilterSwitch } from './KanbanBoardMenu'
-import { isRSSAccount, loadKanbanColumn, resolveKanbanMove, useFoldersByAccount } from '../../lib/kanbanData'
-import { wallpaperCss } from '../../lib/wallpapers'
+import {
+  isRSSAccount,
+  loadKanbanColumn,
+  resolveKanbanMove,
+  restrictColumnDragToHorizontal,
+  useFoldersByAccount,
+} from '../../lib/kanbanData'
+import { boardWallpaper, wallpaperCss } from '../../lib/wallpapers'
 import { useKanbanBoardSync, useKanbanDnd } from './useKanbanBoard'
 
-export function KanbanView({ boardId }: { boardId: string }) {
+/**
+ * `aside`: the board's conversation pane (App builds it). It opens beside the
+ * columns, *under* the board's header, so the header stays a toolbar across
+ * the whole board and its filters don't move when a card is opened.
+ */
+export function KanbanView({ boardId, aside }: { boardId: string; aside?: ReactNode }) {
   const { t } = useTranslation()
   const accounts = useValue(accounts$)
   const foldersByAccount = useFoldersByAccount()
   const boards = useValue(settings$.kanbanBoards)
   const lockScroll = useValue(settings$.kanbanLockScroll)
   const globalFilter = useValue(kanban$.globalFilter)
+  const attachmentsOnly = useValue(kanban$.globalAttachmentsOnly)
   const searchQuery = useValue(kanban$.searchQuery)
   const searchScope = useValue(kanban$.searchScope)
-  const globalSearchFocus = useValue(ui$.globalSearchFocus)
+  const titleBar = useTitleBar()
   const board = boards.find((item) => item.id === boardId)
   // No layer at all when unset, so the default board keeps the plain theme surface.
-  const boardWallpaper = board?.wallpaper ? wallpaperCss(board.wallpaper) : null
+  const wallpaper = boardWallpaper(board?.wallpaper)
+  const boardWallpaperCss = wallpaper ? wallpaperCss(wallpaper) : null
   const [dialogOpen, setDialogOpen] = useState(false)
-  // The search bar is collapsed to an icon by default; it expands on click (or the
-  // search hotkey) and folds back once it's empty and loses focus. Start open if a
-  // query is already active so a persisted search stays visible.
-  const [searchOpen, setSearchOpen] = useState(() => !!kanban$.searchQuery.peek().trim())
-  const searchInputRef = useRef<HTMLInputElement | null>(null)
-  const searchBarRef = useRef<HTMLDivElement | null>(null)
   const hasSendableAccount = accounts.some(isSendableAccount)
   const visibleColumns = useMemo(() => getKanbanColumns(boardId), [boards, boardId])
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }))
-  const selectedKeys = useMemo(() => visibleColumns.map((column) => kanbanColumnKey(column)), [visibleColumns])
+  // The keyboard sensor is for column headers only; cards drop its listener.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  )
+  // The dialog picks folders; saved search columns are not among its options,
+  // so they stay out of what it can add or remove.
+  const selectedKeys = useMemo(
+    () => visibleColumns.filter((column) => !column.query).map((column) => kanbanColumnKey(column)),
+    [visibleColumns],
+  )
   // Derived from the folder cache rather than snapshotted when the dialog opens,
   // so a folder LIST that finishes while it is open shows up without reopening.
   const dialogGroups = useMemo<AccountGroup[]>(
@@ -65,7 +91,6 @@ export function KanbanView({ boardId }: { boardId: string }) {
       accounts.map((account) => ({
         accountId: account.id,
         label: account.display_name || account.email || account.id,
-        email: account.email,
         avatarUrl: account.avatar_url,
         isRSS: isRSSAccount(account.id, accounts),
         folders: foldersByAccount[account.id] ?? [],
@@ -96,34 +121,7 @@ export function KanbanView({ boardId }: { boardId: string }) {
 
   useEffect(() => {
     clearBulkSelection()
-  }, [globalFilter, searchQuery, searchScope])
-
-  useEffect(() => {
-    if (globalSearchFocus === 0) return
-    setSearchOpen(true)
-    requestAnimationFrame(() => {
-      searchInputRef.current?.focus()
-      searchInputRef.current?.select()
-    })
-  }, [globalSearchFocus])
-
-  // Focus the input whenever the bar expands so it's immediately typeable.
-  useEffect(() => {
-    if (searchOpen) searchInputRef.current?.focus()
-  }, [searchOpen])
-
-  // Collapse the bar when the user clicks away, but only if it's empty — an active
-  // query keeps the bar (and its results) visible.
-  useEffect(() => {
-    if (!searchOpen) return
-    const onPointerDown = (event: MouseEvent) => {
-      if (searchBarRef.current?.contains(event.target as Node)) return
-      if (kanban$.searchQuery.peek().trim()) return
-      setSearchOpen(false)
-    }
-    document.addEventListener('mousedown', onPointerDown)
-    return () => document.removeEventListener('mousedown', onPointerDown)
-  }, [searchOpen])
+  }, [globalFilter, attachmentsOnly, searchQuery, searchScope])
 
   function openDialog() {
     // Kick a real folder LIST per account and open immediately on the cache. The
@@ -139,22 +137,10 @@ export function KanbanView({ boardId }: { boardId: string }) {
     setDialogOpen(true)
   }
 
-  // Matches are drawn in the column body, so scoping a search to a collapsed
-  // column would hide the very results it just loaded behind the strip.
-  function expandSearchScope(scope: string) {
-    const column = visibleColumns.find((item) => kanbanColumnKey(item) === scope)
-    if (!column) return
-    settings$.kanbanMinimizedColumns[kanbanBoardColumnKey(boardId, column)].set(false)
-  }
-
   function searchColumn(column: KanbanColumn) {
     kanban$.searchScope.set(kanbanColumnKey(column))
-    expandSearchScope(kanbanColumnKey(column))
-    setSearchOpen(true)
-    requestAnimationFrame(() => {
-      searchInputRef.current?.focus()
-      searchInputRef.current?.select()
-    })
+    expandSearchScope(boardId, kanbanColumnKey(column))
+    focusGlobalSearch()
   }
 
   function applyColumns(nextKeys: string[]) {
@@ -201,73 +187,38 @@ export function KanbanView({ boardId }: { boardId: string }) {
 
   if (accounts.length === 0) {
     return (
-      <section className="flex flex-1 border-r border-border bg-chats">
+      <section className="flex flex-1 bg-chats">
         <EmptyState title={t('empty.welcomeTitle')} text={t('empty.kanbanSetupText')} />
       </section>
     )
   }
 
   return (
-    <section className="flex flex-1 min-w-0 flex-col border-r border-border bg-chats max-[768px]:w-full">
-      <div className="@container relative z-30 flex min-h-16 shrink-0 items-center gap-3 border-b border-border/50 bg-white/70 backdrop-blur-md px-4 py-3 dark:bg-[#0f172a]/70">
+    <section className="flex flex-1 min-w-0 flex-col bg-chats max-[768px]:w-full">
+      <div
+        // No backdrop blur: the header sits in the content frame's rounded
+        // top-left corner, and WebKit (WebKitGTK, WKWebView) can fail to clip a
+        // blurred, separately composited layer to a rounded corner. Nothing
+        // scrolls under the header, so the blur changed nothing visible there.
+        // Above the conversation header (z-40), below title-bar dropdowns (z-50).
+        className="@container relative z-[45] flex h-12 shrink-0 items-center gap-3 border-b border-border/50 bg-header/70 px-4"
+      >
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           {board?.avatarUrl ? (
             <img
               src={board.avatarUrl}
               alt=""
-              className="h-9 w-9 shrink-0 rounded-xl object-cover border border-accent/10"
+              className="h-8 w-8 shrink-0 rounded-lg object-cover border border-accent/10"
             />
           ) : (
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent/10 text-accent shrink-0 border border-accent/10">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent/10 text-accent shrink-0 border border-accent/10">
               <Columns3 size={16} />
             </div>
           )}
           <h2 className="truncate text-sm font-bold text-primary">{board?.name || t('kanban.board.defaultName')}</h2>
         </div>
-        {searchOpen ? (
-          <div
-            ref={searchBarRef}
-            className="flex h-9 min-w-0 basis-72 shrink items-center overflow-visible rounded-xl border border-transparent bg-hover focus-within:border-accent/40 focus-within:bg-chats"
-          >
-            <div className="relative h-full min-w-0 flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-secondary" size={14} />
-              <input
-                ref={searchInputRef}
-                value={searchQuery}
-                onChange={(event) => kanban$.searchQuery.set(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key !== 'Escape') return
-                  if (searchQuery) kanban$.searchQuery.set('')
-                  else setSearchOpen(false)
-                }}
-                placeholder={t('kanban.searchBoard')}
-                className="h-full w-full border-0 bg-transparent py-1.5 pl-9.5 pr-8 text-xs text-primary outline-none placeholder-secondary transition-all"
-              />
-              {searchQuery && (
-                <button
-                  onClick={() => {
-                    kanban$.searchQuery.set('')
-                    searchInputRef.current?.focus()
-                  }}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-secondary hover:text-primary cursor-pointer transition-colors"
-                  title={t('common.clearSearch')}
-                >
-                  <X size={14} />
-                </button>
-              )}
-            </div>
-            <SearchScopeDropdown
-              value={searchScope}
-              onChange={(val) => {
-                kanban$.searchScope.set(val)
-                expandSearchScope(val)
-              }}
-              visibleColumns={visibleColumns}
-            />
-          </div>
-        ) : (
-          <IconButton icon={Search} label={t('kanban.searchBoardAction')} onClick={() => setSearchOpen(true)} />
-        )}
+        {/* In the title bar instead when Meron draws one. */}
+        {!titleBar && <KanbanSearch boardId={boardId} />}
         <FilterSwitch value={globalFilter} onChange={setGlobalKanbanFilter} />
         {hasSendableAccount && (
           <IconButton
@@ -285,6 +236,8 @@ export function KanbanView({ boardId }: { boardId: string }) {
           boardId={boardId}
           filterMode={globalFilter}
           onFilterChange={setGlobalKanbanFilter}
+          attachmentsOnly={attachmentsOnly}
+          onAttachmentsOnlyChange={setGlobalKanbanAttachmentsOnly}
           onAddColumn={openDialog}
         />
       </div>
@@ -307,63 +260,69 @@ export function KanbanView({ boardId }: { boardId: string }) {
           onCreateFolder={createDialogFolder}
         />
       )}
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        // Locked boards stay put: a drag never scrolls the columns out from
-        // under the pointer, so a curated set of visible columns keeps its
-        // place. Off-screen columns are still reachable via "Move to…".
-        autoScroll={!lockScroll}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onDragCancel={() => setDragPreview(null)}
-      >
-        <div className="relative flex flex-1 min-h-0">
-          {boardWallpaper && (
-            <div className={`absolute inset-0 ${boardWallpaper.className}`} style={boardWallpaper.style} />
-          )}
-          <div className="relative flex flex-1 min-h-0 gap-2 overflow-x-auto p-2">
-            {visibleColumns.length === 0 ? (
-              <div className="flex flex-1 items-center justify-center">
-                <EmptyState title={t('empty.noColumns')} text={t('empty.noColumnsText')} />
+      <div className="flex min-h-0 flex-1">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictColumnDragToHorizontal]}
+            // Locked boards stay put: a drag never scrolls the columns out from
+            // under the pointer, so a curated set of visible columns keeps its
+            // place. Off-screen columns are still reachable via "Move to…".
+            autoScroll={!lockScroll}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+            onDragCancel={() => setDragPreview(null)}
+          >
+            <div className="relative flex flex-1 min-h-0">
+              {boardWallpaperCss && (
+                <div className={`absolute inset-0 ${boardWallpaperCss.className}`} style={boardWallpaperCss.style} />
+              )}
+              <div className="relative flex flex-1 min-h-0 gap-2 overflow-x-auto p-2">
+                {visibleColumns.length === 0 ? (
+                  <div className="flex flex-1 items-center justify-center">
+                    <EmptyState title={t('empty.noColumns')} text={t('empty.noColumnsText')} />
+                  </div>
+                ) : (
+                  <SortableContext
+                    items={visibleColumns.map((column) => kanbanBoardColumnKey(boardId, column))}
+                    strategy={horizontalListSortingStrategy}
+                  >
+                    {visibleColumns.map((column) => (
+                      <SortableColumn
+                        key={kanbanColumnKey(column)}
+                        boardId={boardId}
+                        column={column}
+                        // While a card is in the air, every column that would refuse
+                        // it says so up front instead of only after the drop.
+                        dropRejection={dropRejections[kanbanColumnKey(column)]}
+                        onMoveThread={moveThread}
+                        onSearchColumn={searchColumn}
+                        threadMenu={threadMenu}
+                      />
+                    ))}
+                  </SortableContext>
+                )}
+                <button
+                  type="button"
+                  className="group flex h-full w-11 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-dashed border-border/80 bg-chats/45 text-secondary backdrop-blur-sm transition-colors hover:border-accent/50 hover:bg-chats/75 hover:text-accent focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
+                  title={t('kanban.actions.addColumn')}
+                  aria-label={t('kanban.actions.addColumn')}
+                  onClick={() => void openDialog()}
+                >
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full bg-chats/80 shadow-sm transition-colors group-hover:bg-accent/10">
+                    <Plus size={16} />
+                  </span>
+                </button>
               </div>
-            ) : (
-              <SortableContext
-                items={visibleColumns.map((column) => kanbanBoardColumnKey(boardId, column))}
-                strategy={horizontalListSortingStrategy}
-              >
-                {visibleColumns.map((column) => (
-                  <SortableColumn
-                    key={kanbanColumnKey(column)}
-                    boardId={boardId}
-                    column={column}
-                    // While a card is in the air, every column that would refuse
-                    // it says so up front instead of only after the drop.
-                    dropRejection={dropRejections[kanbanColumnKey(column)]}
-                    onMoveThread={moveThread}
-                    onSearchColumn={searchColumn}
-                    threadMenu={threadMenu}
-                  />
-                ))}
-              </SortableContext>
-            )}
-            <button
-              type="button"
-              className="group flex h-full w-11 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-dashed border-border/80 bg-chats/45 text-secondary backdrop-blur-sm transition-colors hover:border-accent/50 hover:bg-chats/75 hover:text-accent focus-visible:border-accent focus-visible:ring-2 focus-visible:ring-accent/30"
-              title={t('kanban.actions.addColumn')}
-              aria-label={t('kanban.actions.addColumn')}
-              onClick={() => void openDialog()}
-            >
-              <span className="flex h-7 w-7 items-center justify-center rounded-full bg-chats/80 shadow-sm transition-colors group-hover:bg-accent/10">
-                <Plus size={16} />
-              </span>
-            </button>
-          </div>
+            </div>
+            <DragOverlay dropAnimation={null}>
+              {dragPreview ? <KanbanDragPreview thread={dragPreview.thread} column={dragPreview.column} /> : null}
+            </DragOverlay>
+          </DndContext>
         </div>
-        <DragOverlay dropAnimation={null}>
-          {dragPreview ? <KanbanDragPreview thread={dragPreview.thread} column={dragPreview.column} /> : null}
-        </DragOverlay>
-      </DndContext>
+        {aside}
+      </div>
     </section>
   )
 }

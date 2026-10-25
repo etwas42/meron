@@ -11,6 +11,56 @@ use meron_core::{imap, smtp, store};
 use crate::sidecar::params::*;
 use crate::{Writer, emit};
 
+/// The optional `uids` array of a request, ignoring anything that isn't a UID.
+fn opt_uids(params: &Value) -> Vec<u32> {
+    params
+        .get("uids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|n| n as u32)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Finalize the Sent view after a send. For Gmail/Outlook defaults this only
+/// refreshes the provider-created copy; other accounts get Meron's best-effort
+/// APPEND plus refresh. The mail already left via SMTP, so none of this may
+/// hold up the reply: an APPEND re-uploads the whole message, and a host that
+/// times out waiting on it would report a delivered message as failed — and
+/// offer to send it again.
+fn finish_sent(engine: &Arc<Engine>, out: &Writer, account: String, raw: Vec<u8>) {
+    let engine = engine.clone();
+    let out = out.clone();
+    tokio::spawn(async move {
+        match append_to_sent(&engine, &account, &raw).await {
+            // The Sent copy is cached, so tell the UI to re-read the
+            // store — see `sent_copy_cached_detail`. When the provider
+            // has not exposed its own copy yet, wait for it rather than
+            // firing at an unchanged cache: no later sync of the Sent
+            // folder is guaranteed to follow.
+            Ok(copy) => {
+                if copy.observed
+                    || (copy.worth_awaiting() && await_sent_copy(&engine, &account, &copy).await)
+                {
+                    emit(
+                        &out,
+                        "mail.sentCopyCached",
+                        sent_copy_cached_detail(&account),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                eprintln!("meron-core: APPEND to Sent failed for {account}: {err:#}");
+            }
+        }
+    });
+}
+
 /// Handle outgoing mail: send, drafts, and saving raw messages.
 pub(crate) async fn dispatch(
     engine: &Arc<Engine>,
@@ -55,45 +105,31 @@ pub(crate) async fn dispatch(
                 &message_id,
             )
             .await?;
-            // Finalize the Sent view. For Gmail/Outlook defaults this only
-            // refreshes the provider-created copy; other accounts get Meron's
-            // best-effort APPEND plus refresh. The mail already left via SMTP,
-            // so Sent-folder issues should not surface as "send failed".
-            match append_to_sent(engine, &account, &raw).await {
-                // The Sent copy is cached, so tell the UI to re-read the store
-                // — see `sent_copy_cached_detail`. When the provider has not
-                // exposed its own copy yet, the event waits for it in the
-                // background rather than firing at an unchanged cache: no
-                // later sync of the Sent folder is guaranteed to follow.
-                Ok(copy) => {
-                    if copy.observed {
-                        emit(
-                            out,
-                            "mail.sentCopyCached",
-                            sent_copy_cached_detail(&account),
-                        )
-                        .await;
-                    } else if copy.worth_awaiting() {
-                        let engine = engine.clone();
-                        let out = out.clone();
-                        let account = account.clone();
-                        tokio::spawn(async move {
-                            if await_sent_copy(&engine, &account, &copy).await {
-                                emit(
-                                    &out,
-                                    "mail.sentCopyCached",
-                                    sent_copy_cached_detail(&account),
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                }
-                Err(err) => {
-                    eprintln!("meron-core: APPEND to Sent failed for {account}: {err:#}");
-                }
-            }
+            finish_sent(engine, out, account, raw);
             Ok(json!({ "ok": true }))
+        }
+
+        "invite.respond" => {
+            let message = req_str(p, "message")?;
+            let thread_id = req_str(p, "thread_id").unwrap_or_default();
+            let response = req_str(p, "response")?;
+            let response = meron_core::calendar::Response::parse(&response)
+                .ok_or_else(|| anyhow::anyhow!("unknown invitation response: {response}"))?;
+            let responded = meron_core::calendar::respond(
+                engine,
+                &message,
+                &thread_id,
+                response,
+                &meron_core::parse::media_root(),
+            )
+            .await?;
+            finish_sent(engine, out, responded.account, responded.raw);
+            emit(out, "calendar.changed", json!({ "method": req.method })).await;
+            Ok(json!({
+                "ok": true,
+                "response": response.as_str(),
+                "event_id": responded.event_id,
+            }))
         }
 
         "save_draft" => {
@@ -227,6 +263,76 @@ pub(crate) async fn dispatch(
                 .write_all(&message.raw)
                 .with_context(|| format!("write message export {path}"))?;
             Ok(json!({ "saved": true, "size": message.raw.len() }))
+        }
+
+        // Resolve what a bulk .eml export covers into source UIDs: a thread
+        // (from the local cache, like copy/move) or, with `all`, every message
+        // the server holds in the folder — not just the cached window.
+        "messages.exportUids" => {
+            let account = req_str(p, "account")?;
+            let folder =
+                canon_folder(&req_str(p, "folder").unwrap_or_else(|_| "INBOX".to_string()));
+            let mut uids = if p.get("all").and_then(Value::as_bool).unwrap_or(false) {
+                engine
+                    .with_read_session(&account, |session| {
+                        let folder = folder.clone();
+                        Box::pin(async move { imap::list_all_uids(session, &folder).await })
+                    })
+                    .await?
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                let (thread_key, subject_filter) =
+                    store::split_thread_key(&req_str(p, "thread_key").unwrap_or_default());
+                let uid = p.get("uid").and_then(Value::as_u64).map(|n| n as u32);
+                store::resolve_message_uids(
+                    &engine.db.lock().unwrap(),
+                    &account,
+                    &folder,
+                    &thread_key,
+                    subject_filter.as_deref(),
+                    uid,
+                    &opt_uids(p),
+                )?
+            };
+            uids.sort_unstable();
+            uids.dedup();
+            Ok(json!({ "uids": uids }))
+        }
+
+        // Fetch a small batch of messages and write each one's RFC822 bytes to
+        // `<dir>/<uid>.eml`. The caller packs them into the export archive and
+        // batches the UIDs, so one slow or missing message costs one batch and
+        // a whole batch never has to fit in a JSON response. UIDs the server no
+        // longer has are simply absent from `saved`.
+        "messages.saveRawBatch" => {
+            let account = req_str(p, "account")?;
+            let folder =
+                canon_folder(&req_str(p, "folder").unwrap_or_else(|_| "INBOX".to_string()));
+            let uids = opt_uids(p);
+            let dir = std::path::PathBuf::from(req_str(p, "dir")?);
+
+            let raw_messages = engine
+                .with_read_session(&account, |session| {
+                    let folder = folder.clone();
+                    let uids = uids.clone();
+                    Box::pin(async move {
+                        imap::fetch_raw_messages_for_copy(session, &folder, &uids).await
+                    })
+                })
+                .await?;
+            let mut saved = Vec::with_capacity(raw_messages.len());
+            for message in raw_messages {
+                // Only UIDs that were asked for become file names.
+                if !uids.contains(&message.uid) {
+                    continue;
+                }
+                let path = dir.join(format!("{}.eml", message.uid));
+                std::fs::write(&path, &message.raw)
+                    .with_context(|| format!("write message export {}", path.display()))?;
+                saved.push(message.uid);
+            }
+            Ok(json!({ "saved": saved }))
         }
 
         other => Err(anyhow::anyhow!("unknown method: {other}")),

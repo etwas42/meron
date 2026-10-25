@@ -5,7 +5,9 @@
 //! and wire types live here so desktop, Android, and future FFI bindings share
 //! one source of truth.
 
+pub mod avatar;
 pub mod backup;
+pub mod calendar;
 pub mod changelog;
 pub mod engine;
 pub mod ffi;
@@ -19,11 +21,13 @@ pub mod proxy;
 pub mod quote;
 pub mod reply;
 pub mod rss;
+pub mod search_query;
 pub mod secrets;
 #[cfg(target_os = "linux")]
 mod secrets_portal;
 pub mod smtp;
 pub mod store;
+pub mod tasks;
 pub mod thread_list;
 pub mod thread_read;
 pub mod tls;

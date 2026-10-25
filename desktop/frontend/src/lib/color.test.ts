@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { darken, formatColor, isValidColor, lighten, luminance, mix, parseColor, withAlpha } from './color'
+import { darken, formatColor, isValidColor, lighten, luminance, mix, parseColor, toHex, withAlpha } from './color'
 
 describe('parseColor', () => {
   it('parses the syntaxes email writes: 4-digit hex, hsl, space-separated rgb', () => {
@@ -80,6 +80,15 @@ describe('formatColor', () => {
 
   it('emits rgba for translucent colors', () => {
     expect(formatColor({ r: 30, g: 41, b: 59, a: 0.6 })).toBe('rgba(30, 41, 59, 0.6)')
+  })
+})
+
+describe('toHex', () => {
+  it('normalizes any parseable color to lowercase hex', () => {
+    expect(toHex('#ABC')).toBe('#aabbcc')
+    expect(toHex('rgb(79, 70, 229)')).toBe('#4f46e5')
+    expect(toHex('rgba(0, 0, 0, 0.5)')).toBe('#00000080')
+    expect(toHex('nope')).toBeNull()
   })
 })
 

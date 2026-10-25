@@ -1,26 +1,228 @@
 import { BUBBLE_CODE_BASE_PX, BUBBLE_HTML_BASE_PX, type MessageFrameFont } from '../../lib/fonts'
 import { QUOTE_FOLDED_CLASS, QUOTE_TOGGLE_CLASS } from './quoteFold'
-import { allowRemoteContent, blockRemoteContent } from './remoteContentCsp'
+import { allowRemoteContent, allowRemoteInCsp, blockRemoteContent, blockRemoteInCsp } from './remoteContentCsp'
 import {
+  DARKENED_ATTR,
+  FRAME_STYLE_MARKER,
   DEFAULT_BUBBLE_THEME,
   LIGHT_ON_DARK_TEXT,
   colorTone,
+  darkenedCss,
+  darkenedFloor,
+  darkensCanvas,
   disownStyleElements,
   frameCanvas,
+  frameCanvasAsync,
+  type FrameCanvas,
   frameVar,
   frameVarPrefix,
   ownStyleElement,
   declaredCanvas,
   frameCanvasBackground,
+  setDarkened,
+  setDarkenedAsync,
   type BubbleTheme,
 } from './frameTheme'
 
 /** The attribute `prepareBubbleHtml` stamps its generation on. */
 export const FRAME_GENERATION_MARKER = 'data-meron-generation'
 
+/**
+ * Hold the place of a picture that has not loaded, from its width and height
+ * attributes. Returns whether it did, so the caller can give the place back.
+ *
+ * `auto`: once the picture loads its own proportions win, so mislabelled
+ * attributes only last until then. A sender's inline ratio is preserved;
+ * browser-derived ratios still get the same explicit reservation.
+ */
+export function reserveImageBox(image: HTMLImageElement | HTMLVideoElement): boolean {
+  const width = plainLength(image.getAttribute('width'))
+  const height = plainLength(image.getAttribute('height'))
+  if (width === null || height === null) return false
+  const current = image.style.aspectRatio || image.ownerDocument.defaultView?.getComputedStyle(image).aspectRatio
+  // Browsers derive `auto w / h` from attributes; a fixed authored ratio
+  // keeps its own proportions instead of being overwritten.
+  if (current && current !== 'auto' && !/^auto\s/.test(current)) return false
+  image.style.aspectRatio = `auto ${width} / ${height}`
+  return true
+}
+
+const IMAGE_BOX_PROPERTIES = ['aspect-ratio', 'width', 'height', 'min-width', 'min-height'] as const
+const failedImageBoxes = new WeakMap<
+  HTMLImageElement,
+  {
+    attributes: Array<[string, string | null]>
+    declarations: Array<[string, string, string]>
+  }
+>()
+
+/** Release both browser-derived and explicit dimensions after a failed image. */
+export function releaseFailedImageBox(image: HTMLImageElement) {
+  if (!failedImageBoxes.has(image)) {
+    failedImageBoxes.set(image, {
+      attributes: ['width', 'height'].map((name) => [name, image.getAttribute(name)]),
+      declarations: IMAGE_BOX_PROPERTIES.map((name) => [
+        name,
+        image.style.getPropertyValue(name),
+        image.style.getPropertyPriority(name),
+      ]),
+    })
+  }
+  image.style.setProperty('aspect-ratio', 'auto', 'important')
+  image.style.setProperty('width', 'auto', 'important')
+  image.style.setProperty('height', 'auto', 'important')
+  image.style.setProperty('min-width', '0', 'important')
+  image.style.setProperty('min-height', '0', 'important')
+  image.removeAttribute('width')
+  image.removeAttribute('height')
+}
+
+/** Restore the sender's box only after an image actually arrives. */
+export function restoreImageBox(image: HTMLImageElement) {
+  const saved = failedImageBoxes.get(image)
+  if (!saved) return
+  for (const [name, value] of saved.attributes) {
+    if (value === null) image.removeAttribute(name)
+    else image.setAttribute(name, value)
+  }
+  for (const [name, value, priority] of saved.declarations) {
+    if (value) image.style.setProperty(name, value, priority)
+    else image.style.removeProperty(name)
+  }
+  failedImageBoxes.delete(image)
+}
+
+// A bare number of pixels: a percentage is not a length a box can be built from.
+function plainLength(value: string | null): number | null {
+  if (!value || !/^\d+(\.\d+)?$/.test(value.trim())) return null
+  const parsed = Number(value)
+  return parsed > 0 ? parsed : null
+}
+
+const pendingImageRetries = new WeakMap<HTMLImageElement, () => void>()
+
+/** Retry failed pictures, including pending requests that fail after recovery. */
+export function reloadFailedImages(doc: Document) {
+  for (const image of doc.querySelectorAll<HTMLImageElement>('img[src]')) {
+    if (image.complete && image.naturalWidth > 0) continue
+    // A second recovery while this request is pending still needs only one retry.
+    pendingImageRetries.get(image)?.()
+    const retry = () => {
+      cleanup()
+      if (image.naturalWidth > 0) return
+      const src = image.getAttribute('src')
+      if (!src) return
+      // An unchanged src is not a reason for the browser to load again.
+      image.removeAttribute('src')
+      image.setAttribute('src', src)
+    }
+    const cleanup = () => {
+      image.removeEventListener('error', retry)
+      image.removeEventListener('load', cleanup)
+      pendingImageRetries.delete(image)
+    }
+    if (image.complete) retry()
+    else {
+      pendingImageRetries.set(image, cleanup)
+      image.addEventListener('error', retry, { once: true })
+      image.addEventListener('load', cleanup, { once: true })
+    }
+  }
+}
+
 const DEFAULT_MESSAGE_FRAME_FONT: MessageFrameFont = {
   family: null,
   zoom: 1,
+}
+
+const SIZING_STYLE = 'height: auto !important; min-height: 0 !important'
+
+// An empty document, only so the frame's own tags can be built. A message from
+// the core is never parsed here: WebKit parses it once, as the iframe's srcdoc.
+function emptyDocument(): Document {
+  return document.implementation?.createHTMLDocument?.('') ?? new DOMParser().parseFromString('', 'text/html')
+}
+
+// The shell the core wraps every sanitized message in (`inject_head` in
+// meron-core's parse.rs). A document that opens with exactly this has its real
+// head right here, whatever the message goes on to contain — so this is where
+// the frame's CSP goes. Nothing is ever looked for inside the message: `<html>`
+// or `<head>` can be spelled in its `<style>` text or an attribute value, and a
+// CSP spliced in there is one the browser never reads.
+const CORE_SHELL_OPEN = '<!doctype html><html><head>'
+const CORE_BODY_OPEN = '</head><body>'
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+}
+
+function endOfTag(html: string, start: number): number {
+  let quote: string | null = null
+  for (let i = start; i < html.length; i++) {
+    const char = html[i]
+    if (quote) {
+      if (char === quote) quote = null
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === '>') return i + 1
+  }
+  return -1
+}
+
+function rewriteCspMetas(html: string, rewrite: (csp: string) => string): string {
+  const lower = html.toLowerCase()
+  let out = ''
+  let from = 0
+  while (from < html.length) {
+    const at = lower.indexOf('<meta', from)
+    if (at < 0) return out + html.slice(from)
+    const end = endOfTag(html, at)
+    if (end < 0) return out + html.slice(from)
+    out += html.slice(from, at) + rewriteCspMeta(html.slice(at, end), rewrite)
+    from = end
+  }
+  return out
+}
+
+function rewriteCspMeta(tag: string, rewrite: (csp: string) => string): string {
+  if (!/http-equiv\s*=\s*["']content-security-policy["']/i.test(tag)) return tag
+  return tag.replace(/content\s*=\s*(["'])([\s\S]*?)\1/i, (_full, quote: string, content: string) => {
+    return `content=${quote}${rewrite(content)}${quote}`
+  })
+}
+
+// The frame's tags spliced into a document from the core, so the iframe's parse
+// is the only one. Null for anything else, which is parsed and rebuilt instead:
+// that includes a body that mentions the frame stylesheet marker at all, since
+// only the parser can say whether the mention is an attribute or just text.
+//
+// No doctype is written back: the parsed path serialises the root element
+// alone, and a message must lay out the same whichever path prepared it.
+function assembleCoreDocument(
+  html: string,
+  csp: string,
+  style: string,
+  allowRemote: boolean,
+  generation: string,
+): string | null {
+  if (!html.startsWith(CORE_SHELL_OPEN)) return null
+  const rest = html.slice(CORE_SHELL_OPEN.length)
+  const bodyAt = rest.indexOf(CORE_BODY_OPEN)
+  if (bodyAt < 0) return null
+  // The head is the core's own: its baked CSP is the one to bring in line with
+  // the caller's decision. The frame's CSP goes ahead of it and blocks on its
+  // own, so a rewrite that misses can only keep pictures hidden.
+  const head = rewriteCspMetas(rest.slice(0, bodyAt), allowRemote ? allowRemoteInCsp : blockRemoteInCsp)
+  const body = rest.slice(bodyAt + CORE_BODY_OPEN.length)
+  if (body.toLowerCase().includes(FRAME_STYLE_MARKER)) return null
+  return (
+    `<html ${FRAME_GENERATION_MARKER}="${escapeAttr(generation)}" style="${SIZING_STYLE}">` +
+    `<head>${csp}${head}${style}</head><body style="${SIZING_STYLE}">${body}`
+  )
 }
 
 // Sanitises and styles an email's HTML body before it's rendered inside the
@@ -40,8 +242,11 @@ export function prepareBubbleHtml(
   generation = '',
 ) {
   try {
-    const parser = new DOMParser()
-    const doc = parser.parseFromString(html, 'text/html')
+    // A document from the core gets the frame's tags built on an empty document
+    // and spliced in. Parsing it here and serialising it back made WebKit parse
+    // every newsletter twice before the iframe could paint.
+    const spliced = html.startsWith(CORE_SHELL_OPEN)
+    const doc = spliced ? emptyDocument() : new DOMParser().parseFromString(html, 'text/html')
 
     // The iframe runs with `allow-scripts` (so our link-click handler fires),
     // so we must block the email's own JS here. `default-src 'none'` denies
@@ -66,23 +271,6 @@ export function prepareBubbleHtml(
       'content',
       `default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; ${media}; style-src 'unsafe-inline'; font-src * data:;`,
     )
-    doc.head.insertBefore(csp, doc.head.firstChild)
-
-    // The body arrives with the sidecar's own CSP meta, baked from the policy in
-    // force when it was read. Rewrite it in place so a decision made since then
-    // takes effect without a refetch: loosen it once the user reveals this
-    // message (or allows its sender), tighten it once that trust is withdrawn.
-    if (allowRemote) allowRemoteContent(doc)
-    else blockRemoteContent(doc)
-
-    // Anything that arrived claiming to be a frame stylesheet isn't one — the
-    // marker is also where this document's variable prefix travels.
-    disownStyleElements(doc)
-    // Which document this is. A frame is wired as soon as its srcDoc changes,
-    // while the one it replaces is still loaded, so the host checks this before
-    // it treats what it finds as the document it just asked for. Sanitising
-    // drops every `data-*` attribute, so sender markup can't carry one.
-    doc.documentElement.setAttribute(FRAME_GENERATION_MARKER, generation)
 
     const style = doc.createElement('style')
     ownStyleElement(style)
@@ -223,9 +411,14 @@ export function prepareBubbleHtml(
         cursor: pointer;
       }
       .${QUOTE_TOGGLE_CLASS}::before { content: '•••'; }
-      .${QUOTE_TOGGLE_CLASS}:hover {
+      .${QUOTE_TOGGLE_CLASS}:hover,
+      .${QUOTE_TOGGLE_CLASS}[aria-expanded="true"] {
         background: var(${v('raised-hover')}, ${DEFAULT_BUBBLE_THEME.raisedHover});
         color: var(${v('text')}, ${DEFAULT_BUBBLE_THEME.text});
+      }
+      /* Open: the chip stays lit, so it reads as the state, not a bare hover. */
+      .${QUOTE_TOGGLE_CLASS}[aria-expanded="true"] {
+        border-color: var(${v('muted')}, ${DEFAULT_BUBBLE_THEME.muted});
       }
       /* In-thread search hits, applied to the live document by BubbleHtmlFrame. */
       mark.meron-search-hit {
@@ -238,9 +431,16 @@ export function prepareBubbleHtml(
         background: #fcd34d;
         color: #000000;
       }
+      ${darkenedCss(v)}
+      /* The root above is transparent, so a darkened body's background would
+         propagate to the canvas, outside the body's filter, and stay light
+         while the text inverted to light on it. A background of the root's
+         own keeps it on the body: the surface the frame sits on, which is
+         what the body's inverted white comes out as too. */
+      html[${DARKENED_ATTR}] {
+        background: var(${v('darkened-backdrop')}, rgba(0, 0, 0, 0.004)) !important;
+      }
     `
-    doc.head.appendChild(style)
-
     // A self-sizing frame needs its document boxes to follow the message.
     // Newsletter resets commonly force both boxes to height:100%, which pins
     // them to the placeholder viewport; with overflow hidden that also hides
@@ -250,11 +450,33 @@ export function prepareBubbleHtml(
     // rules the later one wins. Inline declarations outrank every stylesheet
     // rule of the same importance, so they win wherever the reset sits — and
     // unlike an appended `<style>` they leave `:last-child` and friends alone.
-    for (const el of [doc.documentElement, doc.body]) {
+    if (spliced) {
+      const assembled = assembleCoreDocument(html, csp.outerHTML, style.outerHTML, allowRemote, generation)
+      if (assembled !== null) return assembled
+    }
+
+    const parsed = spliced ? new DOMParser().parseFromString(html, 'text/html') : doc
+    parsed.head.insertBefore(parsed.importNode(csp, true), parsed.head.firstChild)
+    // The body arrives with the sidecar's own CSP meta, baked from the policy in
+    // force when it was read. Rewrite it in place so a decision made since then
+    // takes effect without a refetch: loosen it once the user reveals this
+    // message (or allows its sender), tighten it once that trust is withdrawn.
+    if (allowRemote) allowRemoteContent(parsed)
+    else blockRemoteContent(parsed)
+    // Anything that arrived claiming to be a frame stylesheet isn't one — the
+    // marker is also where this document's variable prefix travels.
+    disownStyleElements(parsed)
+    // Which document this is. A frame is wired as soon as its srcDoc changes,
+    // while the one it replaces is still loaded, so the host checks this before
+    // it treats what it finds as the document it just asked for. Sanitising
+    // drops every `data-*` attribute, so sender markup can't carry one.
+    parsed.documentElement.setAttribute(FRAME_GENERATION_MARKER, generation)
+    parsed.head.appendChild(spliced ? parsed.importNode(style, true) : style)
+    for (const el of [parsed.documentElement, parsed.body]) {
       el.style.setProperty('height', 'auto', 'important')
       el.style.setProperty('min-height', '0', 'important')
     }
-    return doc.documentElement.outerHTML
+    return parsed.documentElement.outerHTML
   } catch {
     return html
   }
@@ -270,7 +492,7 @@ export function prepareBubbleHtml(
  * were authored for and the palette that goes with it; one that declares nothing
  * is painted in the bubble's colors, so it reads as part of the conversation.
  */
-export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
+export function applyBubbleTheme(doc: Document, theme: BubbleTheme, preparedCanvas?: FrameCanvas) {
   const style = doc.documentElement.style
   const v = (name: string) => frameVar(frameVarPrefix(doc), name)
   // A light bubble only needs a canvas when the message declared a dark one:
@@ -280,16 +502,19 @@ export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
     background: canvas,
     text: declaredText,
     framePaints,
-  } = frameCanvas(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas)
+  } = preparedCanvas ?? frameCanvas(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas)
   const palette = canvas && colorTone(canvas) !== 'dark' ? DEFAULT_BUBBLE_THEME : theme
   const text = declaredText ?? palette.text
+  const darkened = darkensCanvas(theme.appearance, theme.darkenStyled, canvas)
+  // A darkened canvas blends into the bubble, so there is no card left to inset.
+  const inset = framePaints && !darkened
 
   const vars: Array<[string, string | null]> = [
     // The canvas itself is painted on the body by `frameCanvas`; a canvas of
     // the frame's own also reads as a card, inset from the bubble's edges,
     // while the message's own design keeps its own box.
-    [v('canvas-pad'), framePaints ? '10px' : null],
-    [v('canvas-radius'), framePaints ? '8px' : null],
+    [v('canvas-pad'), inset ? '10px' : null],
+    [v('canvas-radius'), inset ? '8px' : null],
     [v('text'), text],
     [v('link'), palette.link],
     [v('surface'), palette.surface],
@@ -300,9 +525,33 @@ export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
     [v('raised-hover'), palette.raisedHover],
     [v('muted'), palette.muted],
     [v('highlight-text'), palette.highlightText],
+    [v('darkened-backdrop'), theme.darkenedBackdrop],
+    [v('darkened-floor'), darkenedFloor(theme.darkenedBackdrop)],
   ]
   for (const [name, value] of vars) {
     if (value === null) style.removeProperty(name)
     else style.setProperty(name, value)
   }
+  // The frame's root is transparent, but only while its color scheme matches
+  // the app's: under a dark app a frame left on the default light scheme gets
+  // an opaque white backdrop from the engine, and the dark palette above ends
+  // up as light text on white. Important, so a sender's `:root` can't undo it.
+  style.setProperty('color-scheme', theme.appearance, 'important')
+  if (!preparedCanvas) setDarkened(doc, darkened, darkenedFloor(theme.darkenedBackdrop))
+}
+
+/** Theme large documents in small batches before the first visible measurement. */
+export async function applyBubbleThemeAsync(doc: Document, theme: BubbleTheme, cancelled: () => boolean) {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+  if (cancelled()) return
+  const needsCanvas = theme.appearance === 'dark' || colorTone(declaredCanvas(doc).background ?? '') === 'dark'
+  const canvas = await frameCanvasAsync(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas, cancelled)
+  if (!canvas || cancelled()) return
+  applyBubbleTheme(doc, theme, canvas)
+  await setDarkenedAsync(
+    doc,
+    darkensCanvas(theme.appearance, theme.darkenStyled, canvas.background),
+    darkenedFloor(theme.darkenedBackdrop),
+    cancelled,
+  )
 }

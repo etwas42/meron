@@ -14,7 +14,8 @@ internal data class KanbanMarkReadPlan(
     val column: KanbanColumnSpec,
     val key: String,
     val unread: List<ThreadSummary>,
-    val starred: Boolean,
+    /** Marked thread by thread (the starred aggregate, a saved search), not folder-wide. */
+    val perItem: Boolean,
     val mailAccounts: List<AccountSummary>,
     val writes: Boolean,
     val unreadCountBefore: Int?,

@@ -23,18 +23,13 @@
   --color-accent-hover: var(--me-accent-hover);
   --color-accent-label: var(--me-accent-label, #ffffff);
   --color-accent-hover-label: var(--me-accent-hover-label, #ffffff);
+  /* Count badges: white numbers on the accent, darkened where it is too light
+     for them (whiteLabelAccent in lib/themes.ts). */
+  --color-accent-badge: var(--me-accent-badge, var(--me-accent));
   --color-unread-bg: color-mix(in srgb, var(--me-accent) 18%, var(--me-bg-chats));
   --color-unread-text: color-mix(in srgb, var(--me-accent) 55%, var(--me-text-primary));
-  /* The rail badge sits on the always-dark sidenav, so it cannot reuse
-     --color-unread-bg: that one is mixed into --me-bg-chats, a column surface
-     that is dark in dark themes and would leave the badge unreadable there. */
-  --color-unread-rail-bg: color-mix(in srgb, var(--me-accent) 35%, white);
-  --color-unread-rail-text: color-mix(in srgb, var(--me-accent) 25%, var(--me-bg-sidenav));
-  /* Side nav glyphs sit on the always-dark sidenav, in light themes too, so an
-     accent tinted toward white is what reads there. --me-accent-hover is not a
-     substitute: it darkens in light themes (see accentHover in lib/themes.ts).
-     Derived from --me-accent so custom themes track it with no extra plumbing. */
-  --color-accent-bright: color-mix(in srgb, var(--me-accent) 70%, white);
+  /* Glyph/divider color on the sidenav; set per theme by accentLabelVars in lib/themes.ts. */
+  --color-sidenav-ink: var(--me-sidenav-ink);
   --color-bubble-in: var(--me-bubble-in);
   --color-bubble-in-text: var(--me-bubble-in-text);
   --color-bubble-out: var(--me-bubble-out);
@@ -44,6 +39,8 @@
 
   --shadow-bubble-in: var(--me-bubble-shadow-in);
   --shadow-bubble-out: var(--me-bubble-shadow-out);
+  --shadow-float: var(--me-float-shadow);
+  --shadow-card: var(--me-card-shadow);
 
   /* Inter has no CJK glyphs, so CJK codepoints fall through to --font-cjk. That
      var is switched per active locale via :lang() below — naming the regional
@@ -80,33 +77,47 @@
   --font-cjk: 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans CJK KR', sans-serif;
 }
 
-/* These two blocks are the default "Meron Light" / "Indigo Dark" themes and the no-JS
+/* These two blocks are the default "Meron Light" / "Meron Dark" themes and the no-JS
    fallback paint. Other themes override the vars inline on <html> (see
    applyActiveTheme in states/settings.ts). Keep values in sync with the MERON_LIGHT /
-   INDIGO_DARK registries in lib/themes.ts. */
+   MERON_DARK registries in lib/themes.ts. */
 :root {
   --me-bg-app: #f0f2f1;
-  --me-bg-chat: #f8faf9;
-  --me-bg-chat-overlay: rgba(248, 250, 249, 0.94);
-  --me-bg-sidenav: #121a16;
+  --me-bg-chat: #f2f4f3;
+  --me-bg-chat-overlay: rgba(242, 244, 243, 0.94);
+  --me-bg-sidenav: #e6e9e7;
+  --me-sidenav-ink: #1b211e;
   --me-bg-chats: #ffffff;
   --me-bg-header: #ffffff;
-  --me-bg-hover: #eef1f0;
+  --me-bg-hover: rgba(27, 33, 30, 0.07);
   --me-bg-raised: #f7f9f8;
-  --me-bg-active: #e2e7e4;
-  --me-border: #e0e6e2;
+  --me-bg-active: #e1e6e3;
+  --me-border: #dde3df;
   --me-text-primary: #1b211e;
-  --me-text-secondary: #68746e;
+  --me-text-secondary: #65716b;
   --me-accent: #0e7a58;
-  --me-accent-hover: #0b6448;
+  --me-accent-hover: #006b4a;
   --me-bubble-in: #ffffff;
   --me-bubble-in-text: #1b211e;
-  --me-bubble-out: #ddeee6;
+  --me-bubble-out: #dcede5;
   --me-bubble-out-text: #14543e;
   --me-composer-bg: #ffffff;
-  --me-composer-border: #e0e6e2;
+  --me-composer-border: #dde3df;
   --me-bubble-shadow-in: 0 2px 8px -2px rgba(27, 33, 30, 0.08), 0 1px 3px -1px rgba(27, 33, 30, 0.04);
   --me-bubble-shadow-out: 0 2px 8px -2px rgba(14, 122, 88, 0.12), 0 1px 3px -1px rgba(14, 122, 88, 0.06);
+  /* A message card at rest in the list: barely there, the border does the work. */
+  --me-card-shadow:
+    0 1px 3px 0 color-mix(in srgb, var(--me-text-primary) 10%, transparent),
+    0 1px 2px -1px color-mix(in srgb, var(--me-text-primary) 10%, transparent);
+  /* What floats over the conversation (the quick reply, a pinned message
+     header). Tinted with the theme's text color, and cast upward too: that is
+     the edge messages scroll out from under the quick reply. */
+  --me-float-shadow:
+    0 4px 16px -4px color-mix(in srgb, var(--me-text-primary) 12%, transparent),
+    0 1px 3px -1px color-mix(in srgb, var(--me-text-primary) 6%, transparent),
+    0 -2px 8px -4px color-mix(in srgb, var(--me-text-primary) 6%, transparent);
+  --me-frame-shadow: 0 0 20px rgba(0, 0, 0, 0.11);
+  --me-frame-border-width: 0px;
   --me-wallpaper-overlay: color-mix(in srgb, var(--me-bg-chat) 50%, transparent);
 
   color-scheme: light;
@@ -115,28 +126,34 @@
 }
 
 .dark {
-  --me-bg-app: #090d16;
-  --me-bg-chat: #090d16;
-  --me-bg-chat-overlay: rgba(9, 13, 22, 0.95);
-  --me-bg-sidenav: #05070c;
-  --me-bg-chats: #0f172a;
-  --me-bg-header: #0f172a;
-  --me-bg-hover: rgba(30, 41, 59, 0.6);
-  --me-bg-raised: rgba(15, 23, 42, 0.4);
-  --me-bg-active: #1e293b;
-  --me-border: #1e293b;
-  --me-text-primary: #f8fafc;
-  --me-text-secondary: #94a3b8;
-  --me-accent: #7165c4;
-  --me-accent-hover: #7c70ce;
-  --me-bubble-in: #1e293b;
-  --me-bubble-in-text: #f8fafc;
-  --me-bubble-out: #312e81;
-  --me-bubble-out-text: #e0e7ff;
-  --me-composer-bg: #0f172a;
-  --me-composer-border: #1e293b;
+  --me-bg-app: #0c100e;
+  --me-bg-chat: #0d1210;
+  --me-bg-chat-overlay: rgba(13, 18, 16, 0.95);
+  --me-bg-sidenav: #060908;
+  --me-sidenav-ink: #ffffff;
+  --me-bg-chats: #151b18;
+  --me-bg-header: #151b18;
+  --me-bg-hover: rgba(242, 245, 243, 0.06);
+  --me-bg-raised: rgba(21, 27, 24, 0.4);
+  --me-bg-active: #262f2a;
+  --me-border: #29352f;
+  --me-text-primary: #f2f5f3;
+  --me-text-secondary: #98a39d;
+  --me-accent: #40a984;
+  --me-accent-hover: #4eb690;
+  --me-bubble-in: #1f2823;
+  --me-bubble-in-text: #f2f5f3;
+  --me-bubble-out: #153f33;
+  --me-bubble-out-text: #d6eee2;
+  --me-composer-bg: #151b18;
+  --me-composer-border: #29352f;
   --me-bubble-shadow-in: 0 4px 12px -3px rgba(0, 0, 0, 0.3), 0 1px 4px -2px rgba(0, 0, 0, 0.2);
   --me-bubble-shadow-out: 0 4px 12px -3px rgba(0, 0, 0, 0.4), 0 1px 4px -2px rgba(0, 0, 0, 0.3);
+  --me-card-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
+  --me-float-shadow:
+    0 6px 20px -4px rgba(0, 0, 0, 0.45), 0 1px 4px -2px rgba(0, 0, 0, 0.3), 0 -2px 8px -4px rgba(0, 0, 0, 0.3);
+  --me-frame-shadow: none;
+  --me-frame-border-width: 1px;
   --me-wallpaper-overlay: color-mix(in srgb, var(--me-bg-chat) 55%, transparent);
 
   color-scheme: dark;
@@ -147,6 +164,27 @@ body,
 #root {
   height: 100%;
   margin: 0;
+}
+
+/* A floating Linux window: the webview is transparent, so clipping the page
+   rounds the bottom corners to match the title bar's (see useAppEffects). */
+html.window-rounded {
+  clip-path: inset(0 round 0 0 8px 8px);
+}
+
+/* The integrated title bar (Linux): the window is libadwaita-shaped, 15px on
+   every corner (see decorationCss in Go). */
+html.titlebar-integrated.window-rounded {
+  clip-path: inset(0 round 15px);
+}
+
+/* The body's background would go to the canvas, which the clip doesn't reach. */
+html.window-rounded body {
+  background: transparent;
+}
+
+html.window-rounded #root {
+  background: var(--me-bg-app);
 }
 
 body {
@@ -163,6 +201,13 @@ input,
 textarea {
   font-family: inherit;
   font-feature-settings: inherit;
+  outline: none;
+}
+
+/* dnd-kit makes every sortable item a <div role="button" tabindex="0">, so a
+   click focuses it and WebKit draws its blue focus ring, ignoring the theme.
+   Drop the ring for pointer focus only; keyboard reordering still shows it. */
+[role='button']:focus:not(:focus-visible) {
   outline: none;
 }
 
@@ -305,17 +350,165 @@ textarea,
   cursor: text;
 }
 
-/* Custom Scrollbar */
-::-webkit-scrollbar {
+/* Meron's title bar (TitleBar.tsx) moves the window: Wails reads
+   --wails-draggable off the pressed element, so the buttons in it opt out. A
+   double-click runs the desktop's title bar action where it reads drag (see
+   windowChrome.ts), and must not select anything on the way; the search box
+   keeps its text selectable. */
+[data-titlebar] {
+  --wails-draggable: drag;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+[data-titlebar] :is(button, a, [role='button'], input, [data-no-drag]) {
+  --wails-draggable: no-drag;
+}
+
+[data-titlebar] input {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Windows 11's caption buttons: a subtle fill on hover (SubtleFillColor
+   Secondary/Tertiary), and the close button's red. */
+.caption-button {
+  display: inline-flex;
+  width: 46px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: 'Segoe Fluent Icons', 'Segoe MDL2 Assets';
+  font-size: 10px;
+  cursor: default;
+}
+
+.caption-button:hover {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+.caption-button:active {
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.caption-button-close:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+
+.caption-button-close:active {
+  background: color-mix(in srgb, #c42b1c 90%, transparent);
+  color: rgb(255 255 255 / 0.7);
+}
+
+.caption-button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--me-accent) 50%, transparent);
+  outline-offset: -2px;
+}
+
+/* libadwaita 1.8 default.css, windowcontrols > button and its image, but flat
+   like the title bar's other buttons (TitleBar.tsx): the ink at 60%, full on
+   hover, and the circle only under the pointer, at their 10% and 15% fills. */
+.window-control {
+  display: inline-flex;
+  padding: 5px;
+  border: 0;
+  background: none;
+  color: color-mix(in srgb, currentColor 60%, transparent);
+  cursor: default;
+  transition: color 150ms ease;
+}
+
+.window-control:hover,
+.window-control:active {
+  color: inherit;
+}
+
+.window-control-circle {
+  fill: currentColor;
+  fill-opacity: 0;
+  transition: fill-opacity 200ms cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+.window-control:hover .window-control-circle {
+  fill-opacity: 0.1;
+}
+
+.window-control:active .window-control-circle {
+  fill-opacity: 0.15;
+}
+
+.window-control:focus-visible {
+  outline: none;
+}
+
+.window-control:focus-visible svg {
+  border-radius: 9999px;
+  outline: 2px solid color-mix(in srgb, var(--me-accent) 50%, transparent);
+}
+
+/* The content beside the side navigation (App.tsx): one surface with rounded
+   corners and a soft shadow instead of a hairline edge, lifted off the frame the
+   side navigation and Meron's title bar make (<main> takes their colour behind it). Like Slack, it
+   stops 4px short of the window's right and bottom edges, so the frame shows
+   round all its corners; under the system title bar (.app-frame-detached) 4px
+   short of the top, where the native title bar already sets it apart. On a narrow window the side navigation is hidden, so
+   the surface fills the window, square. */
+.app-frame-content {
+  position: relative;
+  display: flex;
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow: hidden;
+  margin: 0 4px 4px 0;
+  background: var(--me-bg-app);
+  /* Light themes lift the surface with a shadow and no border, so the panels
+     inside meet the shadow directly; dark ones keep the hairline, as a dark shadow
+     hardly shows on the darker frame. The light shadow is wide, faint and centred,
+     like Slack's on macOS. */
+  border: var(--me-frame-border-width) solid color-mix(in srgb, var(--me-border) 70%, transparent);
+  border-radius: 12px;
+  box-shadow: var(--me-frame-shadow);
+}
+
+/* The native title bar sits outside the page, so a shadow would stop 4px above
+   the surface: keep the hairline there, in light themes too. */
+.app-frame-content.app-frame-detached {
+  margin-top: 4px;
+  border: 1px solid color-mix(in srgb, var(--me-border) 70%, transparent);
+  box-shadow: none;
+}
+
+@media (max-width: 768px) {
+  .app-frame-content {
+    margin: 0;
+    border: 0;
+    border-top: 1px solid color-mix(in srgb, var(--me-border) 70%, transparent);
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  /* The system title bar draws its own bottom edge. */
+  .app-frame-content.app-frame-detached {
+    margin: 0;
+    border-width: 0;
+  }
+}
+
+/* Custom scrollbars, except on Linux and macOS, where the webview's own overlay
+   scrollbars match the desktop (html.native-scrollbars, lib/nativeScrollbars.ts). */
+html:not(.native-scrollbars) ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 
-::-webkit-scrollbar-track {
+html:not(.native-scrollbars) ::-webkit-scrollbar-track {
   background: transparent;
 }
 
-::-webkit-scrollbar-thumb {
+html:not(.native-scrollbars) ::-webkit-scrollbar-thumb {
   background-color: rgba(100, 116, 139, 0.2);
   border: 3px solid transparent;
   background-clip: padding-box;
@@ -323,30 +516,30 @@ textarea,
   transition: background-color 0.15s ease;
 }
 
-::-webkit-scrollbar-thumb:hover {
+html:not(.native-scrollbars) ::-webkit-scrollbar-thumb:hover {
   background-color: rgba(100, 116, 139, 0.45);
   border: 2px solid transparent;
 }
 
-.dark ::-webkit-scrollbar-thumb {
+html.dark:not(.native-scrollbars) ::-webkit-scrollbar-thumb {
   background-color: rgba(255, 255, 255, 0.15);
 }
 
-.dark ::-webkit-scrollbar-thumb:hover {
+html.dark:not(.native-scrollbars) ::-webkit-scrollbar-thumb:hover {
   background-color: rgba(255, 255, 255, 0.35);
 }
 
 /* Thread lists keep symmetric padding, so the gutter is kept as narrow as the
    thumb to limit how much extra space the scrollbar adds on the right. */
-[data-thread-list]::-webkit-scrollbar {
+html:not(.native-scrollbars) [data-thread-list]::-webkit-scrollbar {
   width: 6px;
 }
 
-[data-thread-list]::-webkit-scrollbar-thumb {
+html:not(.native-scrollbars) [data-thread-list]::-webkit-scrollbar-thumb {
   border-width: 1px;
 }
 
-[data-thread-list]::-webkit-scrollbar-thumb:hover {
+html:not(.native-scrollbars) [data-thread-list]::-webkit-scrollbar-thumb:hover {
   border-width: 0;
 }
 
@@ -738,12 +931,38 @@ textarea,
   background-size: cover;
 }
 
+/* The quick-reply composer floats over the end of the list (MessagePane), which
+   pads itself by the composer's height and runs on underneath it. Paging and
+   scrolling a match or a focused link into view treat the covered part as out
+   of view. */
+.message-scroll {
+  scroll-padding-bottom: var(--me-composer-overlap, 0px);
+}
+
 .message-scroll > * {
   overflow-anchor: none;
 }
 
 .message-scroll-anchor {
   overflow-anchor: auto;
+}
+
+/* Component-layer defaults let individual overlays customize size, padding,
+   radius or color with utilities without conflicting utility classes. Keep
+   overlay surfaces static: entrance opacity/transform animations can flash in
+   the desktop webview. */
+@layer components {
+  .dialog-backdrop {
+    @apply fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-[3px] dark:bg-black/60;
+  }
+
+  .dialog-surface {
+    @apply w-full rounded-3xl border border-border bg-chats text-primary shadow-2xl outline-none;
+  }
+
+  .menu-surface {
+    @apply rounded-xl border border-border bg-chats p-1 text-primary shadow-2xl;
+  }
 }
 
 /* Custom animations */
@@ -794,6 +1013,67 @@ textarea,
   animation: slideInRight 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
+/* The conversation details panel (MessagePane). On a narrow window it
+   overlays the conversation and slides in by itself, so its frame steps aside
+   and the panel just goes when closed. On a wide window it sits beside the
+   conversation: the frame grows and narrows like the board's conversation pane
+   (animate-pane-open/-close), without the panel's own fading slide-in. */
+.details-slide {
+  display: contents;
+}
+
+@media (max-width: 1099px) {
+  .details-slide[data-pane-phase='exiting'] {
+    display: none;
+  }
+}
+
+@media (min-width: 1100px) {
+  .details-slide {
+    display: flex;
+    flex-shrink: 0;
+    width: 340px;
+    overflow: hidden;
+  }
+
+  .details-slide > aside {
+    animation: none;
+  }
+}
+
+/* The kanban conversation pane, the Tasks panel and (on a wide window) the
+   details panel grow from / collapse to zero width; their content keeps the
+   final width meanwhile (KanbanConversationPane, TasksSlide, .details-slide).
+   Each keyframe names one end only, so the other end is the pane's own width.
+   Closing only narrows: a fade would show the window's background through the
+   panel while it goes. Duration matches PANE_ANIMATION_MS. */
+@keyframes paneOpen {
+  from {
+    width: 0;
+  }
+}
+
+@keyframes paneClose {
+  to {
+    width: 0;
+  }
+}
+
+.animate-pane-open {
+  animation: paneOpen 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-pane-close {
+  animation: paneClose 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pane-open,
+  .animate-pane-close {
+    animation: none;
+  }
+}
+
 /* Tiptap rich-text body — restore formatting stripped by Tailwind preflight. */
 .tiptap-body > * + * {
   margin-top: 0.6em;
@@ -839,5 +1119,10 @@ textarea,
   color: var(--me-text-secondary);
   float: left;
   height: 0;
+  pointer-events: none;
+}
+
+/* While a pane is dragged wider or narrower (lib/paneResize). */
+.pane-resizing iframe {
   pointer-events: none;
 }

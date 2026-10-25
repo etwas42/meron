@@ -57,3 +57,79 @@ it('leaves Shift+Tab to native navigation when suggestions are open', async () =
   expect(advances).toBe(0)
   expect(view.queryByRole('list')).toBeNull()
 })
+
+it('suggests nothing until something is typed', async () => {
+  const view = render(<Field onTab={() => {}} />)
+  const input = view.getByRole('textbox') as HTMLInputElement
+  await act(async () => {
+    input.focus()
+  })
+  await settle()
+  expect(view.queryByRole('list')).toBeNull()
+  fireEvent.change(input, { target: { value: 'a' } })
+  await settle()
+  expect(view.queryByRole('list')).not.toBeNull()
+})
+
+it('reopens suggestions when focus returns to a token being typed', async () => {
+  const view = render(<Field onTab={() => {}} />)
+  const input = view.getByRole('textbox') as HTMLInputElement
+  await showSuggestions(input)
+  expect(view.queryByRole('list')).not.toBeNull()
+  await act(async () => {
+    input.blur()
+  })
+  await settle()
+  expect(view.queryByRole('list')).toBeNull()
+  await act(async () => {
+    input.focus()
+  })
+  expect(view.queryByRole('list')).not.toBeNull()
+})
+
+it('never reopens suggestions an edit has overtaken', async () => {
+  let releaseBob!: () => void
+  ;(window as any).go = {
+    main: {
+      App: {
+        Invoke: async (_command: string, payload: { query: string }) => {
+          if (payload.query.startsWith('bo')) {
+            await new Promise<void>((resolve) => {
+              releaseBob = resolve
+            })
+            return { contacts: [{ name: '', addr: 'bob@example.com' }] }
+          }
+          return { contacts: [{ name: '', addr: 'alice@example.com' }] }
+        },
+      },
+    },
+  }
+  const view = render(<Field onTab={() => {}} />)
+  const input = view.getByRole('textbox') as HTMLInputElement
+  await showSuggestions(input)
+  expect(view.getByRole('list').textContent).toContain('alice@example.com')
+
+  // Replace the token, then leave before the new lookup returns.
+  fireEvent.change(input, { target: { value: 'bo' } })
+  await act(async () => {
+    input.blur()
+  })
+  await settle()
+  await act(async () => {
+    input.focus()
+  })
+  expect(view.queryByRole('list')).toBeNull()
+
+  // Once the lookup for the current token lands, focus brings that back.
+  await act(async () => {
+    input.blur()
+  })
+  await act(async () => {
+    releaseBob()
+  })
+  await settle()
+  await act(async () => {
+    input.focus()
+  })
+  expect(view.getByRole('list').textContent).toContain('bob@example.com')
+})

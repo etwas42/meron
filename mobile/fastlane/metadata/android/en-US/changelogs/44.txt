@@ -1,0 +1,5 @@
+- Add a local calendar of events, accepted invitations, and due tasks
+- Show calendar invite cards with Accept, Maybe, and Decline actions
+- Add Gmail-style search options form and save searches as kanban columns
+- Add recent destination shortcuts and cross-account support for move and copy
+- Tint the mail list top bar when scrolled

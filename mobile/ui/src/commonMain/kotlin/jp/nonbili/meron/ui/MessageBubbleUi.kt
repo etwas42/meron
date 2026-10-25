@@ -14,39 +14,66 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Forward
+import androidx.compose.material.icons.automirrored.filled.ReplyAll
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.HideImage
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.MarkEmailRead
+import androidx.compose.material.icons.filled.MarkEmailUnread
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.IntrinsicMeasurable
+import androidx.compose.ui.layout.IntrinsicMeasureScope
+import androidx.compose.ui.layout.LayoutModifier
+import androidx.compose.ui.layout.Measurable
+import androidx.compose.ui.layout.MeasureResult
+import androidx.compose.ui.layout.MeasureScope
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,6 +87,8 @@ import jp.nonbili.meron.shared.htmlHasRemoteMedia
 import jp.nonbili.meron.shared.mailBodyCsp
 import jp.nonbili.meron.shared.standaloneAttachments
 import jp.nonbili.meron.shared.visibleImageAttachments
+import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlin.random.Random
 
 /** Bubble inner padding; capped bodies offset their scrollbar back over it. */
@@ -71,6 +100,82 @@ private val BubbleHorizontalPadding = 14.dp
  *  to hold the body off the rounded corners. The chrome around the body pads
  *  back up to [BubbleHorizontalPadding] so it still lines up bubble to bubble. */
 private val HtmlBubbleHorizontalPadding = 6.dp
+
+/** How long a bubble stays invisible waiting for its web view to report a width
+ *  before it shows at full width anyway (a page whose script never runs). */
+private const val NATURAL_WIDTH_WAIT_MS = 1000L
+
+/** What each HTML body last reported as the width it needs, so a bubble scrolled
+ *  back into the list takes its width on the first frame instead of flashing at
+ *  full width. [Dp.Unspecified] is not stored: it means not measured yet. */
+private val htmlNaturalWidths = HashMap<String, Dp>()
+
+/** Wide screens cap every bubble here so lines stay readable. */
+private val MaxBubbleWidth = 560.dp
+
+/** Leaves something out of its parent's intrinsic width, so a hugging bubble
+ *  sizes to its text rather than to, say, a photo's pixel width. */
+private object NoIntrinsicWidth : LayoutModifier {
+    override fun MeasureScope.measure(
+        measurable: Measurable,
+        constraints: Constraints,
+    ): MeasureResult {
+        val placeable = measurable.measure(constraints)
+        return layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+    }
+
+    override fun IntrinsicMeasureScope.minIntrinsicWidth(
+        measurable: IntrinsicMeasurable,
+        height: Int,
+    ): Int = 0
+
+    override fun IntrinsicMeasureScope.maxIntrinsicWidth(
+        measurable: IntrinsicMeasurable,
+        height: Int,
+    ): Int = 0
+}
+
+/** Sizes a bubble to [fraction] of the available width, capped at [MaxBubbleWidth].
+ *  Narrower when it can hug its content: [hugIntrinsic] takes the content's own
+ *  widest line (plain text, which Compose can measure), widened to fit
+ *  [imageColumns] grid tiles at the size a full-width bubble gives them; a
+ *  measured HTML [natural] width takes that plus [chrome], widened to whatever
+ *  the header and the rest of the bubble need (the web view counts for nothing
+ *  there). A [natural] of zero or less means the HTML body fills the bubble. */
+private fun Modifier.bubbleWidth(
+    fraction: Float,
+    natural: Dp = 0.dp,
+    chrome: Dp = 0.dp,
+    hugIntrinsic: Boolean = false,
+    imageColumns: Int = 0,
+): Modifier =
+    layout { measurable, constraints ->
+        val cap = minOf((constraints.maxWidth * fraction).roundToInt(), MaxBubbleWidth.roundToPx())
+        val width =
+            when {
+                hugIntrinsic -> {
+                    val grid =
+                        if (imageColumns > 0) {
+                            val gap = AttachmentImageGridGap.roundToPx()
+                            val tile = (cap - chrome.roundToPx() - 2 * gap) / 3
+                            imageColumns * tile + (imageColumns - 1) * gap + chrome.roundToPx()
+                        } else {
+                            0
+                        }
+                    maxOf(measurable.maxIntrinsicWidth(constraints.maxHeight), grid).coerceAtMost(cap)
+                }
+
+                natural > 0.dp -> {
+                    maxOf((natural + chrome).roundToPx(), measurable.maxIntrinsicWidth(constraints.maxHeight)).coerceAtMost(cap)
+                }
+
+                else -> {
+                    cap
+                }
+            }
+        val placeable = measurable.measure(constraints.copy(minWidth = width, maxWidth = width))
+        layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+    }
 
 /** True when the bubble shows the sender's HTML rather than plain text: the
  *  search highlighter works on the plain body, so an open search turns it off. */
@@ -113,6 +218,9 @@ internal fun MessageBubble(
     onOpenMessage: (MessageBody) -> Unit,
     onOpenUrl: (String) -> Unit,
     onRetryLoad: () -> Unit,
+    onRespondToInvite: (MessageBody, String) -> Unit = { _, _ -> },
+    onRemoveInviteEvent: (MessageBody) -> Unit = {},
+    onAddInviteToCalendar: (MessageBody) -> Unit = {},
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     var addressesOpen by remember(message.id) { mutableStateOf(false) }
@@ -122,11 +230,48 @@ internal fun MessageBubble(
         } else {
             RoundedCornerShape(topStart = 4.dp, topEnd = 16.dp, bottomEnd = 16.dp, bottomStart = 16.dp)
         }
-    val bubbleColor = if (outgoing) chat.bubbleOut else chat.bubbleIn
+    val themedBubbleColor = if (outgoing) chat.bubbleOut else chat.bubbleIn
     val textColor = if (outgoing) chat.bubbleOutText else chat.bubbleInText
-    val bodyMaxHeight = 360.dp
+    // Capped, a long body scrolls inside its bubble; uncapped (the full
+    // messages setting), it grows to fit and only the conversation scrolls.
+    val bodyMaxHeight = if (LocalChatFullMessages.current) Dp.Unspecified else 360.dp
     val htmlBody = usesHtmlBody(message, preferHtml, searchQuery)
+    // The web view paints the mail on white, so a tinted light bubble (Material
+    // You) would frame it as a square white box inside a rounded card. Let the
+    // whole bubble be white instead, so the header and body read as one card.
+    val bubbleColor =
+        if (htmlBody && !LocalDarkMailBodies.current && themedBubbleColor.luminance() > 0.5f) {
+            Color.White
+        } else {
+            themedBubbleColor
+        }
     val bubblePadding = if (htmlBody) HtmlBubbleHorizontalPadding else BubbleHorizontalPadding
+    // Attached pictures lay out against the bubble's width outside the web view,
+    // so a bubble carrying them keeps its full width whatever its text needs.
+    val hasImages = standaloneAttachments(message).any { it.mimeType.startsWith("image/") }
+    val hugsText = htmlBody && !hasImages
+    // A plain-text bubble shrinks to its images as well: one or two take only the
+    // columns they fill. Counted the way the body decides what it shows.
+    val visibleImageCount =
+        if (htmlBody) {
+            0
+        } else {
+            visibleImageAttachments(
+                standaloneAttachments(message).filter { it.mimeType.startsWith("image/") },
+                remoteContent.allowRemote,
+            ).size
+        }
+    val naturalWidthKey = "${message.id}:${message.bodyHtml.hashCode()}:${LocalDensity.current.fontScale}"
+    var naturalWidth by remember(naturalWidthKey) { mutableStateOf(htmlNaturalWidths[naturalWidthKey] ?: Dp.Unspecified) }
+    // An unmeasured body is laid out at full width but not painted: showing it
+    // would flash it wide before it shrinks to its text.
+    val widthPending = hugsText && naturalWidth == Dp.Unspecified
+    LaunchedEffect(widthPending) {
+        if (widthPending) {
+            delay(NATURAL_WIDTH_WAIT_MS)
+            if (naturalWidth == Dp.Unspecified) naturalWidth = 0.dp
+        }
+    }
     // What the chrome around an HTML body adds back to sit where it always does.
     val chromeInset = BubbleHorizontalPadding - bubblePadding
     Row(
@@ -139,8 +284,14 @@ internal fun MessageBubble(
                 // grows on tablets, capped so it stays readable on wide screens.
                 // HTML mail is laid out for a wider page than a phone bubble, so
                 // it gets the extra tenth (desktop widens its HTML bubbles too).
-                .fillMaxWidth(if (htmlBody) 0.95f else 0.85f)
-                .widthIn(max = 560.dp)
+                .bubbleWidth(
+                    fraction = if (htmlBody) 0.95f else 0.85f,
+                    natural = if (hugsText && naturalWidth != Dp.Unspecified) naturalWidth else 0.dp,
+                    // A dp of slack so a line measured at max-content never wraps on rounding.
+                    chrome = bubblePadding * 2 + 1.dp,
+                    hugIntrinsic = !htmlBody,
+                    imageColumns = minOf(visibleImageCount, 3),
+                ).alpha(if (widthPending) 0f else 1f)
                 .shadow(3.dp, bubbleShape, clip = false)
                 .clip(bubbleShape)
                 .then(
@@ -290,6 +441,7 @@ internal fun MessageBubble(
                     onToggleStarred = onToggleStarred,
                     onDelete = onDelete,
                     onCopyMessageText = onCopyMessageText,
+                    onOpenUrl = onOpenUrl,
                 )
             }
             if (addressesOpen) {
@@ -310,6 +462,7 @@ internal fun MessageBubble(
                 showSubject = showSubject,
                 bodyMaxHeight = bodyMaxHeight,
                 chromeInset = chromeInset,
+                surface = bubbleColor,
                 remoteContent = remoteContent,
                 onOpenAttachment = onOpenAttachment,
                 onSaveAttachment = onSaveAttachment,
@@ -318,13 +471,25 @@ internal fun MessageBubble(
                 onOpenHtmlImage = onOpenHtmlImage,
                 onOpenUrl = onOpenUrl,
                 onRetryLoad = onRetryLoad,
+                onRespondToInvite = { response -> onRespondToInvite(message, response) },
+                onRemoveInviteEvent = { onRemoveInviteEvent(message) },
+                onAddInviteToCalendar = { onAddInviteToCalendar(message) },
+                imageColumns = if (htmlBody) 3 else visibleImageCount.coerceIn(1, 3),
+                onHtmlNaturalWidth =
+                    if (hugsText) {
+                        { width ->
+                            naturalWidth = width.coerceAtLeast(0.dp)
+                            htmlNaturalWidths[naturalWidthKey] = naturalWidth
+                        }
+                    } else {
+                        null
+                    },
             )
         }
     }
 }
 
-/** The overflow menu shared by both conversation layouts: copy actions plus the
- *  per-message read/star and mail actions the caller enables. */
+/** The overflow button shared by both conversation layouts, opening [MessageActionsMenu]. */
 @Composable
 internal fun MessageActionsButton(
     preferHtml: Boolean,
@@ -342,14 +507,10 @@ internal fun MessageActionsButton(
     onToggleStarred: (MessageBody) -> Unit,
     onDelete: (MessageBody) -> Unit,
     onCopyMessageText: (String, String) -> Unit,
+    onOpenUrl: (String) -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     Box {
-        val printMessage = rememberPrintMessage(preferHtml, allowRemote)
-        val messageTextLabel = tr("chat.messageText")
-        val subjectLabel = tr("composer.fields.subject")
-        val messageIdLabel = tr("chat.messageId")
-        val noSubjectLabel = tr("threads.noSubject")
         IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(24.dp)) {
             Icon(
                 Icons.Filled.MoreVert,
@@ -358,102 +519,139 @@ internal fun MessageActionsButton(
                 tint = tint,
             )
         }
-        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-            if (!isRss) {
-                DropdownMenuItem(
-                    text = { Text(tr("chat.actions.print")) },
-                    enabled = !message.bodyMissing,
-                    onClick = {
-                        menuOpen = false
-                        printMessage(message)
-                    },
-                )
+        MessageActionsMenu(
+            expanded = menuOpen,
+            onDismiss = { menuOpen = false },
+            preferHtml = preferHtml,
+            allowRemote = allowRemote,
+            message = message,
+            isRss = isRss,
+            actionsEnabled = actionsEnabled,
+            onForward = onForward,
+            onReplyAllToMessage = onReplyAllToMessage,
+            canReplyAllToMessage = canReplyAllToMessage,
+            onEditAsNew = onEditAsNew,
+            onToggleRead = if (itemActionsEnabled) onToggleRead else null,
+            onToggleStarred = if (itemActionsEnabled) onToggleStarred else null,
+            onDelete = onDelete,
+            onCopyMessageText = onCopyMessageText,
+            onOpenUrl = onOpenUrl,
+        )
+    }
+}
+
+/** A message's actions menu, shared by the conversation layouts and the reader:
+ *  copy actions plus the read/star and mail actions the caller enables. */
+@Composable
+internal fun MessageActionsMenu(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    preferHtml: Boolean,
+    allowRemote: Boolean,
+    message: MessageBody,
+    isRss: Boolean,
+    actionsEnabled: Boolean,
+    onForward: (MessageBody) -> Unit,
+    onReplyAllToMessage: (MessageBody) -> Unit,
+    canReplyAllToMessage: (MessageBody) -> Boolean,
+    onEditAsNew: (MessageBody) -> Unit,
+    // Null where the message can't be marked from here (the reader).
+    onToggleRead: ((MessageBody) -> Unit)?,
+    onToggleStarred: ((MessageBody) -> Unit)?,
+    onDelete: (MessageBody) -> Unit,
+    onCopyMessageText: (String, String) -> Unit,
+    onOpenUrl: (String) -> Unit,
+    // Reply all, forward and delete sit in the reader's bottom bar instead.
+    mailActionsInBar: Boolean = false,
+) {
+    val printMessage = rememberPrintMessage(preferHtml, allowRemote)
+    val messageTextLabel = tr("chat.messageText")
+    val subjectLabel = tr("composer.fields.subject")
+    val messageIdLabel = tr("chat.messageId")
+    val noSubjectLabel = tr("threads.noSubject")
+    val linkLabel = tr("composer.toolbar.link")
+
+    @Composable
+    fun Item(
+        label: String,
+        icon: ImageVector,
+        enabled: Boolean = true,
+        danger: Boolean = false,
+        onClick: () -> Unit,
+    ) {
+        val error = MaterialTheme.colorScheme.error
+        DropdownMenuItem(
+            text = { Text(label, color = if (danger) error else Color.Unspecified) },
+            leadingIcon = { Icon(icon, contentDescription = null, tint = if (danger) error else LocalContentColor.current) },
+            enabled = enabled,
+            onClick = {
+                onDismiss()
+                onClick()
+            },
+        )
+    }
+
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        if (!isRss) {
+            Item(tr("chat.actions.print"), Icons.Filled.Print, enabled = !message.bodyMissing) {
+                printMessage(message)
             }
-            DropdownMenuItem(
-                text = { Text(tr("chat.copyMessageText")) },
-                onClick = {
-                    menuOpen = false
-                    onCopyMessageText(messageTextLabel, messagePlainText(message))
-                },
-            )
-            DropdownMenuItem(
-                text = { Text(tr("chat.copySubject")) },
-                onClick = {
-                    menuOpen = false
-                    onCopyMessageText(subjectLabel, message.subject.ifBlank { noSubjectLabel })
-                },
-            )
-            if (message.messageId.isNotBlank()) {
-                DropdownMenuItem(
-                    text = { Text(tr("chat.copyMessageId")) },
-                    onClick = {
-                        menuOpen = false
-                        onCopyMessageText(messageIdLabel, message.messageId)
-                    },
-                )
+        }
+        if (isRss && message.link.isNotBlank()) {
+            Item(tr("chat.actions.openLink"), Icons.Filled.Public) { onOpenUrl(message.link) }
+            Item(tr("chat.actions.copyLinkAddress"), Icons.Filled.Link) {
+                onCopyMessageText(linkLabel, message.link)
             }
-            if (itemActionsEnabled) {
-                DropdownMenuItem(
-                    text = { Text(if (message.unread) tr("threads.actions.markAsRead") else tr("threads.actions.markAsUnread")) },
-                    onClick = {
-                        menuOpen = false
-                        onToggleRead(message)
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text(if (message.starred) tr("chat.unstar") else tr("chat.star")) },
-                    onClick = {
-                        menuOpen = false
-                        onToggleStarred(message)
-                    },
-                )
+        }
+        Item(tr("chat.copyMessageText"), Icons.Filled.ContentCopy) {
+            onCopyMessageText(messageTextLabel, messagePlainText(message))
+        }
+        Item(tr("chat.copySubject"), Icons.Filled.ContentCopy) {
+            onCopyMessageText(subjectLabel, message.subject.ifBlank { noSubjectLabel })
+        }
+        if (message.messageId.isNotBlank()) {
+            Item(tr("chat.copyMessageId"), Icons.Filled.ContentCopy) {
+                onCopyMessageText(messageIdLabel, message.messageId)
             }
-            if (actionsEnabled) {
-                // A draft has no sender to reply to: replying to one would
-                // thread a new "Re:" under an unsent message instead of
-                // opening it to edit. A message with no other recipients has
-                // nobody for reply-all to add, which makes it the reply the
-                // bar already sends.
-                if (!folderIsDrafts(message.folderId) && canReplyAllToMessage(message)) {
-                    DropdownMenuItem(
-                        text = { Text(tr("chat.actions.replyAll")) },
-                        onClick = {
-                            menuOpen = false
-                            onReplyAllToMessage(message)
-                        },
-                    )
-                }
-                DropdownMenuItem(
-                    text = { Text(tr("chat.actions.forward")) },
-                    onClick = {
-                        menuOpen = false
-                        onForward(message)
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text(tr("chat.actions.editAsNewMessage")) },
-                    onClick = {
-                        menuOpen = false
-                        onEditAsNew(message)
-                    },
-                )
-                DropdownMenuItem(
-                    text = { Text(tr("chat.actions.deleteMessage"), color = MaterialTheme.colorScheme.error) },
-                    onClick = {
-                        menuOpen = false
-                        onDelete(message)
-                    },
-                )
+        }
+        if (onToggleRead != null) {
+            Item(
+                if (message.unread) tr("threads.actions.markAsRead") else tr("threads.actions.markAsUnread"),
+                if (message.unread) Icons.Filled.MarkEmailRead else Icons.Filled.MarkEmailUnread,
+            ) { onToggleRead(message) }
+        }
+        if (onToggleStarred != null) {
+            Item(
+                if (message.starred) tr("chat.unstar") else tr("chat.star"),
+                if (message.starred) Icons.Filled.StarBorder else Icons.Filled.Star,
+            ) { onToggleStarred(message) }
+        }
+        if (actionsEnabled) {
+            // A draft has no sender to reply to: replying to one would
+            // thread a new "Re:" under an unsent message instead of
+            // opening it to edit. A message with no other recipients has
+            // nobody for reply-all to add, which makes it the reply the
+            // bar already sends.
+            if (!mailActionsInBar && !folderIsDrafts(message.folderId) && canReplyAllToMessage(message)) {
+                Item(tr("chat.actions.replyAll"), Icons.AutoMirrored.Filled.ReplyAll) { onReplyAllToMessage(message) }
+            }
+            if (!mailActionsInBar) {
+                Item(tr("chat.actions.forward"), Icons.AutoMirrored.Filled.Forward) { onForward(message) }
+            }
+            Item(tr("chat.actions.editAsNewMessage"), Icons.Filled.EditNote) { onEditAsNew(message) }
+            if (!mailActionsInBar) {
+                Item(tr("chat.actions.deleteMessage"), Icons.Filled.Delete, danger = true) { onDelete(message) }
             }
         }
     }
 }
 
 /**
- * Everything below a message's header: the optional subject, the body (HTML or
- * plain), standalone attachments, and the send-status line. MessageBubble (chat)
- * and MessageRow (traditional) each wrap it in their own chrome, so the two
- * layouts differ only in the frame around this.
+ * Everything below a message's header: the optional subject, a calendar
+ * invitation's card, the body (HTML or plain), standalone attachments, and the
+ * send-status line. MessageBubble (chat) and MessageRow (traditional) each wrap
+ * it in their own chrome, so the two layouts differ only in the frame around
+ * this.
  */
 @Composable
 internal fun ColumnScope.MessageBodyContent(
@@ -468,6 +666,8 @@ internal fun ColumnScope.MessageBodyContent(
     // its own padding for HTML mail (see [HtmlBubbleHorizontalPadding]) and pads
     // the rest of the message back to where it sits in every other bubble.
     chromeInset: Dp = 0.dp,
+    // The bubble or row this sits in: what a darkened HTML body blends onto.
+    surface: Color,
     // Whether this message's remote content may load, and the two ways the
     // reader can change that (see [MessageRemoteContent]).
     remoteContent: MessageRemoteContent,
@@ -478,6 +678,18 @@ internal fun ColumnScope.MessageBodyContent(
     onOpenHtmlImage: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
     onRetryLoad: () -> Unit,
+    // Accept / Maybe / Decline on an invitation's card, with the response.
+    onRespondToInvite: (String) -> Unit = {},
+    // A cancelled invitation's "Remove from calendar".
+    onRemoveInviteEvent: () -> Unit = {},
+    // An answered invitation's "Add to calendar", once its event is gone.
+    onAddInviteToCalendar: () -> Unit = {},
+    // HTML body only: the width a plain-text-like document needs (zero when it
+    // should fill the bubble). Null where the caller doesn't size to the body.
+    onHtmlNaturalWidth: ((Dp) -> Unit)? = null,
+    // How many columns the image grid lays out; the bubble passes fewer for one
+    // or two images, and sizes itself to them (see bubbleWidth).
+    imageColumns: Int = 3,
 ) {
     if (showSubject && message.subject.isNotBlank()) {
         Text(
@@ -489,33 +701,56 @@ internal fun ColumnScope.MessageBodyContent(
             fontWeight = FontWeight.SemiBold,
         )
     }
+    message.invite?.let { invite ->
+        InviteCard(
+            invite = invite,
+            outgoing = message.outgoing,
+            textColor = textColor,
+            onRespond = onRespondToInvite,
+            onRemoveFromCalendar = onRemoveInviteEvent,
+            onAddToCalendar = onAddInviteToCalendar,
+            modifier = Modifier.padding(horizontal = chromeInset).padding(bottom = 6.dp),
+        )
+    }
     val htmlBody = usesHtmlBody(message, preferHtml, searchQuery)
     val standaloneAttachmentsForMessage = standaloneAttachments(message)
     val (imageAttachments, otherAttachments) =
         standaloneAttachmentsForMessage.partition { it.mimeType.startsWith("image/") }
     val visibleImages = visibleImageAttachments(imageAttachments, remoteContent.allowRemote)
     if (htmlBody) {
-        HtmlMessageBody(
-            html = message.bodyHtml,
-            quoteKey = message.id,
-            allowRemote = remoteContent.allowRemote,
-            maxHeight = bodyMaxHeight,
-            onOpenUrl = onOpenUrl,
-            onOpenImage = onOpenHtmlImage,
-        )
+        // The document reports the width it needs instead (see bubbleWidth); the
+        // bubble's intrinsic width is left to the header and what else it holds.
+        Box(Modifier.then(NoIntrinsicWidth)) {
+            HtmlMessageBody(
+                html = message.bodyHtml,
+                mediaMissing = message.mediaMissing,
+                quoteKey = message.id,
+                allowRemote = remoteContent.allowRemote,
+                maxHeight = bodyMaxHeight,
+                onOpenUrl = onOpenUrl,
+                onOpenImage = onOpenHtmlImage,
+                // Opt-in (the auto-fit setting): a bubble fitting a 640px mail
+                // renders it at about half size.
+                fitWideContent = LocalAutoFitMessages.current,
+                onNaturalWidth = onHtmlNaturalWidth ?: {},
+                darkSurface = surface,
+            )
+        }
     } else if (message.bodyMissing) {
-        // The core has no cached body (the on-demand fetch failed) — a
-        // different state from a genuinely empty message, so offer a retry
-        // instead of "(no content)".
+        // The core has no cached body — a different state from a genuinely
+        // empty message, so not "(no content)". Still downloading in the
+        // background, it arrives by itself; only a failed fetch offers a retry.
         Column(Modifier.padding(horizontal = chromeInset)) {
             Text(
-                tr("chat.messageLoadFailed"),
+                tr(if (message.bodyLoading) "common.loading" else "chat.messageLoadFailed"),
                 color = textColor.copy(alpha = 0.6f),
                 fontSize = 15.5.sp,
                 lineHeight = 21.sp,
             )
-            TextButton(onClick = onRetryLoad, modifier = Modifier.align(Alignment.End)) {
-                Text(tr("chat.retry"))
+            if (!message.bodyLoading) {
+                TextButton(onClick = onRetryLoad, modifier = Modifier.align(Alignment.End)) {
+                    Text(tr("chat.retry"))
+                }
             }
         }
     } else {
@@ -566,10 +801,10 @@ internal fun ColumnScope.MessageBodyContent(
             }
         }
         if (bodyMaxHeight == Dp.Unspecified) {
-            // Uncapped (the traditional layout): the message is as tall as it
-            // needs to be and the conversation list scrolls it. A nested
-            // scroller here would be measured with an infinite height by the
-            // lazy list and throw.
+            // Uncapped (the traditional layout, or full chat messages): the
+            // message is as tall as it needs to be and the conversation list
+            // scrolls it. A nested scroller here would be measured with an
+            // infinite height by the lazy list and throw.
             Box(Modifier.padding(horizontal = chromeInset)) { bodyText() }
         } else {
             val bodyScrollState = rememberScrollState()
@@ -596,8 +831,13 @@ internal fun ColumnScope.MessageBodyContent(
             if (visibleImages.isNotEmpty()) {
                 AttachmentImageGrid(
                     images = visibleImages,
+                    mediaMissing = message.mediaMissing,
                     loadImageAttachment = loadImageAttachment,
                     onOpen = onOpenImageAttachment,
+                    columns = imageColumns,
+                    // The tiles take the width they are given, and a picture's
+                    // own size would otherwise count as the bubble's content.
+                    modifier = Modifier.then(NoIntrinsicWidth),
                 )
             }
             otherAttachments.forEach { attachment ->
@@ -616,7 +856,7 @@ internal fun ColumnScope.MessageBodyContent(
     when (message.sendStatus) {
         SendStatus.Sending -> {
             Text(
-                "Sending…",
+                tr("composer.status.sending"),
                 modifier = Modifier.align(Alignment.End).padding(horizontal = chromeInset),
                 fontSize = 10.5.sp,
                 color = textColor.copy(alpha = 0.55f),
@@ -625,7 +865,7 @@ internal fun ColumnScope.MessageBodyContent(
 
         SendStatus.Failed -> {
             Text(
-                "Failed to send",
+                tr("mobile.status.failedToSend"),
                 modifier = Modifier.align(Alignment.End).padding(horizontal = chromeInset),
                 fontSize = 10.5.sp,
                 color = MaterialTheme.colorScheme.error,
@@ -740,6 +980,27 @@ internal fun clampMailBodyHeight(reported: Dp): Dp = reported.coerceIn(0.dp, Mai
  *  the mail rendered beside it, which never sees this process. */
 private fun randomScriptNonce(): String = buildString { repeat(4) { append(Random.nextInt(1, Int.MAX_VALUE).toString(36)) } }
 
+/** `hue-rotate(180deg)` as the matrix the engine applies, row by row. */
+private val HUE_TURN =
+    listOf(
+        floatArrayOf(-0.574f, 1.43f, 0.144f),
+        floatArrayOf(0.426f, 0.43f, 0.144f),
+        floatArrayOf(0.426f, 1.43f, -0.856f),
+    )
+
+/**
+ * The color a darkened body has to be painted with to come out as [surface]:
+ * the darkening filter run backwards, like desktop's darkenedFloor. The filter
+ * can't reach every color — a very saturated surface falls outside what it
+ * produces — and then this is the nearest it gets to, a shade duller than the
+ * surface itself.
+ */
+internal fun darkenedFloor(surface: Color): Color {
+    val channels = floatArrayOf(surface.red, surface.green, surface.blue)
+    val (r, g, b) = HUE_TURN.map { row -> (1f - (row[0] * channels[0] + row[1] * channels[1] + row[2] * channels[2])).coerceIn(0f, 1f) }
+    return Color(r, g, b)
+}
+
 @Composable
 internal fun HtmlMessageBody(
     html: String,
@@ -755,12 +1016,21 @@ internal fun HtmlMessageBody(
     onOpenUrl: (String) -> Unit,
     onOpenImage: (String) -> Unit = {},
     fitWideContent: Boolean = false,
+    onNaturalWidth: (Dp) -> Unit = {},
+    mediaMissing: Int = 0,
+    // What a darkened body turns its white into: the bubble, row or card the
+    // view sits on. Inverted white is black, which caps nothing.
+    darkSurface: Color = Color.Black,
 ) {
     // The WebView can't tell Compose how tall its content is, so a tiny script
     // reports document height through a platform bridge and we size the view to
     // it. The bubble caps the height (desktop uses 360px) and the WebView scrolls
     // past that; the full-screen reader passes no cap and shows the whole email.
-    var contentHeight by remember(html) { mutableStateOf(0.dp) }
+    // Saveable so a message the conversation list scrolled out and back in
+    // returns at its measured height: its web view is a fresh one, and growing
+    // from the placeholder while on screen would move the list under the reader.
+    var contentHeightDp by rememberSaveable(html) { mutableFloatStateOf(0f) }
+    val contentHeight = contentHeightDp.dp
     // A WebView reaches neither the app's text sizes nor the system font-size
     // setting, so the reading typography is baked into the stylesheet below.
     // Sizing the text rather than zooming the page is what the overrides here
@@ -772,14 +1042,42 @@ internal fun HtmlMessageBody(
     // fold it in here so an HTML mail and a text one stay the same size.
     val systemFontScale = if (MailWebViewFollowsSystemFontScale) 1f else LocalDensity.current.fontScale
     val bodyFontSize = scaledCssPx(MESSAGE_HTML_BASE_PX * systemFontScale, LocalMessageFontScale.current)
+    // The script's overflow floor (see contentHeight in the script), saved with
+    // the height it produced, along with what laid it out: the typography and
+    // fitting here, and the width, which only the document knows and checks
+    // itself. A floor from another layout would hold text that now runs
+    // shorter at its old height, so it is handed back only to the same one.
+    // Read once into the document: a later report must not rebuild the page
+    // it came from.
+    val overflowLayout = "$bodyFontSize|${LocalDensity.current.fontScale}|$fitWideContent"
+    var savedOverflowLayout by rememberSaveable(html) { mutableStateOf("") }
+    var savedOverflowExtent by rememberSaveable(html) { mutableIntStateOf(0) }
+    var savedOverflowWidth by rememberSaveable(html) { mutableIntStateOf(0) }
+    val initialOverflow =
+        remember(html, overflowLayout) {
+            if (savedOverflowLayout == overflowLayout) savedOverflowExtent to savedOverflowWidth else 0 to 0
+        }
     // A fresh nonce per document admits the measurement script below and nothing
     // else: the mail is spliced into this page, so a script of its own that
     // survived the core's sanitiser would still have no way to name the token.
     val scriptNonce = remember(html, allowRemote) { randomScriptNonce() }
     val showQuotedLabel = tr("chat.showQuotedText")
     val hideQuotedLabel = tr("chat.hideQuotedText")
+    val darkBody = LocalDarkMailBodies.current
     val mobileHtml =
-        remember(html, quoteKey, allowRemote, scriptNonce, fitWideContent, bodyFontSize, showQuotedLabel, hideQuotedLabel) {
+        remember(
+            html,
+            quoteKey,
+            allowRemote,
+            scriptNonce,
+            fitWideContent,
+            darkBody,
+            darkSurface,
+            bodyFontSize,
+            showQuotedLabel,
+            hideQuotedLabel,
+            initialOverflow,
+        ) {
             val body = applyRemoteContentPolicy(html, allowRemote)
             // The state the reader left the quote in, read once per document:
             // toggles inside the page don't rebuild (and so reload) it, they
@@ -788,6 +1086,19 @@ internal fun HtmlMessageBody(
             // the body parses, and the script below only places the toggle.
             val quoteOpen = QuoteFoldMemory.isOpen(quoteKey)
             val quoteClass = if (html.contains(HTML_QUOTE_ATTR) && !quoteOpen) "meron-quote-folded" else ""
+            val rootClass = listOfNotNull(quoteClass.ifEmpty { null }, "meron-dark".takeIf { darkBody }).joinToString(" ")
+            // Inline for the same reason as the height override below: a
+            // sender's `html { background }` would otherwise sit, undarkened,
+            // behind the inverted body. Not left transparent: a body
+            // background under a transparent root propagates to the canvas,
+            // outside the body's filter, so a mail declaring a white body
+            // stayed white while its text inverted to white on it. The root
+            // paints the surface the view sits on, which is what the body's
+            // inverted white comes out as too.
+            val backdrop = darkSurface.copy(alpha = 1f)
+            val rootBackground = if (darkBody) " background: ${backdrop.toHex()} !important;" else ""
+            val floor = darkenedFloor(backdrop)
+            val floorChannels = listOf(floor.red, floor.green, floor.blue).joinToString(", ") { (it * 255).roundToInt().toString() }
             """
             <!doctype html>
             <!-- The self-sizing WebView needs its document boxes to follow the
@@ -798,7 +1109,7 @@ internal fun HtmlMessageBody(
                  specific !important rules the later one wins, while an inline
                  declaration outranks every stylesheet rule of the same
                  importance wherever the sender's <style> sits. -->
-            <html class="$quoteClass" style="height: auto !important; min-height: 0 !important;">
+            <html class="$rootClass" style="height: auto !important; min-height: 0 !important;$rootBackground">
             <head>
               <meta http-equiv="Content-Security-Policy" content="${mailBodyCsp(allowRemote, scriptNonce)}">
               <meta id="meron-viewport" name="viewport" content="width=device-width, initial-scale=1.0">
@@ -902,8 +1213,48 @@ internal fun HtmlMessageBody(
                   font: 700 11px/1 sans-serif;
                   letter-spacing: 1px;
                 }
+                /* Open: the chip stays lit, so it reads as a state rather than
+                   as the same button as when folded. */
+                button.meron-quote-toggle[aria-expanded="true"] {
+                  opacity: 0.9;
+                  background: color-mix(in srgb, currentColor 16%, transparent);
+                }
                 button.meron-quote-toggle::before {
                   content: '•••';
+                }
+                /* Dark bodies: the mail is drawn inverted, light text on dark,
+                   with the hue turned back so links and brand colors stay
+                   recognisable. Pictures are inverted a second time to come
+                   out as sent (background ones are marked by applyDarkBody
+                   below, which also drops the class for mail designed dark). */
+                html.meron-dark body,
+                html.meron-dark img,
+                html.meron-dark video,
+                html.meron-dark [data-meron-picture] {
+                  filter: invert(1) hue-rotate(180deg);
+                }
+                /* ...but only once: inside a re-inverted picture an image is
+                   already back to its own colors. */
+                html.meron-dark [data-meron-picture] img {
+                  filter: none;
+                }
+                /* Inverted white is black, not the surface the view sits on,
+                   so a layer over the body caps how light it gets before the
+                   filter runs: at the color that inverts to that surface (see
+                   darkenedFloor). The layer is the first thing positioned in
+                   the body, above everything in the flow and below whatever
+                   comes after it with a filter of its own -- the pictures,
+                   which a cap on the whole body would tint with the surface
+                   instead. What else paints above it is capped one element at
+                   a time (see capBackgrounds below). */
+                html.meron-dark body::before {
+                  content: '' !important;
+                  display: block !important;
+                  position: absolute !important;
+                  inset: 0 !important;
+                  background: ${floor.toHex()} !important;
+                  mix-blend-mode: darken !important;
+                  pointer-events: none !important;
                 }
               </style>
             </head>
@@ -1033,9 +1384,16 @@ internal fun HtmlMessageBody(
                     // A little slack: sub-pixel table borders routinely round up
                     // and are not worth shrinking the whole page for.
                     if (natural <= viewWidth + 2) return;
-                    fitScale = viewWidth / natural;
-                    // Dropping initial-scale lets WebView pick the fit scale.
-                    meta.setAttribute('content', 'width=' + Math.ceil(natural));
+                    // Widening the viewport alone does not rescale a page that has
+                    // already loaded: the layout grows to the natural width but
+                    // the scale stays 1, leaving the mail sideways-scrollable. So
+                    // the fit scale is stated outright.
+                    var width = Math.ceil(natural);
+                    fitScale = viewWidth / width;
+                    meta.setAttribute(
+                      'content',
+                      'width=' + width + ', initial-scale=' + fitScale + ', minimum-scale=' + fitScale
+                    );
                   }
                   // The root element is the one that scrolls, so its scrollHeight
                   // never drops below the view's own height -- sizing off it pins
@@ -1063,7 +1421,19 @@ internal fun HtmlMessageBody(
                   //
                   // The desktop frame applies the same rules; its arithmetic
                   // (and the tests pinning it) lives in chat/frameHeight.ts.
+                  //
+                  // A list item that scrolled out and back in gets a fresh
+                  // document in a view already sized to the saved height, where
+                  // the overflow fits and so never shows: the floor it had found
+                  // is handed back, or the escaping content reads as the empty
+                  // box and the item collapses before growing back. Only at the
+                  // width it was found at, checked on the first measurement:
+                  // narrower or wider, the content runs to a different length.
                   var overflowExtent = 0;
+                  var seededOverflowExtent = ${initialOverflow.first};
+                  var seededOverflowWidth = ${initialOverflow.second};
+                  var layoutWidth = 0;
+                  var reportedOverflowExtent = 0;
                   function contentHeight() {
                     var root = document.documentElement;
                     var body = document.body;
@@ -1084,12 +1454,81 @@ internal fun HtmlMessageBody(
                     }
                     return Math.max(h, overflowExtent);
                   }
+                  // What a document of plain flowing text needs: the body laid out
+                  // at max-content, read and put back within the same task so
+                  // nothing paints it. Anything whose layout follows the width it
+                  // is given (tables, pictures, fixed widths) reports -1, and the
+                  // bubble stays at full width for it.
+                  function naturalWidth() {
+                    var body = document.body;
+                    if (!body || body.querySelector('table, img, video, iframe, svg, pre, [width], [style*="width"]')) return -1;
+                    var style = body.style;
+                    var w = [style.getPropertyValue('width'), style.getPropertyPriority('width')];
+                    var mw = [style.getPropertyValue('max-width'), style.getPropertyPriority('max-width')];
+                    style.setProperty('width', 'max-content', 'important');
+                    style.setProperty('max-width', 'none', 'important');
+                    var natural = Math.ceil(body.getBoundingClientRect().width);
+                    if (w[0]) style.setProperty('width', w[0], w[1]); else style.removeProperty('width');
+                    if (mw[0]) style.setProperty('max-width', mw[0], mw[1]); else style.removeProperty('max-width');
+                    return natural > 0 ? Math.ceil(natural * fitScale) : -1;
+                  }
+                  // How far the reader has pinched in, where the view allows it.
+                  // Taken from the two viewports rather than visualViewport.scale:
+                  // the fit above already sets a page scale, and their ratio is 1
+                  // at whatever scale the document rests at. The view is sized
+                  // to its content and never scrolls down, so the height it is
+                  // given has to grow with the zoom or the enlarged mail would
+                  // be cut off at its unzoomed length.
+                  var pinchZooms = ${if (MailWebViewPinchZooms) "true" else "false"};
+                  function pinchZoom() {
+                    var vv = window.visualViewport;
+                    var layout = document.documentElement ? document.documentElement.clientWidth : 0;
+                    if (!pinchZooms || !vv || !vv.width || !layout) return 1;
+                    var zoom = layout / vv.width;
+                    // Rounding in either width is not a zoom.
+                    return zoom > 1.01 ? zoom : 1;
+                  }
                   function report() {
+                    // A lazy list can attach a fresh web view and load it before
+                    // the view is laid out. At zero width every word wraps onto a
+                    // line of its own, and a mail that needs 8000px reads as
+                    // hundreds of thousands: reported, that sizes the list item
+                    // off into the distance and the list jumps. The resize
+                    // observer reports again once the view has its width.
+                    if (!visibleWidth()) return;
+                    if (!layoutWidth) {
+                      // Before the fit pass, which widens the viewport.
+                      layoutWidth = Math.round(visibleWidth());
+                      if (seededOverflowWidth === layoutWidth) overflowExtent = seededOverflowExtent;
+                      reportedOverflowExtent = overflowExtent;
+                    }
                     applyWidthFit();
+                    var nw = naturalWidth();
+                    if (window.MeronWidth && window.MeronWidth.report) {
+                      window.MeronWidth.report(nw);
+                    } else if (
+                      window.webkit &&
+                      window.webkit.messageHandlers &&
+                      window.webkit.messageHandlers.meronWidth
+                    ) {
+                      window.webkit.messageHandlers.meronWidth.postMessage(nw);
+                    }
                     // The measurement is in the (possibly widened) layout
                     // viewport's CSS pixels; the view renders it at fitScale, so
                     // scale it back to dp or the view gets sized to a phantom tail.
-                    var h = Math.ceil(contentHeight() * fitScale);
+                    var h = Math.ceil(contentHeight() * fitScale * pinchZoom());
+                    if (overflowExtent !== reportedOverflowExtent) {
+                      reportedOverflowExtent = overflowExtent;
+                      if (window.MeronOverflow && window.MeronOverflow.report) {
+                        window.MeronOverflow.report(overflowExtent, layoutWidth);
+                      } else if (
+                        window.webkit &&
+                        window.webkit.messageHandlers &&
+                        window.webkit.messageHandlers.meronOverflow
+                      ) {
+                        window.webkit.messageHandlers.meronOverflow.postMessage([overflowExtent, layoutWidth]);
+                      }
+                    }
                     if (window.MeronHeight && window.MeronHeight.report) {
                       window.MeronHeight.report(h);
                     } else if (
@@ -1179,12 +1618,147 @@ internal fun HtmlMessageBody(
                   // Before the first report: every width the script measures,
                   // and the view height derived from them, is read under the
                   // viewport this leaves in place.
+                  // Dark bodies (see the meron-dark rules): a mail designed
+                  // dark already -- a dark page, or light text written for a
+                  // dark client -- would come out bright if inverted, so it
+                  // keeps its own colors. Judged the way the desktop frames
+                  // do: the page color the core hoisted or the body paints,
+                  // else the tone most of the visible text is drawn in.
+                  function colorParts(value) {
+                    var match = /^rgba?\(([^)]*)\)/.exec((value || '').trim());
+                    if (!match) return null;
+                    var parts = match[1].split(/[\s,\/]+/).filter(Boolean).map(parseFloat);
+                    return parts.length < 3 ? null : parts;
+                  }
+                  function colorTone(value) {
+                    var parts = colorParts(value);
+                    if (!parts || (parts.length > 3 && parts[3] < 0.6)) return null;
+                    var lum = (0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]) / 255;
+                    return lum > 0.55 ? 'light' : 'dark';
+                  }
+                  function bodyMeta(name) {
+                    var meta = document.querySelector('meta[name="' + name + '"]');
+                    return meta ? (meta.getAttribute('content') || '').trim() : '';
+                  }
+                  function canvasTone() {
+                    var probe = document.createElement('span');
+                    var declared = bodyMeta('meron-body-bg');
+                    if (declared) {
+                      probe.style.color = declared;
+                      document.body.appendChild(probe);
+                      var tone = colorTone(getComputedStyle(probe).color);
+                      probe.remove();
+                      if (tone) return tone;
+                    }
+                    return colorTone(getComputedStyle(document.body).backgroundColor);
+                  }
+                  function textTone() {
+                    var light = 0;
+                    var dark = 0;
+                    (function walk(el) {
+                      if (/^(STYLE|SCRIPT|BUTTON)$/.test(el.tagName)) return;
+                      var style = getComputedStyle(el);
+                      if (style.display === 'none' || style.visibility === 'hidden') return;
+                      if (style.opacity === '0' || style.fontSize === '0px') return;
+                      var tone = colorTone(style.color);
+                      for (var i = 0; i < el.childNodes.length; i++) {
+                        var node = el.childNodes[i];
+                        if (node.nodeType === 1) {
+                          walk(node);
+                        } else if (node.nodeType === 3 && tone) {
+                          var length = node.textContent.trim().length;
+                          if (tone === 'light') light += length;
+                          else dark += length;
+                        }
+                      }
+                    })(document.body);
+                    if (!light && !dark) return null;
+                    return light > dark ? 'light' : 'dark';
+                  }
+                  // A picture drawn as a background is turned back to its own
+                  // colors with the images -- but only where it is the whole
+                  // of the element: turning a box back also turns back the
+                  // text in it, which then reads as sent on a canvas that no
+                  // longer is.
+                  function markBackgroundPictures() {
+                    var all = document.body.getElementsByTagName('*');
+                    for (var i = 0; i < all.length; i++) {
+                      var el = all[i];
+                      if (getComputedStyle(el).backgroundImage.indexOf('url(') === -1) continue;
+                      if (el.textContent.trim()) continue;
+                      el.setAttribute('data-meron-picture', '');
+                    }
+                  }
+                  // The layer over the body (see the meron-dark rules) caps
+                  // what is in the flow, but a positioned box paints above that
+                  // layer, and so does everything inside one: its white would
+                  // invert to black, not to the surface. Such a background is
+                  // held to the floor on the element itself; the pictures are
+                  // turned back to their own colors, which a cap would then
+                  // show through.
+                  var darkFloor = [$floorChannels];
+                  function capBackgrounds() {
+                    var all = document.body.querySelectorAll('*');
+                    // Written once the walk has read every element: a write in
+                    // between would have the engine resolve the document's
+                    // styles again for the next read.
+                    var capped = [];
+                    for (var i = 0; i < all.length; i++) {
+                      var el = all[i];
+                      if (el.matches('img, video, [data-meron-picture], [data-meron-picture] *')) continue;
+                      var color = colorParts(getComputedStyle(el).backgroundColor);
+                      if (!color || color[3] === 0) continue;
+                      if (color[0] <= darkFloor[0] && color[1] <= darkFloor[1] && color[2] <= darkFloor[2]) continue;
+                      var channels = [0, 1, 2].map(function (c) { return Math.min(color[c], darkFloor[c]); });
+                      capped.push([el, 'rgba(' + channels.join(', ') + ', ' + (color.length > 3 ? color[3] : 1) + ')']);
+                    }
+                    capped.forEach(function (pair) {
+                      pair[0].style.setProperty('background-color', pair[1], 'important');
+                    });
+                  }
+                  // The sanitiser drops <body>, so the core hoists its colors
+                  // into metas. They go back on every mail, dark rendering or
+                  // not, and as the pair they are: white text written for a
+                  // black <body> is white on the canvas without it, and a
+                  // background alone, or the page left transparent with the
+                  // default black text on it, is dark on dark. Put back as
+                  // the inline declarations they were, with the priority they
+                  // were written at; a surviving declaration of the mail's
+                  // own is left alone.
+                  function restoreDeclaredCanvas() {
+                    var important = bodyMeta('meron-body-important').split(/\s+/);
+                    [['background-color', 'meron-body-bg'], ['color', 'meron-body-fg']].forEach(function (pair) {
+                      var value = bodyMeta(pair[1]);
+                      if (!value || document.body.style.getPropertyValue(pair[0])) return;
+                      document.body.style.setProperty(pair[0], value, important.indexOf(pair[0]) === -1 ? '' : 'important');
+                    });
+                  }
+                  function applyDarkBody() {
+                    var root = document.documentElement;
+                    if (!root.classList.contains('meron-dark')) return;
+                    var canvas = canvasTone();
+                    if (canvas === 'dark') {
+                      root.classList.remove('meron-dark');
+                      return;
+                    }
+                    if (!canvas && textTone() === 'light') {
+                      root.classList.remove('meron-dark');
+                      return;
+                    }
+                    markBackgroundPictures();
+                    capBackgrounds();
+                  }
                   dropForeignViewports();
                   groupConsecutiveImages();
+                  restoreDeclaredCanvas();
+                  applyDarkBody();
                   window.addEventListener('load', report);
                   document.addEventListener('DOMContentLoaded', report);
                   if (window.ResizeObserver) {
                     new ResizeObserver(report).observe(document.documentElement);
+                  }
+                  if (pinchZooms && window.visualViewport) {
+                    window.visualViewport.addEventListener('resize', report);
                   }
                   setTimeout(report, 300);
                 })();
@@ -1202,7 +1776,11 @@ internal fun HtmlMessageBody(
                 if (measured) {
                     Modifier.height(contentHeight)
                 } else {
-                    Modifier.heightIn(min = 80.dp)
+                    // Fixed, not a minimum: in a lazy list the height is otherwise
+                    // unbounded and the web view sizes itself to its own layout,
+                    // which before the view has a width is hundreds of thousands
+                    // of pixels of one-word lines.
+                    Modifier.height(80.dp)
                 },
             )
 
@@ -1227,12 +1805,20 @@ internal fun HtmlMessageBody(
     ) {
         MailWebViewWithLinkMenu(
             html = mobileHtml,
-            onContentHeight = { contentHeight = clampMailBodyHeight(it) },
+            mediaMissing = mediaMissing,
+            onContentHeight = { contentHeightDp = clampMailBodyHeight(it).value },
+            onOverflowExtent = { extent, width ->
+                savedOverflowLayout = overflowLayout
+                savedOverflowExtent = extent
+                savedOverflowWidth = width
+            },
             onOpenUrl = onOpenUrl,
             onOpenImage = onOpenImage,
             onQuoteToggle = { open -> QuoteFoldMemory.setOpen(quoteKey, open) },
+            onNaturalWidth = onNaturalWidth,
             modifier = webViewModifier,
             fitWideContent = fitWideContent,
+            transparentBackground = darkBody,
         )
     }
 }
@@ -1243,22 +1829,30 @@ internal fun HtmlMessageBody(
 private fun MailWebViewWithLinkMenu(
     html: String,
     onContentHeight: (Dp) -> Unit,
+    onOverflowExtent: (Int, Int) -> Unit,
     onOpenUrl: (String) -> Unit,
     onOpenImage: (String) -> Unit,
     onQuoteToggle: (Boolean) -> Unit,
+    onNaturalWidth: (Dp) -> Unit,
     modifier: Modifier,
     fitWideContent: Boolean,
+    transparentBackground: Boolean,
+    mediaMissing: Int,
 ) {
     var menuTarget by remember { mutableStateOf<MessageLinkMenuTarget?>(null) }
     Box(modifier) {
         MailWebView(
             html = html,
+            mediaMissing = mediaMissing,
             onContentHeight = onContentHeight,
+            onOverflowExtent = onOverflowExtent,
             onOpenUrl = onOpenUrl,
             onOpenImage = onOpenImage,
             onLinkLongPress = { url, offset -> menuTarget = MessageLinkMenuTarget(url, offset) },
             fitWideContent = fitWideContent,
+            transparentBackground = transparentBackground,
             onQuoteToggle = onQuoteToggle,
+            onNaturalWidth = onNaturalWidth,
             modifier = Modifier.fillMaxSize(),
         )
         MessageLinkContextMenu(

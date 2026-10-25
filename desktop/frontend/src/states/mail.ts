@@ -1,4 +1,4 @@
-import { observable } from '@legendapp/state'
+import { attachmentSaveFilename } from '../lib/attachmentFilename'
 import type { Folder, Message } from '../types'
 import { invoke } from '../lib/bridge'
 import { t } from '../lib/i18n'
@@ -12,46 +12,10 @@ import { isLocalSendId } from './pendingSends'
 import { CONVERSATION_PAGE_SIZE } from '../lib/pagination'
 import { bareAddr, splitAddressList } from '../lib/address'
 import { decrementFolderUnread, isDraftFolder, updateCachedFolderUnread } from './mailFolders'
+import { mail$ } from './mailState'
+import { compose$ } from './composeState'
 
-// Mail data cache — the frontend view of the sidecar's `folders` and `messages`
-// tables (threads are messages grouped by the sidecar). Ephemeral: repopulated
-// from the sidecar on demand, never persisted on this side.
-export const mail$ = observable({
-  folders: [] as Folder[],
-  // Real per-account folder lists, keyed by account id. `folders` above is the
-  // view for the *selected* account (and is just a synthetic single inbox in the
-  // unified view), so anything that needs a specific account's real folders —
-  // e.g. the thread context menu's "Move to" in the unified inbox — reads here.
-  foldersByAccount: {} as Record<string, Folder[]>,
-  threads: [] as Message[],
-  threadsCursor: '',
-  threadAccountCursors: {} as Record<string, string>,
-  threadsLoadingMore: false,
-  // The view (`threadListViewKey`) whose threads are the ones in `threads`. An
-  // empty list means "nothing here" only once this matches the view on screen:
-  // before that the rows simply have not arrived, and saying the folder is empty
-  // — at startup, or for the second or two a folder load takes — is wrong, then
-  // wrong again when they land. Deliberately not a boolean set by `loadThreads`:
-  // a selection or filter change repaints the list *before* the effect that
-  // starts the load runs, and the client-side filter empties it on that very
-  // render, so a flag set inside the load turns on a frame too late.
-  threadsLoadedKey: '',
-  messages: [] as Message[],
-  // Opaque pagination cursor for older messages in the current thread; "" = no more.
-  messagesCursor: '',
-  // Loading flag for "Load earlier messages".
-  messagesLoadingMore: false,
-  // True while threadRead is in flight for a newly-selected thread. The reader
-  // shows a spinner (instead of the previous thread's stale messages) when this
-  // is set and the loaded messages don't yet belong to the active thread —
-  // notably during the on-demand ancestor fetch, which adds a network round-trip.
-  threadLoading: false,
-  // Thread id whose last threadRead failed (backend timeout, network down).
-  // The reader shows an error + retry instead of a silent blank pane; cleared
-  // on the next load attempt for that thread.
-  threadErrorId: '',
-  readThreads: {} as Record<string, boolean>,
-})
+export { mail$ }
 
 // Optimistic rollback for the keyed caches, key by key. Two reasons not to keep a
 // whole `.get()` and restore that: Legend-State mutates a record's raw object in
@@ -228,16 +192,17 @@ export async function openAttachment(att: { key: string | null; filename: string
 
 // Save a local attachment to disk via the native save dialog. The bytes already
 // live in the media cache (keyed); the bridge copies them to the chosen path.
-export async function downloadAttachment(att: { key: string | null; filename: string }) {
+export async function downloadAttachment(att: { key: string | null; filename: string; mime?: string }) {
   if (!att.key) return
+  const filename = attachmentSaveFilename(att.filename, att.key, att.mime)
   try {
     const res = await invoke<{ saved: boolean; path?: string }>('mail.saveAttachment', {
       key: att.key,
-      filename: att.filename,
+      filename,
     })
-    if (res?.saved) showToast(t('chat.savedAttachment', { filename: att.filename }))
+    if (res?.saved) showToast(t('chat.savedAttachment', { filename }))
   } catch {
-    showToast(t('chat.couldNotSaveAttachment', { filename: att.filename }))
+    showToast(t('chat.couldNotSaveAttachment', { filename }))
   }
 }
 
@@ -281,7 +246,7 @@ export function getFilteredThreads() {
   if (isUnifiedStarred(ui$.selectedAccount.get(), ui$.selectedFolder.get())) return threads
   const filterMode = ui$.filterMode.get()
   const selected = ui$.selectedThread.get()
-  return filterThreads(threads, filterMode, selected, mail$.readThreads.get())
+  return filterThreads(threads, filterMode, selected, mail$.readThreads.get(), ui$.attachmentsOnly.get())
 }
 
 // Move the selection up (delta -1) or down (delta +1) through the visible
@@ -366,6 +331,113 @@ export function threadListViewKey(account: string, folder: string, query: string
   return [account, folder, query, filter].join('\n')
 }
 
+/** The list's filter inputs as one comparable value — the read-state filter
+ * plus the attachments toggle — for view keys and staleness checks. */
+export function listFilterKey(mode = ui$.filterMode.get(), attachments = ui$.attachmentsOnly.get()) {
+  return attachments ? `${mode}+attachments` : mode
+}
+
+// Suppress removals only while the backend mutation is pending. Each list read
+// keeps its own snapshot, including removals that start while it is in flight.
+// Completing a mutation releases future reads, while older reads still cannot
+// paint its stale row back. The core's UID guards protect the committed cache.
+const pendingRemovals = new Map<string, symbol>()
+const activeThreadListReads = new Set<Map<string, symbol>>()
+
+export function beginThreadListRead() {
+  const removed = new Map(pendingRemovals)
+  activeThreadListReads.add(removed)
+  return {
+    filter: (threads: Message[]) =>
+      threads.filter((thread) => !removed.has(thread.thread_id) && !pendingRemovals.has(thread.thread_id)),
+    dispose: () => {
+      activeThreadListReads.delete(removed)
+    },
+  }
+}
+
+type ThreadListRead = ReturnType<typeof beginThreadListRead>
+
+export function suppressRemovedThread(threadId: string): () => void {
+  if (!threadId) return () => {}
+  const token = Symbol(threadId)
+  pendingRemovals.set(threadId, token)
+  for (const read of activeThreadListReads) read.set(threadId, token)
+  return () => {
+    if (pendingRemovals.get(threadId) === token) pendingRemovals.delete(threadId)
+    for (const read of activeThreadListReads) {
+      if (read.get(threadId) === token) read.delete(threadId)
+    }
+  }
+}
+
+// The backend has removed the source rows. Reads begun afterwards may show a
+// new reply or a moved-back copy of this conversation; older reads stay guarded.
+export function completeRemovedThread(threadId: string) {
+  pendingRemovals.delete(threadId)
+}
+
+export function releaseRemovedThread(threadId: string) {
+  pendingRemovals.delete(threadId)
+  for (const read of activeThreadListReads) read.delete(threadId)
+}
+
+// `mail.threadList` uses this when the client doesn't pass a limit. The
+// background merge needs it to tell a full first page from the end of the folder.
+export const THREAD_LIST_PAGE_SIZE = 50
+
+// A background refresh only re-reads the first page. Threads it no longer
+// returns left that page (archived, moved, deleted). Threads older than the
+// page are ones the reader scrolled to, and this refresh didn't look at them.
+// A short page still has those when the server sent a cursor — the unified
+// inbox stops at a date cutoff before the page is full. Only a short page with
+// nowhere further to read has covered the folder, and then a missing row is
+// gone. Threads that slide into the page, or that actually just arrived, join
+// by date. Putting them on the front is how an older conversation from another
+// account landed above newer mail after an archive.
+export function mergeRefreshedThreadPage(
+  previous: Message[],
+  fetched: Message[],
+  hasMore = false,
+  pinned: Record<string, boolean> = {},
+): Message[] {
+  const fetchedById = new Map(fetched.map((thread) => [thread.thread_id, thread]))
+  const previousIds = new Set(previous.map((thread) => thread.thread_id))
+  const brandNew = fetched.filter((thread) => !previousIds.has(thread.thread_id))
+  const oldest = Math.min(...fetched.map((thread) => thread.date))
+  const pageCoversRest = fetched.length < THREAD_LIST_PAGE_SIZE && !hasMore
+  const kept = previous.filter((thread) => {
+    // A filtered page cannot distinguish a pinned row's flag change from an
+    // external move. Keep triage pins until the user reloads this view.
+    if (fetchedById.has(thread.thread_id) || pinned[thread.thread_id]) return true
+    if (pageCoversRest) return false
+    // Date alone cannot place equal-timestamp rows on either side of this
+    // boundary. Conservatively keep them until a full user-initiated reload.
+    return thread.date <= oldest
+  })
+  const updated = kept.map((thread) => fetchedById.get(thread.thread_id) ?? thread)
+  const merged = brandNew.length > 0 ? [...brandNew, ...updated] : updated
+  return merged.length < 2 ? merged : merged.sort((a, b) => b.date - a.date)
+}
+
+// The open conversation left the list this refresh just wrote. Follow it to the
+// next row that is still on screen (or the previous one, if it was last) so a
+// burst of archives doesn't land on a blank pane. A selection that was never in
+// this list — a notification that hasn't landed — stays where it is.
+export function nextSelectedAfterRefresh(previous: Message[], visible: Message[], selectedId: string): string {
+  if (!selectedId || visible.some((thread) => thread.thread_id === selectedId)) return selectedId
+  const index = previous.findIndex((thread) => thread.thread_id === selectedId)
+  if (index === -1) return selectedId
+  const visibleIds = new Set(visible.map((thread) => thread.thread_id))
+  const after = previous.slice(index + 1).find((thread) => visibleIds.has(thread.thread_id))
+  if (after) return after.thread_id
+  const before = previous
+    .slice(0, index)
+    .reverse()
+    .find((thread) => visibleIds.has(thread.thread_id))
+  return before?.thread_id ?? visible[0]?.thread_id ?? ''
+}
+
 // Encoded t. keys include the subject branch and are stable across folders.
 // Numeric IMAP UIDs and RSS item ids remain tied to their original location.
 function starredConversationIdentity(thread: Message): string {
@@ -375,6 +447,15 @@ function starredConversationIdentity(thread: Message): string {
 }
 
 export async function loadThreads(refresh = true, searchStage: ThreadSearchStage = 'auto') {
+  const read = beginThreadListRead()
+  try {
+    await loadThreadsWithRead(refresh, searchStage, read)
+  } finally {
+    read.dispose()
+  }
+}
+
+async function loadThreadsWithRead(refresh: boolean, searchStage: ThreadSearchStage, read: ThreadListRead) {
   // A Kanban card temporarily points selectedFolder at the card's real mailbox
   // so thread actions have the right context. The normal mail list is hidden,
   // and treating that account-specific id as a unified role falls back to Inbox,
@@ -390,7 +471,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   const initialAccount = ui$.selectedAccount.get()
   const initialFolder = ui$.selectedFolder.get()
   const initialQuery = ui$.query.get()
-  const initialFilter = ui$.filterMode.get()
+  const initialFilter = listFilterKey()
   const activeAccount = accounts$.get().find((account) => account.id === initialAccount)
   // Starred is answered from the local cache, so there is no live stage to run.
   const canSearchLive =
@@ -406,7 +487,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
       ui$.selectedAccount.get() !== initialAccount ||
       ui$.selectedFolder.get() !== initialFolder ||
       ui$.query.get() !== initialQuery ||
-      ui$.filterMode.get() !== initialFilter
+      listFilterKey() !== initialFilter
     ) {
       return
     }
@@ -418,7 +499,9 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   const selectedFol = ui$.selectedFolder.get()
   const q = ui$.query.get()
   const filter = ui$.filterMode.get()
-  const viewKey = threadListViewKey(selectedAcc, selectedFol, q, filter)
+  const attachments = ui$.attachmentsOnly.get()
+  const filterKey = listFilterKey(filter, attachments)
+  const viewKey = threadListViewKey(selectedAcc, selectedFol, q, filterKey)
 
   // A background refresh steps aside for a server-bound load already running for
   // the same view. Taking the version from it would throw away the fresher rows
@@ -467,12 +550,11 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
       ui$.selectedAccount.get() !== selectedAcc ||
       ui$.selectedFolder.get() !== selectedFol ||
       ui$.query.get() !== q ||
-      ui$.filterMode.get() !== filter
+      listFilterKey() !== filterKey
     if (stale) releasePendingRefresh()
     return stale
   }
   const previousThreads = mail$.threads.get()
-  const currentSelected = ui$.selectedThread.get()
   const previousThreadsCursor = mail$.threadsCursor.get()
   const previousAccountCursors = snapshotRecord(mail$.threadAccountCursors.get())
   const userInitiated = refresh || searchStage === 'cache'
@@ -487,6 +569,8 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   const mergeBackground = backgroundRefresh && !unifiedStarred
 
   let allThreads: Message[] = []
+  let readFailed = false
+  const failedAccountIds = new Set<string>()
 
   // Starred spans every account and every folder, so it is answered by a
   // cross-account cache query rather than the per-account folder fan-out. Its
@@ -496,6 +580,9 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
       const res = await invoke<{ items: Message[]; next_cursor?: string }>('mail.starredItems', {
         query: q,
         filter,
+        // Hidden in the starred view (no menu offers it), so a toggle left on
+        // elsewhere must not narrow this list.
+        attachments: false,
         // Re-fetch every loaded row: stars can disappear and the core can pick
         // a different folder copy of the same conversation after a flag change.
         // Keeping absent rows or merging by folder-specific thread_id duplicates it.
@@ -509,8 +596,11 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     } catch (err) {
       if (superseded()) return
       console.error('Failed to load starred items:', err)
-      mail$.threadsCursor.set('')
-      mail$.threadAccountCursors.set({})
+      readFailed = true
+      if (userInitiated) {
+        mail$.threadsCursor.set('')
+        mail$.threadAccountCursors.set({})
+      }
     }
   } else if (selectedAcc === 'unified') {
     const role = unifiedFolderRole(selectedFol)
@@ -520,12 +610,14 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
         next_cursor?: string
         folder_unreads?: Record<string, number>
         failures?: Array<{ account_id: string; message: string }>
+        search_incomplete?: boolean
       }>('mail.threadList', {
         account_id: 'unified',
         folder_id: role,
         folder_role: role,
         query: q,
         filter,
+        attachments,
         refresh,
       })
       if (superseded()) return
@@ -538,28 +630,46 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
         }
       }
       for (const failure of result.failures ?? []) {
+        failedAccountIds.add(failure.account_id)
         console.error(`Failed to load threads for ${failure.account_id}: ${failure.message}`)
       }
-      mail$.threadAccountCursors.set({})
-      mail$.threadsCursor.set(result.next_cursor ?? '')
+      // Failed accounts did not check their cached rows. If every participating
+      // account failed, there is no authoritative page or cursor at all.
+      const participatingIds = unifiedAccounts().map((account) => account.id)
+      const expectedIds = participatingIds.length
+        ? participatingIds
+        : [...new Set([...previousThreads, ...allThreads].map((thread) => thread.account_id))]
+      readFailed = expectedIds.length > 0 && expectedIds.every((id) => failedAccountIds.has(id))
+      if (!readFailed || userInitiated) {
+        mail$.threadAccountCursors.set({})
+        mail$.threadsCursor.set(result.next_cursor ?? '')
+      }
+      // Some account's server search failed; its part of the list is cached only.
+      if (refresh && result.search_incomplete) showToast(t('threads.searchServerUnavailable'))
     } catch (err) {
       if (superseded()) return
       console.error('Failed to load unified threads:', err)
-      mail$.threadAccountCursors.set({})
-      mail$.threadsCursor.set('')
+      readFailed = true
+      if (userInitiated) {
+        mail$.threadAccountCursors.set({})
+        mail$.threadsCursor.set('')
+      }
     }
   } else {
     try {
-      const result = await invoke<{ threads: Message[]; next_cursor?: string; folder_unread?: number }>(
-        'mail.threadList',
-        {
-          account_id: selectedAcc,
-          folder_id: selectedFol,
-          query: q,
-          filter,
-          refresh,
-        },
-      )
+      const result = await invoke<{
+        threads: Message[]
+        next_cursor?: string
+        folder_unread?: number
+        search_incomplete?: boolean
+      }>('mail.threadList', {
+        account_id: selectedAcc,
+        folder_id: selectedFol,
+        query: q,
+        filter,
+        attachments,
+        refresh,
+      })
       if (superseded()) return
       if (typeof result.folder_unread === 'number') {
         updateCachedFolderUnread(selectedAcc, selectedFol, result.folder_unread)
@@ -567,16 +677,65 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
       allThreads = result.threads || []
       mail$.threadsCursor.set(result.next_cursor ?? '')
       mail$.threadAccountCursors.set({})
+      // The server half of the search failed; say the list is only what this
+      // device has cached rather than letting older matches silently vanish.
+      if (refresh && result.search_incomplete) showToast(t('threads.searchServerUnavailable'))
     } catch (err) {
       if (superseded()) return
       console.error('Failed to load threads:', err)
-      mail$.threadsCursor.set('')
-      mail$.threadAccountCursors.set({})
+      readFailed = true
+      if (userInitiated) {
+        mail$.threadsCursor.set('')
+        mail$.threadAccountCursors.set({})
+      }
     }
   }
 
-  if (filter !== 'all' && currentSelected && !allThreads.some((thread) => thread.thread_id === currentSelected)) {
-    const selectedThread = previousThreads.find((thread) => thread.thread_id === currentSelected)
+  // A failed read has no authoritative page. Preserve the current list and
+  // pagination; a successful empty page below is authoritative.
+  if (readFailed && !userInitiated) return
+
+  const fetchedThreads = allThreads
+  if (mergeBackground) {
+    // Update the threads we already show with their fresh copies (new unread
+    // counts, latest message, etc.), keep the extra pages the user loaded by
+    // scrolling, and fold in threads that are new since the last load.
+    // A thread the fresh page no longer has left the folder — keeping it is how
+    // an archived thread came back and then refused to archive again. The cursor
+    // is read first: restoring the scrolled cursor below would hide that this
+    // page still has mail under it.
+    const fetchedCursor = mail$.threadsCursor.get()
+    const fetchedHasMore = fetchedCursor !== ''
+    const pinned = { ...(filter !== 'all' || attachments ? mail$.readThreads.get() : {}) }
+    // A background refresh of a search is answered from the local index, which
+    // lacks the hits only the server found. A row it does not return is "not
+    // found yet", not gone; keep the results and their pagination.
+    const searching = q.trim() !== ''
+    for (const thread of previousThreads) {
+      if (searching || failedAccountIds.has(thread.account_id)) pinned[thread.thread_id] = true
+    }
+    allThreads = mergeRefreshedThreadPage(previousThreads, fetchedThreads, fetchedHasMore, pinned)
+    // Preserve loaded pagination depth when it has a cursor; an exhausted old
+    // list must adopt the new page's cursor when more mail becomes available.
+    // A partial failure cannot establish that the whole unified list is exhausted.
+    const exhausted =
+      !searching && fetchedThreads.length < THREAD_LIST_PAGE_SIZE && !fetchedHasMore && failedAccountIds.size === 0
+    mail$.threadsCursor.set(exhausted ? '' : previousThreadsCursor || fetchedCursor)
+    mail$.threadAccountCursors.set(exhausted || !previousThreadsCursor ? {} : previousAccountCursors)
+  }
+
+  // Read selection here, not at the start of the load. Archiving the open
+  // thread moves it to the neighbour while this load is in flight; deciding
+  // from the old id would put that thread back or close the one that replaced it.
+  // Done after the merge so pinning the open row can't make the fresh page look
+  // longer than it is and keep threads that actually left.
+  const selectedNow = ui$.selectedThread.get()
+  if (
+    (filter !== 'all' || attachments) &&
+    selectedNow &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow)
+  ) {
+    const selectedThread = previousThreads.find((thread) => thread.thread_id === selectedNow)
     const replacement =
       selectedThread &&
       allThreads.some((thread) => starredConversationIdentity(thread) === starredConversationIdentity(selectedThread))
@@ -588,23 +747,22 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     }
   }
 
-  if (mergeBackground) {
-    // Update the threads we already show with their fresh copies (new unread
-    // counts, latest message, etc.), keep the extra pages the user loaded by
-    // scrolling, and prepend any threads that are brand-new since the last load.
-    // This preserves both the list length and the user's scroll position.
-    const fetched = new Map(allThreads.map((thread) => [thread.thread_id, thread]))
-    const previousIds = new Set(previousThreads.map((thread) => thread.thread_id))
-    const brandNew = allThreads.filter((thread) => !previousIds.has(thread.thread_id))
-    const updated = previousThreads.map((thread) => fetched.get(thread.thread_id) ?? thread)
-    allThreads = brandNew.length > 0 ? [...brandNew, ...updated] : updated
-    // Keep the cursor pointing past the last loaded page rather than resetting it
-    // to the first page's cursor.
-    mail$.threadsCursor.set(previousThreadsCursor)
-    mail$.threadAccountCursors.set(previousAccountCursors)
-  }
-
+  allThreads = read.filter(allThreads)
   mail$.threads.set(allThreads)
+  // A background refresh can drop the row the selection just moved to (a short
+  // page, or a neighbour archived while this load was in flight). Leaving the
+  // id in place shows a blank conversation. Follow the row that is still here.
+  // A load the user started still closes the pane below, on purpose.
+  if (
+    !userInitiated &&
+    selectedNow &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow) &&
+    !mail$.threadLoading.get() &&
+    !activeThreadTabOwns(selectedNow)
+  ) {
+    const nextSelected = nextSelectedAfterRefresh(previousThreads, allThreads, selectedNow)
+    if (nextSelected !== selectedNow) ui$.selectedThread.set(nextSelected)
+  }
   // These rows now stand for this view — but only a load that went to the server
   // for them may say so, which is what `refresh` marks. The two cache-only kinds
   // both answer from the local index, so an empty result from either means "not
@@ -647,7 +805,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   if (kanban$.activeBoardId.get()) {
     return
   }
-  if (!currentSelected) {
+  if (!selectedNow) {
     // Only a flow that just cleared the selection may fill it (see
     // `requestThreadReselect`); an empty pane otherwise stays empty.
     if (reselect) ui$.selectedThread.set(filtered[0]?.thread_id ?? '')
@@ -658,16 +816,25 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     // scrolled down to and opened from a later page would look "missing" and
     // get closed a second or two later.
     userInitiated &&
-    !allThreads.some((thread) => thread.thread_id === currentSelected) &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow) &&
     // A selection whose conversation is still being fetched — a notification or
     // starred jump that set account, folder and thread together — isn't missing,
     // it just hasn't landed. Only close one that has settled.
-    !mail$.threadLoading.get()
+    !mail$.threadLoading.get() &&
+    // A thread tab on screen owns the selection (it renders only while the two
+    // match) and needn't be in this folder's list: it was opened from elsewhere,
+    // e.g. a kanban card in another folder, and closing it is the tab's call.
+    !activeThreadTabOwns(selectedNow)
   ) {
     // The thread the user was reading is not in this view: close the pane rather
     // than opening an unrelated one for them.
     ui$.selectedThread.set('')
   }
+}
+
+function activeThreadTabOwns(threadId: string): boolean {
+  const activeTab = compose$.activeTab.peek()
+  return compose$.tabs.peek().some((tab) => tab.id === activeTab && tab.kind === 'thread' && tab.threadId === threadId)
 }
 
 export async function loadMoreThreads() {
@@ -676,18 +843,21 @@ export async function loadMoreThreads() {
   const selectedFol = ui$.selectedFolder.get()
   const q = ui$.query.get()
   const filter = ui$.filterMode.get()
+  const attachments = ui$.attachmentsOnly.get()
+  const filterKey = listFilterKey(filter, attachments)
   const version = threadLoadVersion
   const stillCurrent = (cursor: string) =>
     threadLoadVersion === version &&
     ui$.selectedAccount.get() === selectedAcc &&
     ui$.selectedFolder.get() === selectedFol &&
     ui$.query.get() === q &&
-    ui$.filterMode.get() === filter &&
+    listFilterKey() === filterKey &&
     mail$.threadsCursor.get() === cursor
   // The starred filter is one unpaginated page; a search over it is paged like
   // any other, and every other view stops on an empty cursor below.
   if (!q.trim() && filter === 'starred') return
 
+  const read = beginThreadListRead()
   mail$.threadsLoadingMore.set(true)
   try {
     let moreThreads: Message[] = []
@@ -699,6 +869,9 @@ export async function loadMoreThreads() {
         // query or they'd page through items the first page never showed.
         query: q,
         filter,
+        // Hidden in the starred view (no menu offers it), so a toggle left on
+        // elsewhere must not narrow this list.
+        attachments: false,
         limit: 50,
         before_cursor: cursor,
       })
@@ -713,12 +886,14 @@ export async function loadMoreThreads() {
         threads: Message[]
         next_cursor?: string
         folder_unreads?: Record<string, number>
+        search_incomplete?: boolean
       }>('mail.threadList', {
         account_id: 'unified',
         folder_id: role,
         folder_role: role,
         query: q,
         filter,
+        attachments,
         before_cursor: cursor,
         refresh: false,
       })
@@ -731,36 +906,43 @@ export async function loadMoreThreads() {
       moreThreads = res.threads || []
       mail$.threadAccountCursors.set({})
       mail$.threadsCursor.set(res.next_cursor ?? '')
+      if (res.search_incomplete) showToast(t('threads.searchServerUnavailable'))
     } else {
       const cursor = mail$.threadsCursor.get()
       if (!cursor) return
-      const res = await invoke<{ threads: Message[]; next_cursor?: string; folder_unread?: number }>(
-        'mail.threadList',
-        {
-          account_id: selectedAcc,
-          folder_id: selectedFol,
-          query: q,
-          filter,
-          before_cursor: cursor,
-          refresh: false,
-        },
-      )
+      const res = await invoke<{
+        threads: Message[]
+        next_cursor?: string
+        folder_unread?: number
+        search_incomplete?: boolean
+      }>('mail.threadList', {
+        account_id: selectedAcc,
+        folder_id: selectedFol,
+        query: q,
+        filter,
+        attachments,
+        before_cursor: cursor,
+        refresh: false,
+      })
       if (!stillCurrent(cursor)) return
       if (typeof res.folder_unread === 'number') updateCachedFolderUnread(selectedAcc, selectedFol, res.folder_unread)
       moreThreads = res.threads || []
       mail$.threadsCursor.set(res.next_cursor ?? '')
+      // Older server matches could not be fetched; the list ends at what is cached.
+      if (res.search_incomplete) showToast(t('threads.searchServerUnavailable'))
     }
 
     if (moreThreads.length > 0) {
       const existing = mail$.threads.get()
       const seen = new Set(existing.map((thread) => thread.thread_id))
-      const merged = [...existing, ...moreThreads.filter((thread) => !seen.has(thread.thread_id))]
+      const merged = read.filter([...existing, ...moreThreads.filter((thread) => !seen.has(thread.thread_id))])
       if (selectedAcc === 'unified') {
         merged.sort((a, b) => b.date - a.date)
       }
       mail$.threads.set(merged)
     }
   } finally {
+    read.dispose()
     mail$.threadsLoadingMore.set(false)
   }
 }
@@ -784,6 +966,7 @@ export async function loadThread(threadId: string) {
     const messages = mergeRefreshedThreadMessages(mail$.messages.get(), refreshed, threadId)
     mail$.messages.set(messages)
     mail$.messagesCursor.set(result.next_cursor ?? '')
+    mail$.messagesCursorThread.set(threadId)
     mail$.messagesLoadingMore.set(false)
     // Reconcile against the unfiltered page: a hidden placeholder can still be
     // unread, and dropping it must not mark the thread read early.
@@ -927,6 +1110,9 @@ export async function loadMoreMessages(threadId: string) {
   if (!cursor || mail$.messagesLoadingMore.get()) return
   // Guard against a stale click after the thread switched out from under us.
   if (ui$.selectedThread.get() !== threadId) return
+  // Paging the new thread with the previous thread's cursor would prepend to the
+  // wrong messages.
+  if (mail$.messagesCursorThread.get() !== threadId) return
   mail$.messagesLoadingMore.set(true)
   try {
     const result = await invoke<{ messages: Message[]; next_cursor?: string }>('mail.threadRead', {

@@ -89,7 +89,7 @@ class AndroidPlatformServices(
                 if (callback != null) {
                     callback(Result.failure(error))
                 } else {
-                    Toast.makeText(activity, "File save failed", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(activity, R.string.mobile_android_file_save_failed, Toast.LENGTH_SHORT).show()
                 }
                 return@registerForActivityResult
             }
@@ -145,9 +145,10 @@ class AndroidPlatformServices(
                 .build()
                 .launchUrl(activity, Uri.parse(url))
         }.recoverCatching {
-            if (!tryOpenUrl(url)) error(activity.getString(R.string.mobile_android_oauth_browser_launch_failed))
+            // No custom tab and no browser either: the custom tab's failure is the reason.
+            if (!tryOpenUrl(url)) throw it
         }.onFailure {
-            onFailure(it.message ?: activity.getString(R.string.mobile_android_oauth_browser_launch_failed))
+            onFailure(it.message.orEmpty())
         }
     }
 
@@ -361,7 +362,7 @@ class AndroidMobileHost(
                 return@registerForActivityResult
             }
             if (result.resultCode != Activity.RESULT_OK || accountName.isNullOrBlank()) {
-                val message = "Google account picker did not return an account."
+                val message = activity.getString(R.string.mobile_android_google_picker_no_account)
                 lastGoogleDeviceAuthError = message
                 Log.i(
                     GOOGLE_AUTH_LOG_TAG,
@@ -398,7 +399,7 @@ class AndroidMobileHost(
                     lastGoogleDeviceAuthError =
                         it.message?.takeIf { message -> message.isNotBlank() }
                             ?: it::class.simpleName
-                            ?: "Google AccountManager token request failed."
+                            ?: activity.getString(R.string.mobile_android_google_token_failed)
                     Log.w(GOOGLE_AUTH_LOG_TAG, "Google AccountManager token request failed; falling back to browser", it)
                     AndroidSyncDiagnosticLog.appendRedacted(
                         activity,
@@ -460,6 +461,11 @@ class AndroidMobileHost(
             "Account emails below are masked to only the first letter and domain (e.g. j***@gmail.com).\n" +
                 "Review before sharing.\n\n"
         shareBytesViaFileProvider(activity, (disclosure + body).toByteArray(), "meron-sync-log.txt", "text/plain")
+    }
+
+    override fun shareText(text: String) {
+        val intent = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+        activity.startActivity(Intent.createChooser(intent, null))
     }
 
     override fun pendingCrashReport(): String = AndroidCrashLog.pending(activity)

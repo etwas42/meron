@@ -34,7 +34,7 @@ export function ComposerHeaderFields({
   const fromAccount = sendable.find((acc) => acc.id === draft.accountId)
 
   return (
-    <div className="shrink-0 border-b border-border bg-header px-4 py-2 select-none">
+    <div className="shrink-0 border-b border-border/60 bg-chat px-4 py-2 select-none">
       {identityCount > 1 && (
         <div className="flex items-center gap-2 border-b border-border/60 py-1.5">
           <span className={labelClass}>{t('composer.fields.from')}</span>

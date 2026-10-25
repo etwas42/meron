@@ -1,30 +1,51 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useValue } from '@legendapp/state/react'
 import type { MouseEvent } from 'react'
 import { useTranslation } from '../../lib/i18n'
 import { AlertCircle, Check, ChevronDown, ExternalLink, Loader2, MoreHorizontal, Star } from 'lucide-react'
 
 import { openDraftCompose, openMessageTab } from '../../states/compose'
 import { retrySend } from '../../states/quickReplySend'
+import { settings$ } from '../../states/settings'
+import { thread$ } from '../../states/thread'
 import type { Message } from '../../types'
+import { targetWithin, useDismissOnOutside } from '../menu/useDismissOnOutside'
 import { formatFullTimestamp, formatMessageStamp } from './messageHelpers'
 import { AddressRow } from './AddressList'
 import { BlockedRemoteButton } from './BlockedRemoteButton'
 import { MessageContent } from './MessageContent'
 import { useMessageView } from './useMessageView'
-import type { MessageContextMenuState } from './MessageContextMenu'
+
+// The bubble's horizontal chrome: p-3.5 on both sides is rem-based, so it scales with
+// the interface size; the two 1px borders and a pixel of slack (so a line measured
+// at max-content never wraps on rounding) do not.
+const BUBBLE_CHROME = '1.75rem + 3px'
+// How long an HTML bubble stays hidden waiting for its frame to report a width
+// before it shows at full width anyway (a frame that never loads, say).
+const NATURAL_WIDTH_WAIT_MS = 1000
 
 interface MessageBubbleProps {
   message: Message
   // Index of this bubble's first image within the thread-wide gallery list.
   galleryOffset: number
-  onOpenContextMenu: (state: MessageContextMenuState) => void
-  onLinkHover?: (url: string | null) => void
 }
 
-export function MessageBubble({ message, galleryOffset, onOpenContextMenu, onLinkHover }: MessageBubbleProps) {
+export function MessageBubble({ message, galleryOffset }: MessageBubbleProps) {
   const { t } = useTranslation()
   const [metaOpen, setMetaOpen] = useState(false)
+  // The overlay below is stacked with the list, so it lies under the composer
+  // floating over it (MessagePane); a click that the overlay does not catch
+  // has to close the panel from here.
+  useDismissOnOutside(
+    metaOpen,
+    (target) => targetWithin(target, '.message-scroll'),
+    () => setMetaOpen(false),
+  )
+  // What a short HTML body needs, so its bubble can hug it (see below): undefined
+  // until the frame has reported, null for a body that fills the bubble.
+  const [naturalWidth, setNaturalWidth] = useState<number | null | undefined>(undefined)
   const view = useMessageView(message)
+  const fullHeight = useValue(settings$.chatFullMessages)
   const {
     outgoing,
     isDraft,
@@ -40,9 +61,22 @@ export function MessageBubble({ message, galleryOffset, onOpenContextMenu, onLin
     replyToDiffers,
   } = view
 
+  // Attached images and videos lay out against the bubble's width outside the
+  // frame, so a bubble carrying them keeps its full width whatever its text needs.
+  const hugsText = useHtmlBody && view.bubbleAttachmentImages.length === 0 && view.videos.length === 0
+  // An unmeasured HTML bubble is laid out at full width but not painted: showing
+  // it would flash it wide before it shrinks to its text. A frame measured before
+  // reports its width ahead of the first paint, so this only holds a first open.
+  const widthPending = hugsText && naturalWidth === undefined
+  useEffect(() => {
+    if (!widthPending) return
+    const timer = window.setTimeout(() => setNaturalWidth((current) => current ?? null), NATURAL_WIDTH_WAIT_MS)
+    return () => window.clearTimeout(timer)
+  }, [widthPending])
+
   const openActionsMenu = (event: MouseEvent<HTMLButtonElement>) => {
     const rect = event.currentTarget.getBoundingClientRect()
-    onOpenContextMenu({ x: rect.right, y: rect.bottom + 4, message, hideOpenInNewTab: true })
+    thread$.messageContextMenu.set({ x: rect.right, y: rect.bottom + 4, message, hideOpenInNewTab: true })
   }
   const openMessageOrDraftTab = () => {
     if (isDraft) {
@@ -55,7 +89,14 @@ export function MessageBubble({ message, galleryOffset, onOpenContextMenu, onLin
   return (
     <div className={`flex w-full animate-slide-up ${outgoing ? 'justify-end' : 'justify-start'}`}>
       <div
-        className={`group/message-bubble relative ${useHtmlBody ? 'w-[70%]' : 'max-w-[70%]'} min-w-[100px] p-3.5 border transition-shadow duration-200 ${
+        style={
+          hugsText && naturalWidth
+            ? { width: `calc(${naturalWidth}px + ${BUBBLE_CHROME})` }
+            : widthPending
+              ? { visibility: 'hidden' }
+              : undefined
+        }
+        className={`group/message-bubble relative ${useHtmlBody ? (hugsText && naturalWidth ? 'max-w-[70%] min-w-[260px]' : 'w-[70%] min-w-[100px]') : 'max-w-[70%] min-w-[100px]'} p-3.5 border transition-shadow duration-200 ${
           isDraft
             ? 'bg-bubble-out/55 text-bubble-out-text/80 border-dashed border-accent/45 rounded-2xl rounded-tr-sm shadow-none'
             : outgoing
@@ -186,7 +227,14 @@ export function MessageBubble({ message, galleryOffset, onOpenContextMenu, onLin
           )}
         </div>
 
-        <MessageContent message={message} view={view} galleryOffset={galleryOffset} onLinkHover={onLinkHover} />
+        <MessageContent
+          message={message}
+          view={view}
+          galleryOffset={galleryOffset}
+          fullHeight={fullHeight}
+          surface={isDraft ? 'draft' : 'bubble'}
+          onNaturalWidth={hugsText ? setNaturalWidth : undefined}
+        />
       </div>
     </div>
   )

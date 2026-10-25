@@ -1,6 +1,8 @@
 import { observable } from '@legendapp/state'
 import { invoke } from '../lib/bridge'
+import { ui$ } from './ui'
 import {
+  DEFAULT_DARK_ID,
   DEFAULT_LIGHT_ID,
   THEME_TOKEN_KEYS,
   TOKEN_CSS_VAR,
@@ -8,9 +10,12 @@ import {
   builtinTheme,
   defaultThemeId,
   sanitizeCustomThemes,
+  sideNavInkColor,
+  type Appearance,
   type CustomTheme,
   type ThemeDef,
 } from '../lib/themes'
+import { toHex } from '../lib/color'
 import { sanitizeChatWallpaper } from '../lib/wallpapers'
 import {
   BASE_ROOT_FONT_SIZE,
@@ -31,8 +36,10 @@ import {
 } from '../lib/shortcuts'
 import type { Account, ChatWallpaper } from '../types'
 import { normalizeI18nLanguage, resolveI18nLanguageFromWebLocale, type SupportedI18nLanguage } from '../lib/i18n'
+import { setTrayStyle } from '../lib/trayStyle'
 
-// Persisted user settings. This module maps 1:1 to the `settings` DB table: each
+// Core-persisted user settings map to the `settings` DB table; native tray
+// style is loaded separately through tray.getStyle. Each core-backed
 // field is one row, keyed by `DB_KEY`. Persistence is centralized here (a single
 // root listener) so individual fields never wire up their own save logic.
 
@@ -49,6 +56,8 @@ export type ConversationLayout = 'chat' | 'traditional'
 export type KanbanBoardColumn = {
   accountId: string
   folderId: string
+  /** A saved search: the column lists only this folder's matches for it. */
+  query?: string
 }
 export type KanbanBoard = {
   id: string
@@ -85,8 +94,17 @@ export const EMPTY_PROXY: ProxySettings = {
 }
 
 export type Settings = {
-  /** Active built-in or custom theme id. The theme's appearance controls light/dark mode. */
+  /**
+   * Active built-in or custom theme id while not following the system. The
+   * theme's appearance controls light/dark mode.
+   */
   themeId: string
+  /** Whether the theme switches between `lightThemeId` and `darkThemeId` with the OS appearance. */
+  themeFollowSystem: boolean
+  /** Theme painted while following the system and the OS is light. */
+  lightThemeId: string
+  /** Theme painted while following the system and the OS is dark. */
+  darkThemeId: string
   /** User-created themes (see lib/themes.ts). */
   customThemes: CustomTheme[]
   /** Interface font: '' for Inter, a lib/fonts option id, or a typed family name. */
@@ -98,13 +116,25 @@ export type Settings = {
   /** Message body text size, in percent, applied on top of `fontScale`. */
   messageFontScale: number
   showRealAvatars: boolean
+  /** Whether a message that brings its own light design is drawn inverted under
+   *  a dark theme, instead of as a light card (see `darkensCanvas`). */
+  darkMessageBodies: boolean
+  /** Whether a bubble shrinks a table too wide for it to fit, instead of scrolling it. */
+  autoFitMessages: boolean
+  /** Whether reader tabs put reply, forward and delete in a bar at the bottom. */
+  readerBottomActions: boolean
   /** Whether to overlay an inbox unread-count badge on side navigation account avatars. */
   showUnreadAccountBadge: boolean
   sendShortcut: SendShortcut
   /** Chat bubbles or the traditional stacked reading view (desktop only). */
   conversationLayout: ConversationLayout
+  /** Whether chat bubbles grow to fit long bodies instead of scrolling inside a
+   *  capped box, so only the conversation scrolls (desktop only). */
+  chatFullMessages: boolean
   /** Whether native spell checking is requested in composer prose fields. */
   spellCheck: boolean
+  /** Whether replies carry the message they answer, quoted under the reply text. */
+  quoteReplies: boolean
   /**
    * App-wide signature HTML, inserted into new messages and replies. Accounts
    * follow this unless they carry their own override (see Account.signature).
@@ -134,6 +164,20 @@ export type Settings = {
   hiddenSideNavAccounts: string[]
   /** Whether the synthetic unified inbox appears in the desktop side navigation. */
   showUnifiedInboxInSideNav: boolean
+  /**
+   * Whether the optional Tasks surface is available. Off by default: an upgrade
+   * shouldn't grow a rail entry nobody asked for. The tasks themselves live in
+   * the core's own tables, not here — this is only whether the app shows them.
+   */
+  tasksEnabled: boolean
+  /** Whether the optional calendar is available, like [tasksEnabled]. */
+  calendarEnabled: boolean
+  /**
+   * Whether the window's close button hides Meron to the tray instead of
+   * quitting (Linux and Windows; macOS keeps its own close/quit split).
+   */
+  closeToTray: boolean
+  monochromeTrayIcon: boolean
   /** Whether to poll for new releases in the background (see states/update.ts). */
   autoUpdateCheck: boolean
   /** Version whose update banner the user dismissed, so it doesn't nag. */
@@ -156,16 +200,24 @@ export const KANBAN_COLUMN_MAX_WIDTH = 700
 // nothing else needs to change.
 const DB_KEY = {
   themeId: 'theme_id',
+  themeFollowSystem: 'theme_follow_system',
+  lightThemeId: 'light_theme_id',
+  darkThemeId: 'dark_theme_id',
   customThemes: 'custom_themes',
   fontFamily: 'font_family',
   messageFontFamily: 'message_font_family',
   fontScale: 'font_scale',
   messageFontScale: 'message_font_scale',
   showRealAvatars: 'show_real_avatars',
+  darkMessageBodies: 'dark_message_bodies',
+  autoFitMessages: 'auto_fit_messages',
+  readerBottomActions: 'reader_bottom_actions',
   showUnreadAccountBadge: 'show_unread_account_badge',
   sendShortcut: 'send_shortcut',
   conversationLayout: 'conversation_layout',
+  chatFullMessages: 'chat_full_messages',
   spellCheck: 'spell_check',
+  quoteReplies: 'quote_replies',
   signature: 'signature',
   remoteImageSenders: 'remote_image_senders',
   kanbanBoards: 'kanban_boards',
@@ -176,12 +228,15 @@ const DB_KEY = {
   kanbanMinimizedColumns: 'kanban_minimized_columns',
   hiddenSideNavAccounts: 'hidden_sidenav_accounts',
   showUnifiedInboxInSideNav: 'show_unified_inbox_in_sidenav',
+  tasksEnabled: 'tasks_enabled',
+  calendarEnabled: 'calendar_enabled',
+  closeToTray: 'close_to_tray',
   autoUpdateCheck: 'auto_update_check',
   dismissedUpdateVersion: 'dismissed_update_version',
   language: 'language',
   shortcutOverrides: 'shortcut_overrides',
   proxy: 'proxy',
-} satisfies Record<keyof Settings, string>
+} satisfies Record<Exclude<keyof Settings, 'monochromeTrayIcon'>, string>
 
 /** Keys to request from `app.prefsGet` on boot. */
 export const SETTINGS_DB_KEYS = Object.values(DB_KEY)
@@ -213,23 +268,58 @@ export function isSendKey(
 // light-on-dark first-paint flash. The DB rows stay authoritative.
 const THEME_CACHE_KEY = 'meron-theme-cache'
 
-function bootstrapThemeSelection(): Pick<Settings, 'themeId' | 'customThemes'> {
+type ThemeSelection = Pick<Settings, 'themeId' | 'themeFollowSystem' | 'lightThemeId' | 'darkThemeId' | 'customThemes'>
+
+const DARK_SCHEME_QUERY = '(prefers-color-scheme: dark)'
+
+function mediaAppearance(): Appearance {
+  try {
+    return window.matchMedia(DARK_SCHEME_QUERY).matches ? 'dark' : 'light'
+  } catch {
+    return 'light'
+  }
+}
+
+function bootstrapThemeSelection(): ThemeSelection & { systemAppearance: Appearance } {
+  const nonEmpty = (value: unknown, fallback: string) => (typeof value === 'string' && value ? value : fallback)
   try {
     const raw = localStorage.getItem(THEME_CACHE_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as Record<string, unknown>
       return {
-        themeId: typeof parsed.themeId === 'string' && parsed.themeId ? parsed.themeId : DEFAULT_LIGHT_ID,
+        themeId: nonEmpty(parsed.themeId, DEFAULT_LIGHT_ID),
+        themeFollowSystem: parsed.themeFollowSystem === true,
+        lightThemeId: nonEmpty(parsed.lightThemeId, DEFAULT_LIGHT_ID),
+        darkThemeId: nonEmpty(parsed.darkThemeId, DEFAULT_DARK_ID),
         customThemes: sanitizeCustomThemes(parsed.customThemes) ?? [],
+        // The last appearance the backend reported: the webview's own media
+        // query reflects the app's pinned appearance, not the system's.
+        systemAppearance:
+          parsed.systemAppearance === 'dark' || parsed.systemAppearance === 'light'
+            ? parsed.systemAppearance
+            : mediaAppearance(),
       }
     }
   } catch {
     // Corrupt cache: fall through to defaults; the DB hydrate will repair it.
   }
-  return { themeId: DEFAULT_LIGHT_ID, customThemes: [] }
+  return {
+    themeId: DEFAULT_LIGHT_ID,
+    themeFollowSystem: false,
+    lightThemeId: DEFAULT_LIGHT_ID,
+    darkThemeId: DEFAULT_DARK_ID,
+    customThemes: [],
+    systemAppearance: mediaAppearance(),
+  }
 }
 
 const themeBootstrap = bootstrapThemeSelection()
+
+/**
+ * The OS light/dark preference, which a theme following the system resolves
+ * against. Fed by the backend (see watchSystemAppearance); not a setting.
+ */
+export const systemAppearance$ = observable<Appearance>(themeBootstrap.systemAppearance)
 
 // Typography, like the theme, is painted before the DB rows arrive, so it keeps
 // its own localStorage mirror to avoid a reflow from the default font/size to
@@ -323,16 +413,24 @@ export function applyDocumentLanguage(lang: SupportedI18nLanguage) {
 
 export const settings$ = observable<Settings>({
   themeId: themeBootstrap.themeId,
+  themeFollowSystem: themeBootstrap.themeFollowSystem,
+  lightThemeId: themeBootstrap.lightThemeId,
+  darkThemeId: themeBootstrap.darkThemeId,
   customThemes: themeBootstrap.customThemes,
   fontFamily: fontBootstrap.fontFamily,
   messageFontFamily: fontBootstrap.messageFontFamily,
   fontScale: fontBootstrap.fontScale,
   messageFontScale: fontBootstrap.messageFontScale,
   showRealAvatars: false,
+  darkMessageBodies: false,
+  autoFitMessages: false,
+  readerBottomActions: false,
   showUnreadAccountBadge: false,
   sendShortcut: 'mod_enter',
   conversationLayout: 'chat',
+  chatFullMessages: false,
   spellCheck: true,
+  quoteReplies: false,
   signature: '',
   remoteImageSenders: [],
   kanbanBoards: [],
@@ -343,11 +441,28 @@ export const settings$ = observable<Settings>({
   kanbanMinimizedColumns: {},
   hiddenSideNavAccounts: [],
   showUnifiedInboxInSideNav: true,
+  tasksEnabled: true,
+  calendarEnabled: true,
+  closeToTray: true,
+  // Boot gets the native saved choice/default before hydrating settings.
+  monochromeTrayIcon: false,
   autoUpdateCheck: true,
   dismissedUpdateVersion: null,
   language: null,
   shortcutOverrides: {},
   proxy: EMPTY_PROXY,
+})
+
+// The backend decides what the close button does, so hand it the setting. Its
+// default matches ours, so only a change (hydration included) needs sending.
+settings$.closeToTray.onChange(({ value }) => {
+  void invoke('window.setCloseToTray', { enabled: value }).catch(() => {})
+})
+
+// Native hydration only updates the UI; user changes persist through the
+// ordered native style updater rather than the core settings table.
+settings$.monochromeTrayIcon.onChange(({ value }) => {
+  if (!hydrating) setTrayStyle(value)
 })
 
 // lib/shortcuts resolves chords from a local mirror, so keep it in step with the
@@ -406,22 +521,43 @@ settings$.onChange(({ changes }) => {
   if (hydrating) return
   const seen = new Set<string>()
   for (const change of changes) {
-    const field = change.path[0] as keyof Settings | undefined
+    const field = change.path[0] as keyof typeof DB_KEY | undefined
     if (!field || seen.has(field) || !(field in DB_KEY)) continue
     seen.add(field)
     persistSetting(DB_KEY[field], settings$[field].get())
   }
 })
 
+function findTheme(id: string): ThemeDef | undefined {
+  return settings$.customThemes.peek().find((theme) => theme.id === id) ?? builtinTheme(id)
+}
+
+/**
+ * The theme chosen for one appearance while following the system. A stale id
+ * (deleted custom theme, renamed builtin), or a custom theme since edited to the
+ * other appearance, falls back to that appearance's default.
+ */
+export function followedThemeDef(appearance: Appearance): ThemeDef {
+  const id = appearance === 'dark' ? settings$.darkThemeId.peek() : settings$.lightThemeId.peek()
+  const theme = findTheme(id)
+  return theme?.appearance === appearance ? theme : builtinTheme(defaultThemeId(appearance))!
+}
+
 /** The theme that should currently be painted, after fallbacks. */
 export function resolveThemeDef(): ThemeDef {
-  const id = settings$.themeId.peek()
-  const custom = settings$.customThemes.peek().find((theme) => theme.id === id)
-  if (custom) return custom
-  const builtin = builtinTheme(id)
+  if (settings$.themeFollowSystem.peek()) return followedThemeDef(systemAppearance$.peek())
   // A stale id (deleted custom theme, renamed builtin) falls back to Meron Light.
-  if (builtin) return builtin
-  return builtinTheme(DEFAULT_LIGHT_ID)!
+  return findTheme(settings$.themeId.peek()) ?? builtinTheme(DEFAULT_LIGHT_ID)!
+}
+
+/**
+ * Ids of the themes the picker marks as chosen: the fixed theme, or the light
+ * and dark pair while following the system. Resolved like the paint is, so a
+ * stale id highlights the default that actually shows.
+ */
+export function chosenThemeIds(): string[] {
+  if (settings$.themeFollowSystem.peek()) return [followedThemeDef('light').id, followedThemeDef('dark').id]
+  return [resolveThemeDef().id]
 }
 
 // The active theme is reflected to the DOM (the `.dark` class drives Tailwind
@@ -446,22 +582,97 @@ function applyActiveTheme() {
     THEME_CACHE_KEY,
     JSON.stringify({
       themeId: settings$.themeId.peek(),
+      themeFollowSystem: settings$.themeFollowSystem.peek(),
+      lightThemeId: settings$.lightThemeId.peek(),
+      darkThemeId: settings$.darkThemeId.peek(),
       customThemes: settings$.customThemes.peek(),
+      systemAppearance: systemAppearance$.peek(),
     }),
   )
 
   // The webview doesn't paint the native title bar, so hand the appearance to
-  // the backend as well and let it tint the window chrome to match.
-  void invoke('window.setAppearance', { dark: def.appearance === 'dark' }).catch(() => {})
+  // the backend as well and let it tint the window chrome to match. Where the
+  // title bar takes arbitrary colors (GTK client-side decorations) it wears
+  // the side nav's, reading as one piece with the rail below it.
+  void invoke('window.setAppearance', {
+    dark: def.appearance === 'dark',
+    titlebar: toHex(def.tokens.bgSideNav),
+    titlebarText: toHex(sideNavInkColor(def.tokens)),
+  }).catch(() => {})
 }
 applyActiveTheme()
 settings$.themeId.onChange(applyActiveTheme)
+settings$.themeFollowSystem.onChange(applyActiveTheme)
+settings$.lightThemeId.onChange(applyActiveTheme)
+settings$.darkThemeId.onChange(applyActiveTheme)
+systemAppearance$.onChange(applyActiveTheme)
 // Editing the active custom theme must repaint live.
 settings$.customThemes.onChange(applyActiveTheme)
 
-/** Pick the active theme. Its appearance controls light/dark mode. */
+/**
+ * Keep `systemAppearance$` on the OS preference: the backend reports it once
+ * asked and again on every change. Where it has no source (a platform without
+ * one, a desktop without the settings portal, a plain browser), the webview's
+ * media query stands in. Returns the unsubscribe.
+ */
+export function watchSystemAppearance(): () => void {
+  let fromBackend = false
+  const report = (detail: unknown) => {
+    const dark = (detail as { dark?: unknown } | null)?.dark
+    if (typeof dark !== 'boolean') return
+    fromBackend = true
+    systemAppearance$.set(dark ? 'dark' : 'light')
+  }
+
+  let media: MediaQueryList | null = null
+  const onMedia = () => {
+    if (!fromBackend && media) systemAppearance$.set(media.matches ? 'dark' : 'light')
+  }
+  try {
+    media = window.matchMedia(DARK_SCHEME_QUERY)
+    media.addEventListener('change', onMedia)
+  } catch {
+    media = null
+  }
+
+  const eventsOn = (window as any).runtime?.EventsOn
+  const unsubscribe = typeof eventsOn === 'function' ? eventsOn('system.appearance', report) : null
+  void invoke<{ dark: boolean | null }>('system.appearance')
+    .then((result) => {
+      report(result)
+      onMedia()
+    })
+    .catch(onMedia)
+
+  return () => {
+    media?.removeEventListener('change', onMedia)
+    if (typeof unsubscribe === 'function') unsubscribe()
+  }
+}
+
+/**
+ * Pick a theme. While following the system it becomes the choice for its own
+ * appearance; otherwise it is the active theme, and its appearance controls
+ * light/dark mode.
+ */
 export function selectTheme(def: ThemeDef) {
-  settings$.themeId.set(def.id)
+  if (!settings$.themeFollowSystem.peek()) settings$.themeId.set(def.id)
+  else if (def.appearance === 'dark') settings$.darkThemeId.set(def.id)
+  else settings$.lightThemeId.set(def.id)
+}
+
+/**
+ * Turn following the system on or off without changing what is on screen when
+ * the system already matches: the painted theme becomes the pick for its
+ * appearance, or the fixed theme when turning off.
+ */
+export function setThemeFollowSystem(enabled: boolean) {
+  if (enabled === settings$.themeFollowSystem.peek()) return
+  const current = resolveThemeDef()
+  if (!enabled) settings$.themeId.set(current.id)
+  else if (current.appearance === 'dark') settings$.darkThemeId.set(current.id)
+  else settings$.lightThemeId.set(current.id)
+  settings$.themeFollowSystem.set(enabled)
 }
 
 /** Add or replace a custom theme and make it the active choice for its appearance. */
@@ -481,6 +692,8 @@ export function deleteCustomTheme(id: string) {
   if (!theme) return
   settings$.customThemes.set(current.filter((item) => item.id !== id))
   if (settings$.themeId.peek() === id) settings$.themeId.set(DEFAULT_LIGHT_ID)
+  if (settings$.lightThemeId.peek() === id) settings$.lightThemeId.set(DEFAULT_LIGHT_ID)
+  if (settings$.darkThemeId.peek() === id) settings$.darkThemeId.set(DEFAULT_DARK_ID)
 }
 
 // Whether hydration found a stored kanban-boards row. An empty stored list means
@@ -489,6 +702,12 @@ let storedKanbanBoards = false
 
 export function hasStoredKanbanBoards(): boolean {
   return storedKanbanBoards
+}
+
+/** A saved search query as a column stores it: one line, trimmed. The column key
+ * joins its parts with newlines, so a query must not carry one. */
+export function normalizeKanbanColumnQuery(query: string): string {
+  return query.replace(/\s+/g, ' ').trim()
 }
 
 export function sanitizeKanbanBoards(raw: unknown): KanbanBoard[] | null {
@@ -506,7 +725,12 @@ export function sanitizeKanbanBoards(raw: unknown): KanbanBoard[] | null {
           const col = column as Record<string, unknown>
           if (typeof col.accountId !== 'string' || typeof col.folderId !== 'string') return []
           if (!col.accountId || !col.folderId) return []
-          return [{ accountId: col.accountId, folderId: col.folderId }]
+          const query = typeof col.query === 'string' ? normalizeKanbanColumnQuery(col.query) : ''
+          return [
+            query
+              ? { accountId: col.accountId, folderId: col.folderId, query }
+              : { accountId: col.accountId, folderId: col.folderId },
+          ]
         })
       : []
     seen.add(obj.id)
@@ -633,6 +857,18 @@ export function setUnifiedInboxSideNavVisible(visible: boolean) {
   settings$.showUnifiedInboxInSideNav.set(visible)
 }
 
+export function setCalendarEnabled(enabled: boolean) {
+  settings$.calendarEnabled.set(enabled)
+  if (!enabled) ui$.calendarOpen.set(false)
+}
+
+export function setTasksEnabled(enabled: boolean) {
+  settings$.tasksEnabled.set(enabled)
+  // Switching the feature off takes its panel with it; the list it was on is
+  // left alone, so switching back on reopens where the user was.
+  if (!enabled) ui$.tasksPanelOpen.set(false)
+}
+
 /** Apply persisted settings loaded from the DB (via `app.prefsGet`). */
 export function hydrateSettings(prefs: Record<string, unknown>) {
   hydrating = true
@@ -642,6 +878,13 @@ export function hydrateSettings(prefs: Record<string, unknown>) {
     // theme arriving in a later hydrate.
     const themeId = prefs[DB_KEY.themeId]
     if (typeof themeId === 'string' && themeId) settings$.themeId.set(themeId)
+    const lightThemeId = prefs[DB_KEY.lightThemeId]
+    if (typeof lightThemeId === 'string' && lightThemeId) settings$.lightThemeId.set(lightThemeId)
+    const darkThemeId = prefs[DB_KEY.darkThemeId]
+    if (typeof darkThemeId === 'string' && darkThemeId) settings$.darkThemeId.set(darkThemeId)
+    if (typeof prefs[DB_KEY.themeFollowSystem] === 'boolean') {
+      settings$.themeFollowSystem.set(prefs[DB_KEY.themeFollowSystem] as boolean)
+    }
     const customThemes = sanitizeCustomThemes(prefs[DB_KEY.customThemes])
     if (customThemes) settings$.customThemes.set(customThemes)
 
@@ -658,6 +901,18 @@ export function hydrateSettings(prefs: Record<string, unknown>) {
       settings$.showRealAvatars.set(prefs[DB_KEY.showRealAvatars] as boolean)
     }
 
+    if (typeof prefs[DB_KEY.darkMessageBodies] === 'boolean') {
+      settings$.darkMessageBodies.set(prefs[DB_KEY.darkMessageBodies] as boolean)
+    }
+
+    if (typeof prefs[DB_KEY.autoFitMessages] === 'boolean') {
+      settings$.autoFitMessages.set(prefs[DB_KEY.autoFitMessages] as boolean)
+    }
+
+    if (typeof prefs[DB_KEY.readerBottomActions] === 'boolean') {
+      settings$.readerBottomActions.set(prefs[DB_KEY.readerBottomActions] as boolean)
+    }
+
     if (typeof prefs[DB_KEY.showUnreadAccountBadge] === 'boolean') {
       settings$.showUnreadAccountBadge.set(prefs[DB_KEY.showUnreadAccountBadge] as boolean)
     }
@@ -672,8 +927,16 @@ export function hydrateSettings(prefs: Record<string, unknown>) {
       settings$.conversationLayout.set(conversationLayout)
     }
 
+    if (typeof prefs[DB_KEY.chatFullMessages] === 'boolean') {
+      settings$.chatFullMessages.set(prefs[DB_KEY.chatFullMessages] as boolean)
+    }
+
     if (typeof prefs[DB_KEY.spellCheck] === 'boolean') {
       settings$.spellCheck.set(prefs[DB_KEY.spellCheck] as boolean)
+    }
+
+    if (typeof prefs[DB_KEY.quoteReplies] === 'boolean') {
+      settings$.quoteReplies.set(prefs[DB_KEY.quoteReplies] as boolean)
     }
 
     if (typeof prefs[DB_KEY.signature] === 'string') {
@@ -729,6 +992,18 @@ export function hydrateSettings(prefs: Record<string, unknown>) {
       settings$.showUnifiedInboxInSideNav.set(prefs[DB_KEY.showUnifiedInboxInSideNav] as boolean)
     }
 
+    if (typeof prefs[DB_KEY.tasksEnabled] === 'boolean') {
+      settings$.tasksEnabled.set(prefs[DB_KEY.tasksEnabled] as boolean)
+    }
+
+    if (typeof prefs[DB_KEY.calendarEnabled] === 'boolean') {
+      settings$.calendarEnabled.set(prefs[DB_KEY.calendarEnabled] as boolean)
+    }
+
+    if (typeof prefs[DB_KEY.closeToTray] === 'boolean') {
+      settings$.closeToTray.set(prefs[DB_KEY.closeToTray] as boolean)
+    }
+
     if (typeof prefs[DB_KEY.autoUpdateCheck] === 'boolean') {
       settings$.autoUpdateCheck.set(prefs[DB_KEY.autoUpdateCheck] as boolean)
     }
@@ -752,4 +1027,16 @@ export function hydrateSettings(prefs: Record<string, unknown>) {
   // before the Wails bindings existed, so its window.setAppearance was lost,
   // and hydrating a theme identical to the current one fires no onChange.
   applyActiveTheme()
+}
+
+// Native storage owns this setting. Hydration must neither write a core pref
+// nor send a native style command (which would persist a platform default).
+export function hydrateTrayStyle(monochrome: boolean) {
+  const previous = hydrating
+  hydrating = true
+  try {
+    settings$.monochromeTrayIcon.set(monochrome)
+  } finally {
+    hydrating = previous
+  }
 }

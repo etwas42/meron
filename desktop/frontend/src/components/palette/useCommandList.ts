@@ -17,6 +17,7 @@ import {
   Search,
   SearchCheck,
   Settings,
+  Paperclip,
   Star,
   Sun,
   Trash2,
@@ -27,15 +28,19 @@ import { createElement } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { ui$, closeCommandPalette, focusGlobalSearch, focusQuickReply } from '../../states/ui'
 import { selectTheme, settings$ } from '../../states/settings'
+import { useChosenThemeIds } from '../../lib/useThemeChoice'
 import { accounts$ } from '../../states/accounts'
 import { BUILTIN_THEMES } from '../../lib/themes'
 import {
   closeKanbanBoard,
   createKanbanBoard,
   kanban$,
+  kanbanPaneThreadId,
+  markBoardAllRead,
   openMailAccount,
   selectKanbanBoard,
   setGlobalKanbanFilter,
+  setGlobalKanbanAttachmentsOnly,
 } from '../../states/kanban'
 import { thread$ } from '../../states/thread'
 import { mail$, syncMail } from '../../states/mail'
@@ -52,10 +57,12 @@ import type { Command } from './paletteCommands'
 export function useCommandList(): Command[] {
   const boards = useValue(settings$.kanbanBoards)
   const activeBoardId = useValue(kanban$.activeBoardId)
-  const themeId = useValue(settings$.themeId)
+  const chosenThemeIds = useChosenThemeIds()
   const customThemes = useValue(settings$.customThemes)
   const filterMode = useValue(ui$.filterMode)
   const kanbanFilterMode = useValue(kanban$.globalFilter)
+  const attachmentsOnly = useValue(ui$.attachmentsOnly)
+  const kanbanAttachmentsOnly = useValue(kanban$.globalAttachmentsOnly)
   const selectedAccount = useValue(ui$.selectedAccount)
   const selectedFolder = useValue(ui$.selectedFolder)
   const selectedThread = useValue(ui$.selectedThread)
@@ -73,6 +80,10 @@ export function useCommandList(): Command[] {
     const setActiveFilterMode = activeBoardId
       ? setGlobalKanbanFilter
       : (mode: typeof filterMode) => ui$.filterMode.set(mode)
+    const activeAttachmentsOnly = activeBoardId ? kanbanAttachmentsOnly : attachmentsOnly
+    const setActiveAttachmentsOnly = activeBoardId
+      ? setGlobalKanbanAttachmentsOnly
+      : (on: boolean) => ui$.attachmentsOnly.set(on)
     const railShortcut = (slot: number) => RAIL_SHORTCUT_IDS[slot - 1] as ShortcutId | undefined
 
     const list: Command[] = [
@@ -97,7 +108,8 @@ export function useCommandList(): Command[] {
         label: 'Mark all as read',
         icon: icon(MailCheck),
         keywords: 'clear unread',
-        run: run(() => void markAllRead()),
+        // With a board open, the list behind it is hidden: mark the board instead.
+        run: run(() => void (activeBoardId ? markBoardAllRead(activeBoardId) : markAllRead())),
       },
       {
         id: 'search.thread',
@@ -106,7 +118,7 @@ export function useCommandList(): Command[] {
         keywords: 'find conversation in',
         shortcut: 'search.thread',
         run: run(() => {
-          const visible = !!selectedThread && (!activeBoardId || !!kanban$.paneThreadId.peek())
+          const visible = !!selectedThread && (!activeBoardId || !!kanbanPaneThreadId())
           if (visible) thread$.searchOpen.set(true)
           else focusGlobalSearch()
         }),
@@ -188,17 +200,26 @@ export function useCommandList(): Command[] {
         active: activeFilterMode === 'starred',
         run: run(() => setActiveFilterMode('starred')),
       },
+      {
+        // A toggle on top of the filters above, not a fourth filter.
+        id: 'filter.attachments',
+        label: activeAttachmentsOnly ? 'Filter: Show all, not only with attachments' : 'Filter: Only with attachments',
+        icon: icon(Paperclip),
+        keywords: 'files has attachment toggle',
+        active: activeAttachmentsOnly,
+        run: run(() => setActiveAttachmentsOnly(!activeAttachmentsOnly)),
+      },
       ...[...BUILTIN_THEMES, ...customThemes].map((theme) => ({
         id: `theme.${theme.id}`,
         label: `Theme: ${theme.name}`,
         icon: icon(theme.appearance === 'light' ? Sun : Moon),
-        active: themeId === theme.id,
+        active: chosenThemeIds.includes(theme.id),
         run: run(() => selectTheme(theme)),
       })),
     ]
 
     // Actions on the open conversation — only when one is on screen.
-    if (selectedThread && (!activeBoardId || !!kanban$.paneThreadId.peek())) {
+    if (selectedThread && (!activeBoardId || !!kanbanPaneThreadId())) {
       list.push(
         {
           id: 'reply.focus',
@@ -303,10 +324,12 @@ export function useCommandList(): Command[] {
   }, [
     boards,
     activeBoardId,
-    themeId,
+    chosenThemeIds,
     customThemes,
     filterMode,
     kanbanFilterMode,
+    attachmentsOnly,
+    kanbanAttachmentsOnly,
     selectedAccount,
     selectedFolder,
     selectedThread,

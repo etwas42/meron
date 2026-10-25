@@ -1,6 +1,6 @@
 import { X, RefreshCw } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
 import { ui$ } from '../../states/ui'
 import { Field } from '../field/Field'
 import { Button } from '../button/Button'
@@ -40,10 +40,6 @@ export function AccountDialog({ variant = 'dialog' }: AccountDialogProps) {
     ui$.reconnectAccountId.set('')
     ui$.setupOpen.set(false)
   }
-
-  // Esc closes the layered add-account dialog. The full-screen onboarding setup
-  // variant has no close affordance, so it ignores Esc.
-  useEscapeKey(onClose, !isSetup)
 
   // The full-screen first-run onboarding: provider cards stacked above the form.
   if (isSetup) {
@@ -87,54 +83,57 @@ export function AccountDialog({ variant = 'dialog' }: AccountDialogProps) {
   // selected provider on the right — same shape as the Settings dialog.
   const active = PROVIDERS.find((p) => p.isActive(mode))
   return (
-    <div className="fixed inset-0 flex items-center justify-center bg-black/40 dark:bg-black/60 backdrop-blur-[3px] z-50 p-4 select-none animate-fade-in">
-      <div className="bg-chats border border-border text-primary w-full max-w-[760px] max-h-[92vh] rounded-3xl shadow-2xl animate-slide-up flex flex-col overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-border/70 shrink-0">
-          <h2 className="text-[0.9375rem] font-bold tracking-tight leading-tight">
-            {ctl.editing
-              ? t('accounts.actions.editAccountTitle', { defaultValue: 'Account server settings' })
-              : reconnecting
-                ? t('accounts.actions.reconnectAccountTitle', { defaultValue: 'Reconnect account' })
-                : t('accounts.actions.addAccountTitle')}
-          </h2>
-          <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
-        </div>
+    <Dialog
+      onClose={onClose}
+      closeOnBackdrop={false}
+      aria-labelledby="account-dialog-title"
+      className="max-w-[760px] max-h-[92vh] flex flex-col overflow-hidden"
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-border/70 shrink-0">
+        <h2 id="account-dialog-title" className="text-[0.9375rem] font-bold tracking-tight leading-tight">
+          {ctl.editing
+            ? t('accounts.actions.editAccountTitle', { defaultValue: 'Account server settings' })
+            : reconnecting
+              ? t('accounts.actions.reconnectAccountTitle', { defaultValue: 'Reconnect account' })
+              : t('accounts.actions.addAccountTitle')}
+        </h2>
+        <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
+      </div>
 
-        {/* Body: add-account shows provider selection; reconnect already knows
+      {/* Body: add-account shows provider selection; reconnect already knows
             the provider, so it uses the full width for the active form. */}
-        <div className="flex h-[500px] min-h-0">
-          {!reconnecting && <AccountProviderRail mode={mode} setMode={setMode} />}
-          <div className="flex-1 min-w-0 overflow-y-auto p-5 flex flex-col gap-4">
-            <div>
-              <h3 className="text-[0.8125rem] font-bold tracking-tight leading-tight">{active?.label}</h3>
-              <p className="text-[0.65625rem] text-secondary mt-0.5 font-medium">
-                {active ? t(active.descriptionKey, { defaultValue: active.defaultDescription }) : null}
-              </p>
-            </div>
-            <div className="flex flex-col gap-3.5">
-              <AccountDialogForm ctl={ctl} classes={classes} isSetup={false} />
-            </div>
-            <AccountDialogError error={ctl.error} />
-            {ctl.certPrompt && (
-              <CertificateTrustPanel
-                prompt={ctl.certPrompt}
-                onTrust={ctl.trustCertificate}
-                onDismiss={ctl.dismissCertPrompt}
-              />
-            )}
+      <div className="flex h-[500px] min-h-0">
+        {!reconnecting && <AccountProviderRail mode={mode} setMode={setMode} />}
+        <div className="flex-1 min-w-0 overflow-y-auto p-5 flex flex-col gap-4">
+          <div>
+            <h3 className="text-[0.8125rem] font-bold tracking-tight leading-tight">{active?.label}</h3>
+            <p className="text-[0.65625rem] text-secondary mt-0.5 font-medium">
+              {active ? t(active.descriptionKey, { defaultValue: active.defaultDescription }) : null}
+            </p>
           </div>
-        </div>
-
-        {/* Footer */}
-        <div className="flex justify-end gap-2 px-6 py-4 border-t border-border/70 shrink-0 select-none">
-          <Button variant="ghost" onClick={onClose}>
-            {t('buttons.cancel')}
-          </Button>
-          {!isOAuth && <SaveButton ctl={ctl} isSetup={false} />}
+          <div className="flex flex-col gap-3.5">
+            <AccountDialogForm ctl={ctl} classes={classes} isSetup={false} />
+          </div>
+          <AccountDialogError error={ctl.error} />
+          {ctl.certPrompt && (
+            <CertificateTrustPanel
+              prompt={ctl.certPrompt}
+              onTrust={ctl.trustCertificate}
+              onDismiss={ctl.dismissCertPrompt}
+            />
+          )}
         </div>
       </div>
-    </div>
+
+      {/* Footer */}
+      <div className="flex justify-end gap-2 px-6 py-4 border-t border-border/70 shrink-0 select-none">
+        <Button variant="ghost" onClick={onClose}>
+          {t('buttons.cancel')}
+        </Button>
+        {!isOAuth && <SaveButton ctl={ctl} isSetup={false} />}
+      </div>
+    </Dialog>
   )
 }
 

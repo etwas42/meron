@@ -6,7 +6,7 @@ import kotlin.test.assertEquals
 class MailLocationPrefsTest {
     @Test
     fun defaultsToUnifiedInboxWhenNoMailboxWasSaved() {
-        val prefs = FakePreferences()
+        val prefs = MemoryAppPreferences()
 
         assertEquals(UNIFIED_ACCOUNT_ID, loadLastMailAccountId(prefs))
         assertEquals(INBOX_FOLDER, loadLastMailFolder(prefs))
@@ -14,7 +14,7 @@ class MailLocationPrefsTest {
 
     @Test
     fun savesAndRestoresAccountMailbox() {
-        val prefs = FakePreferences()
+        val prefs = MemoryAppPreferences()
 
         saveLastMailLocation(prefs, "acct-1", "Archive")
 
@@ -24,7 +24,7 @@ class MailLocationPrefsTest {
 
     @Test
     fun blankSavedValuesFallBackToUnifiedInbox() {
-        val prefs = FakePreferences()
+        val prefs = MemoryAppPreferences()
 
         saveLastMailLocation(prefs, "", "")
 
@@ -32,65 +32,80 @@ class MailLocationPrefsTest {
         assertEquals(INBOX_FOLDER, loadLastMailFolder(prefs))
     }
 
-    private class FakePreferences : AppPreferences {
-        private val strings = mutableMapOf<String, String>()
-        private val booleans = mutableMapOf<String, Boolean>()
-        private val ints = mutableMapOf<String, Int>()
-        private val stringSets = mutableMapOf<String, Set<String>>()
+    @Test
+    fun remembersFoldersIndependentlyForEachAccountAndUnifiedMailbox() {
+        val prefs = MemoryAppPreferences()
 
-        override fun getString(
-            key: String,
-            default: String,
-        ): String = strings[key] ?: default
+        saveLastMailLocation(prefs, "acct-1", "Projects/Work")
+        saveLastMailLocation(prefs, "acct-2", "Archive")
+        saveLastMailLocation(prefs, UNIFIED_ACCOUNT_ID, "starred")
 
-        override fun putString(
-            key: String,
-            value: String,
-        ) {
-            strings[key] = value
-        }
+        assertEquals("Projects/Work", loadMailFolderForAccount(prefs, "acct-1"))
+        assertEquals("Archive", loadMailFolderForAccount(prefs, "acct-2"))
+        assertEquals("starred", loadMailFolderForAccount(prefs, UNIFIED_ACCOUNT_ID))
+        assertEquals(INBOX_FOLDER, loadMailFolderForAccount(prefs, "new-account"))
+        assertEquals("starred", loadLastMailFolder(prefs))
 
-        override fun getBoolean(
-            key: String,
-            default: Boolean,
-        ): Boolean = booleans[key] ?: default
+        saveLastMailLocation(prefs, "acct-1", "Sent")
+        assertEquals("Sent", loadMailFolderForAccount(prefs, "acct-1"))
+        assertEquals("Archive", loadMailFolderForAccount(prefs, "acct-2"))
+        assertEquals("Sent", loadLastMailFolder(prefs))
+    }
 
-        override fun putBoolean(
-            key: String,
-            value: Boolean,
-        ) {
-            booleans[key] = value
-        }
+    @Test
+    fun upgradePreservesLegacyFolderWhenSwitchingToAnotherAccount() {
+        val prefs = MemoryAppPreferences()
+        prefs.putString(LAST_MAIL_ACCOUNT_PREF, "acct-1")
+        prefs.putString(LAST_MAIL_FOLDER_PREF, "Projects/Work")
 
-        override fun getInt(
-            key: String,
-            default: Int,
-        ): Int = ints[key] ?: default
+        assertEquals("Projects/Work", loadLastMailFolder(prefs))
+        assertEquals(INBOX_FOLDER, loadMailFolderForAccount(prefs, "acct-2"))
+        saveLastMailLocation(prefs, "acct-2", "Archive")
 
-        override fun putInt(
-            key: String,
-            value: Int,
-        ) {
-            ints[key] = value
-        }
+        assertEquals("Projects/Work", loadMailFolderForAccount(prefs, "acct-1"))
+        assertEquals("Archive", loadLastMailFolder(prefs))
+    }
 
-        override fun getStringSet(
-            key: String,
-            default: Set<String>,
-        ): Set<String> = stringSets[key] ?: default
+    @Test
+    fun migrationOnlyWritesOnceAndNormalSavesUseTwoWrites() {
+        val prefs = MemoryAppPreferences()
+        prefs.putString(LAST_MAIL_ACCOUNT_PREF, "acct-1")
+        prefs.putString(LAST_MAIL_FOLDER_PREF, "Projects/Work")
+        val beforeMigration = prefs.stringWrites
 
-        override fun putStringSet(
-            key: String,
-            value: Set<String>,
-        ) {
-            stringSets[key] = value
-        }
+        assertEquals("Projects/Work", loadMailFolderForAccount(prefs, "acct-1"))
+        assertEquals(beforeMigration, prefs.stringWrites)
+        migrateLegacyMailFolder(prefs)
+        assertEquals(beforeMigration + 1, prefs.stringWrites)
+        assertEquals("", prefs.getString(LAST_MAIL_FOLDER_PREF, ""))
+        migrateLegacyMailFolder(prefs)
+        loadMailFolderForAccount(prefs, "acct-1")
+        assertEquals(beforeMigration + 1, prefs.stringWrites)
 
-        override fun remove(key: String) {
-            strings.remove(key)
-            booleans.remove(key)
-            ints.remove(key)
-            stringSets.remove(key)
-        }
+        saveLastMailLocation(prefs, "acct-2", "Archive")
+        assertEquals(beforeMigration + 3, prefs.stringWrites)
+    }
+
+    @Test
+    fun clearingAnAccountFolderDoesNotAffectOtherAccounts() {
+        val prefs = MemoryAppPreferences()
+        saveLastMailLocation(prefs, "acct-1", "Projects/Work")
+        saveLastMailLocation(prefs, "acct-2", "Archive")
+
+        clearMailFolderForAccount(prefs, "acct-1")
+
+        assertEquals(INBOX_FOLDER, loadMailFolderForAccount(prefs, "acct-1"))
+        assertEquals("Archive", loadMailFolderForAccount(prefs, "acct-2"))
+    }
+
+    @Test
+    fun clearingLegacyAccountFolderDoesNotRestoreItOnNextLoad() {
+        val prefs = MemoryAppPreferences()
+        prefs.putString(LAST_MAIL_ACCOUNT_PREF, "acct-1")
+        prefs.putString(LAST_MAIL_FOLDER_PREF, "Projects/Work")
+
+        clearMailFolderForAccount(prefs, "acct-1")
+
+        assertEquals(INBOX_FOLDER, loadMailFolderForAccount(prefs, "acct-1"))
     }
 }

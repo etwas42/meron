@@ -6,27 +6,33 @@ const MAX_THREAD_LIST_WIDTH = 560
 const MIN_KANBAN_PANE_WIDTH = 25
 const MAX_KANBAN_PANE_WIDTH = 60
 
+// A pointer over a message frame moves within the frame's own document, out of
+// this window's sight, so the frames stop taking the pointer for the drag.
 function beginDrag(onMove: (event: PointerEvent) => void) {
   const onUp = () => {
     window.removeEventListener('pointermove', onMove)
     window.removeEventListener('pointerup', onUp)
     document.body.style.cursor = ''
     document.body.style.userSelect = ''
+    document.body.classList.remove('pane-resizing')
   }
   document.body.style.cursor = 'col-resize'
   document.body.style.userSelect = 'none'
+  document.body.classList.add('pane-resizing')
   window.addEventListener('pointermove', onMove)
   window.addEventListener('pointerup', onUp)
 }
 
 // Drag the kanban conversation pane's left edge; width persists as a percentage
-// of the app shell (passed in as `shell`).
-export function startKanbanResize(event: ReactPointerEvent<HTMLDivElement>, shell: HTMLElement | null) {
+// of the viewport, matching KanbanConversationPane's vw sizing. Its right edge
+// excludes the content frame's border/margin and any open Tasks panel.
+export function startKanbanResize(event: ReactPointerEvent<HTMLDivElement>) {
   event.preventDefault()
-  if (!shell) return
+  const pane = event.currentTarget.parentElement
+  if (!pane) return
   beginDrag((moveEvent) => {
-    const rect = shell.getBoundingClientRect()
-    const raw = ((rect.right - moveEvent.clientX) / rect.width) * 100
+    const rect = pane.getBoundingClientRect()
+    const raw = ((rect.right - moveEvent.clientX) / window.innerWidth) * 100
     const next = Math.min(MAX_KANBAN_PANE_WIDTH, Math.max(MIN_KANBAN_PANE_WIDTH, raw))
     settings$.kanbanPaneWidth.set(Math.round(next))
   })

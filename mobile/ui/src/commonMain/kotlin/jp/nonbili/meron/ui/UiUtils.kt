@@ -9,6 +9,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.outlined.StickyNote2
 import androidx.compose.material.icons.filled.AllInbox
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Outbox
@@ -17,6 +19,7 @@ import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material.icons.outlined.Drafts
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -44,6 +47,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import jp.nonbili.meron.shared.AccountSummary
 import jp.nonbili.meron.shared.FolderSummary
+import jp.nonbili.meron.shared.MessageAttachment
 import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.SendIdentity
 import jp.nonbili.meron.shared.ThreadSummary
@@ -149,15 +153,46 @@ internal fun folderIcon(name: String): ImageVector =
         else -> Icons.Outlined.FolderOpen
     }
 
-internal fun kanbanColumnKey(column: KanbanColumnSpec): String = "${column.accountId}\n${column.folderId}"
+// A saved search is its own column beside the folder's plain one, so its query is
+// part of the key. Splitting a key on "\n" still yields account and folder first.
+internal fun kanbanColumnKey(column: KanbanColumnSpec): String {
+    val base = "${column.accountId}\n${column.folderId}"
+    return if (column.query.isBlank()) base else "$base\n${column.query}"
+}
+
+/** The account and folder a column key names, whatever query follows them. */
+internal fun kanbanKeyAccountFolder(key: String): Pair<String, String> {
+    val parts = key.split("\n")
+    return parts[0] to parts.getOrElse(1) { "" }
+}
+
+/** A saved search query as a column stores it: one line, trimmed. The column key
+ *  joins its parts with newlines, so a query must not carry one. */
+internal fun normalizeKanbanColumnQuery(query: String): String = query.replace(Regex("\\s+"), " ").trim()
+
+/** The board search inside a saved search column narrows it. The core reads each
+ *  side of an `AND` as its own query that must also match, so free text, dates
+ *  and read state narrow the saved query rather than merging into or replacing
+ *  its own. The search starts a line of its own, which no quote or group left
+ *  open in the saved query reaches into. A leading `OR` would be a stray word
+ *  there, so it is dropped. */
+internal fun narrowKanbanQuery(
+    saved: String,
+    query: String,
+): String {
+    if (saved.isBlank()) return query.trim()
+    val extra = query.trim().replace(Regex("^(?:OR(?:\\s+|$))+"), "")
+    return if (extra.isBlank()) saved else "$saved\nAND $extra"
+}
 
 internal fun identityKey(identity: SendIdentity): String = "${identity.accountId}|${identity.email}"
 
+@Composable
 internal fun FilterMode.label(): String =
     when (this) {
-        FilterMode.All -> "All"
-        FilterMode.Unread -> "Unread"
-        FilterMode.Starred -> "Starred"
+        FilterMode.All -> tr("filters.all")
+        FilterMode.Unread -> tr("filters.unread")
+        FilterMode.Starred -> tr("filters.starred")
     }
 
 internal fun FilterMode.protocolValue(): String =
@@ -178,6 +213,7 @@ internal fun List<ThreadSummary>.filteredKanbanThreads(
     filter: FilterMode,
     search: String,
     searchAlreadyApplied: Boolean = false,
+    attachmentsOnly: Boolean = false,
 ): List<ThreadSummary> {
     val query = search.trim().lowercase()
     return filter { thread ->
@@ -186,7 +222,7 @@ internal fun List<ThreadSummary>.filteredKanbanThreads(
                 FilterMode.All -> true
                 FilterMode.Unread -> thread.unread
                 FilterMode.Starred -> thread.starred || thread.hasStarredItems
-            }
+            } && (!attachmentsOnly || thread.hasAttachments)
         val queryOk =
             searchAlreadyApplied ||
                 query.isBlank() ||
@@ -239,7 +275,8 @@ internal fun kanbanColumnUnreadCount(
     folderUnread: Int?,
     loadedThreads: List<ThreadSummary> = emptyList(),
 ): Int {
-    if (isUnifiedStarredColumn(column)) return loadedUnreadCount(loadedThreads)
+    // The folder's total says nothing about how many of a saved search's matches are unread.
+    if (isUnifiedStarredColumn(column) || column.query.isNotBlank()) return loadedUnreadCount(loadedThreads)
     return folderUnread ?: loadedUnreadCount(loadedThreads)
 }
 
@@ -256,6 +293,18 @@ internal fun columnTitle(
     return folderTitle(column.accountId, column.folderId, accounts, foldersByAccount)
 }
 
+/** A column as the search scope names it: a saved search shares its folder's
+ *  title, so its query tells the two apart. */
+@Composable
+internal fun searchScopeTitle(
+    column: KanbanColumnSpec,
+    accounts: List<AccountSummary>,
+    foldersByAccount: Map<String, List<FolderSummary>>,
+): String {
+    val title = columnTitle(column, accounts, foldersByAccount)
+    return if (column.query.isBlank()) title else "$title · ${column.query}"
+}
+
 /** The display name of a mailbox, as a kanban column or the mail list shows it. */
 @Composable
 internal fun folderTitle(
@@ -265,7 +314,7 @@ internal fun folderTitle(
     foldersByAccount: Map<String, List<FolderSummary>>,
 ): String {
     if (accountId == UNIFIED_ACCOUNT_ID) {
-        if (folderId.equals(STARRED_FOLDER, ignoreCase = true)) return "Unified starred"
+        if (folderId.equals(STARRED_FOLDER, ignoreCase = true)) return tr("kanban.columns.unifiedStarred")
         // The unified view now switches folders, so the header names the folder
         // ("Sent", "Archive") the way a single account's does.
         return unifiedFolderLabel(folderId)
@@ -278,7 +327,7 @@ internal fun folderTitle(
             ?: folderId
     val folderLabel =
         if (folder.equals(INBOX_FOLDER, ignoreCase = true)) {
-            if (account?.let(::accountSummaryIsRss) == true) "Feed" else "Inbox"
+            tr(if (account?.let(::accountSummaryIsRss) == true) "mobile.feedTitle" else "folders.roles.inbox")
         } else {
             folder
         }
@@ -315,25 +364,16 @@ internal fun KanbanBoardTile(
     }
 }
 
-@Composable
-internal fun boardBackgroundBrush(board: KanbanBoardSpec?): Brush? {
-    if (board == null || !board.hasBoardStyle()) return null
-    return Brush.verticalGradient(
-        listOf(
-            MaterialTheme.colorScheme.background,
-            MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.92f),
-            MaterialTheme.colorScheme.background,
-        ),
-    )
-}
-
 @OptIn(ExperimentalUuidApi::class)
-internal fun defaultKanbanBoard(accounts: List<AccountSummary>): KanbanBoardSpec {
+internal fun defaultKanbanBoard(
+    accounts: List<AccountSummary>,
+    name: String = "Kanban board",
+): KanbanBoardSpec {
     val columns = mutableListOf(KanbanColumnSpec(UNIFIED_ACCOUNT_ID, INBOX_FOLDER))
     accounts.forEach { account -> columns += KanbanColumnSpec(account.id, INBOX_FOLDER) }
     return KanbanBoardSpec(
         id = "kb-${Uuid.random()}",
-        name = "Kanban board",
+        name = name,
         columns = columns.distinctBy(::kanbanColumnKey),
     )
 }
@@ -442,18 +482,51 @@ internal fun appLanguageDisplayName(tag: String): String = languageEndonyms[tag]
 
 internal fun onOffLabel(enabled: Boolean): String = if (enabled) "On" else "Off"
 
-internal fun AppAppearanceMode.next(): AppAppearanceMode {
-    val values = AppAppearanceMode.entries.filterNot { it == AppAppearanceMode.System }
-    val index = values.indexOf(this).takeIf { it >= 0 } ?: 0
-    return values[(index + 1) % values.size]
-}
-
 internal fun formatBytes(bytes: Long): String =
     when {
         bytes >= 1_000_000 -> "${bytes / 1_000_000} MB"
         bytes >= 1_000 -> "${bytes / 1_000} KB"
         else -> "$bytes B"
     }
+
+// Inline MIME parts can have no filename extension even though the cached
+// media key has one. Keep it when saving, sharing, or opening the attachment.
+internal fun safeAttachmentFilename(attachment: MessageAttachment): String {
+    val name = safeAttachmentFilename(attachment.filename)
+    val mediaMime =
+        attachment.mimeType
+            .substringBefore(';')
+            .trim()
+            .lowercase()
+    if (!mediaMime.startsWith("image/") && !mediaMime.startsWith("video/")) return name
+    val extension = Regex("\\.[a-z0-9]+$", RegexOption.IGNORE_CASE)
+    val imageExtension = Regex("\\.(?:a?png|jpe?g|jpe|jfif|gif|webp|bmp|tiff?|heic|heif|avif|svg|ico|jxl|jp2|jpx)$", RegexOption.IGNORE_CASE)
+    val cachedSuffix = extension.find(attachment.key)?.value.orEmpty()
+    val mimeSuffix =
+        when (
+            attachment.mimeType
+                .substringBefore(';')
+                .trim()
+                .lowercase()
+        ) {
+            "image/png" -> ".png"
+            "image/jpeg" -> ".jpg"
+            "image/gif" -> ".gif"
+            "image/webp" -> ".webp"
+            "image/bmp", "image/x-ms-bmp" -> ".bmp"
+            "image/tiff" -> ".tiff"
+            "image/heic" -> ".heic"
+            "image/heif" -> ".heif"
+            "image/avif" -> ".avif"
+            "image/svg+xml" -> ".svg"
+            "image/x-icon", "image/vnd.microsoft.icon" -> ".ico"
+            else -> ""
+        }
+    val suffix = cachedSuffix.takeIf { imageExtension.matches(it) } ?: mimeSuffix.ifBlank { cachedSuffix }
+    val hasExtension =
+        if (imageExtension.matches(suffix)) imageExtension.containsMatchIn(name) else extension.containsMatchIn(name)
+    return if (hasExtension) name else name + suffix
+}
 
 internal fun safeAttachmentFilename(name: String): String {
     val cleaned =
@@ -489,6 +562,23 @@ internal fun FilterModeSegmentedControl(
             )
         }
     }
+}
+
+// The attachments toggle under the filter control: an on/off narrowing of
+// whichever read-state filter is chosen above, not a fourth choice beside them.
+@Composable
+internal fun AttachmentsOnlyMenuItem(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    DropdownMenuItem(
+        text = { Text(tr("chat.attachments")) },
+        leadingIcon = { Icon(Icons.Filled.AttachFile, contentDescription = null) },
+        trailingIcon = {
+            if (checked) Icon(Icons.Filled.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+        },
+        onClick = { onCheckedChange(!checked) },
+    )
 }
 
 // Unified starred contains starred cards only, including after optimistic flag changes.

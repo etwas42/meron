@@ -86,15 +86,18 @@ func TestSidecarErrorMessage(t *testing.T) {
 
 func TestSidecarCallTimeouts(t *testing.T) {
 	tests := map[string]time.Duration{
-		"account.connect":     45 * time.Second,
-		"messages.thread":     30 * time.Second,
-		"messages.markRead":   30 * time.Second,
-		"folders.list":        15 * time.Second,
-		"folders.delete":      30 * time.Second,
-		"rss.importOpml":      15 * time.Second,
-		"backup.export":       30 * time.Second,
-		"backup.import":       30 * time.Second,
-		"unknown.sidecarCall": 5 * time.Second,
+		"account.connect":             45 * time.Second,
+		"messages.thread":             30 * time.Second,
+		"messages.markRead":           30 * time.Second,
+		"messages.markStarred":        30 * time.Second,
+		"messages.markAllRead":        30 * time.Second,
+		"messages.markAllReadUnified": 30 * time.Second,
+		"folders.list":                15 * time.Second,
+		"folders.delete":              30 * time.Second,
+		"rss.importOpml":              15 * time.Second,
+		"backup.export":               30 * time.Second,
+		"backup.import":               30 * time.Second,
+		"unknown.sidecarCall":         5 * time.Second,
 	}
 	for method, want := range tests {
 		if got := sidecarCallTimeout(method); got != want {

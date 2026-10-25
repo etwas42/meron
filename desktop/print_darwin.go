@@ -15,15 +15,15 @@ import (
 	"unsafe"
 )
 
-func printNativeMail(html string) (bool, error) {
+func printNativeMail(html string) (bool, string, error) {
 	document := C.CString(html)
 	defer C.free(unsafe.Pointer(document))
 	result := C.printMailDocument(document)
 	if result < 0 {
-		return false, nil
+		return false, "print document unavailable", nil
 	}
 	if result == 0 {
-		return false, fmt.Errorf("could not present mail print dialog")
+		return false, "", fmt.Errorf("could not present mail print dialog")
 	}
-	return true, nil
+	return true, "", nil
 }

@@ -4,12 +4,18 @@
 // view should land. Both conversation layouts (chat bubbles and the traditional
 // rows) share the hook, so they share these rules.
 
-/** Breathing room left above a message the view anchors to. */
-export const ANCHOR_GAP_PX = 24
+/** Breathing room left above a message the view anchors to: the list's own top
+ *  padding (ConversationMessageList's pt-3), so a message brought to the top
+ *  sits where the first one does. */
+export const ANCHOR_GAP_PX = 12
 
 /** Below this distance from the bottom the view counts as "at the bottom", and
  *  content growing underneath keeps it there. */
 export const BOTTOM_STICK_PX = 160
+
+/** How close to the end the view has to be for content resizing under it to
+ *  keep it there: at the end, give or take sub-pixel rounding. */
+export const BOTTOM_FOLLOW_PX = 2
 
 /** How long after positioning the view keeps re-anchoring to its target while
  *  asynchronously measured bodies settle. Mirrors THREAD_OPEN_ANCHOR_WINDOW_MS
@@ -53,6 +59,17 @@ export type VerticalBounds = {
   bottom: number
 }
 
+/** CSS variable holding the height of the composer that floats over the bottom
+ *  of the scroll container. MessagePane sets it on the conversation, so the
+ *  list and what sits beside it inherit it; unset when there is no composer. */
+export const COMPOSER_OVERLAP_VAR = '--me-composer-overlap'
+
+/** The part of the scroll container the reader can actually see: its bottom
+ *  edge raised by the composer floating over it. */
+export function visibleBounds(container: VerticalBounds, composerOverlap: number): VerticalBounds {
+  return { top: container.top, bottom: container.bottom - Math.max(0, composerOverlap) }
+}
+
 /**
  * Whether a message counts as read from where the view sits. Two ways to have
  * read it: its bottom came into view, so all of it has been on screen, or its
@@ -69,6 +86,40 @@ export type ScrollMetrics = {
   scrollTop: number
   scrollHeight: number
   clientHeight: number
+}
+
+/** The part of a container's geometry a layout change moves and a reader's
+ *  scrolling does not. */
+export type ScrollGeometry = Pick<ScrollMetrics, 'scrollHeight' | 'clientHeight'>
+
+/**
+ * Whether a scroll event should drop the pin, given that it is not one our own
+ * positioning caused. A settling pin goes on any position we did not set. A
+ * persistent one — an expanded message, whose frame and images can resize it
+ * long after — also needs the container to be the size it was when we last
+ * looked: a body resizing can clamp the view to a position we never set, and
+ * that must not read as the reader leaving. A scrollbar drag, which may reach
+ * us as nothing but scroll events, moves the view inside unchanged geometry.
+ */
+export function scrollReleasesPin({
+  persistent,
+  metrics,
+  expectedScrollTop,
+  settledGeometry,
+}: {
+  persistent: boolean
+  metrics: ScrollMetrics
+  expectedScrollTop: number | null
+  /** Geometry as of our last positioning, resize pass or scroll event. */
+  settledGeometry: ScrollGeometry | null
+}): boolean {
+  if (!isUserScroll(metrics.scrollTop, expectedScrollTop)) return false
+  if (!persistent) return true
+  return (
+    settledGeometry !== null &&
+    metrics.scrollHeight === settledGeometry.scrollHeight &&
+    metrics.clientHeight === settledGeometry.clientHeight
+  )
 }
 
 /**
@@ -115,18 +166,18 @@ export function isAtBottom(metrics: ScrollMetrics, scrollHeight = metrics.scroll
 }
 
 /**
- * Where a content resize should leave the view. `previousScrollHeight` is the
- * height measured before this resize, which is what isAtBottom is asked
- * against. Returns null to leave the scroll position alone.
+ * Where a content resize should leave the view. `previous` is the view as it
+ * was before this resize: the position the reader last left it at, against
+ * the height it had then. Returns null to leave the scroll position alone.
  */
 export function resolveResizeScrollTop({
   metrics,
-  previousScrollHeight,
+  previous,
   containerOffsetTop,
   pinned,
 }: {
   metrics: ScrollMetrics
-  previousScrollHeight: number
+  previous: ScrollMetrics
   containerOffsetTop: number
   /** Measured position of the pinned message, or null when nothing is pinned. */
   pinned: { offsetTop: number; offset: number } | null
@@ -138,8 +189,12 @@ export function resolveResizeScrollTop({
   }
   // Keep the view pinned to the bottom only when it already was (content grew
   // under the fold, e.g. images loading after open). A reader scrolled up — to
-  // star or reread something — must not be yanked back down.
-  if (!isAtBottom(metrics, previousScrollHeight)) return null
+  // star or reread something — must not be yanked back down, however little:
+  // not the stick distance a newly arrived message is judged by, since bodies
+  // above the view mount and re-measure as the reader scrolls towards them,
+  // and every one of those resizes would undo the scroll that brought them in.
+  if (bottomScrollTop(previous) - previous.scrollTop > BOTTOM_FOLLOW_PX) return null
+  if (metrics.scrollHeight <= previous.scrollHeight) return null
   return metrics.scrollHeight
 }
 
@@ -153,14 +208,15 @@ export type OpenScrollPlan = {
 }
 
 /**
- * Where the view belongs when a thread renders: a restored position when
- * returning to a thread, the first unread on a fresh open, the top of the
- * newest message when everything is read, and nothing at all when messages
- * merely re-render.
+ * Where the view belongs when a thread renders: the end of the thread after
+ * the reader's own send, a restored position when returning to a thread, the
+ * first unread on a fresh open, the top of the newest message when everything
+ * is read, and nothing at all when messages merely re-render.
  */
 export function resolveOpenScroll({
   isNewThread,
   grew,
+  ownSend = false,
   savedScrollTop,
   savedAtBottom,
   metrics,
@@ -173,6 +229,8 @@ export function resolveOpenScroll({
   isNewThread: boolean
   /** Whether the message count grew since the last positioning. */
   grew: boolean
+  /** Whether the reader's own just-sent message was rendered by this pass. */
+  ownSend?: boolean
   /** Position saved when leaving this thread, or null when not restoring. */
   savedScrollTop: number | null
   /** Whether that saved position was at the end of the thread. */
@@ -188,6 +246,11 @@ export function resolveOpenScroll({
   /** offsetTop of the newest message, or null when none is rendered. */
   lastMessageOffsetTop: number | null
 }): OpenScrollPlan {
+  // The reader's own reply outranks everything else: they just wrote it, so
+  // wherever they were — partway through the message they answered, or coming
+  // back from the full editor to a saved position — the view goes to it.
+  if (ownSend) return { scrollTop: metrics.scrollHeight, pin: null }
+
   const unreadAnchor = firstUnreadOffsetTop === null ? null : anchorScrollTop(firstUnreadOffsetTop, containerOffsetTop)
 
   if (savedScrollTop !== null) {

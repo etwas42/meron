@@ -18,6 +18,14 @@ use crate::{mail_model, rss, store};
 /// Default page size when a caller does not ask for one.
 pub const DEFAULT_LIMIT: u32 = 50;
 
+/// How many further pages a request reads when the attachments toggle empties
+/// the one it asked for (see [`ThreadListQuery::next_attachment_cursor`]).
+/// Bounded so a long mailbox with no attachments answers in a few reads, not a
+/// walk of the whole folder (a live search pays a server round-trip per page).
+/// Past the bound the empty page still carries its cursor, and both frontends
+/// offer "Load more" on an empty list that has one.
+pub const ATTACHMENT_PAGE_HOPS: u32 = 5;
+
 /// The mailbox-view inputs, as both transports send them. Only the folder key
 /// differs between the two param vocabularies ("folder" vs "folder_id").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +33,9 @@ pub struct ThreadListQuery {
     pub folder: String,
     pub query: String,
     pub filter: String,
+    /// Keep only threads with attachments. Independent of `filter`, so it
+    /// combines with unread and starred.
+    pub attachments: bool,
     pub before_cursor: Option<(i64, u32)>,
     pub search_before_cursor: Option<SearchCursor>,
     pub limit: u32,
@@ -67,6 +78,10 @@ impl ThreadListQuery {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            attachments: params
+                .get("attachments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             before_cursor: params
                 .get("before_cursor")
                 .and_then(Value::as_str)
@@ -91,8 +106,49 @@ impl ThreadListQuery {
         }
         match self.filter.as_str() {
             "starred" => MailSource::Starred,
-            "unread" => MailSource::Recent { unread_only: true },
-            _ => MailSource::Recent { unread_only: false },
+            filter => MailSource::Recent {
+                filter: store::RecentFilter {
+                    unread_only: filter == "unread",
+                    attachments_only: self.attachments,
+                },
+            },
+        }
+    }
+
+    /// The cursor to read on from when the attachments toggle left `page` with
+    /// no threads but more to come, and `hops` further pages have already been
+    /// read for this request. `None` means `page` is the answer.
+    pub fn next_attachment_cursor(&self, page: &Value, hops: u32) -> Option<String> {
+        if !self.attachments || hops >= ATTACHMENT_PAGE_HOPS {
+            return None;
+        }
+        let empty = page
+            .get("threads")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty);
+        if !empty {
+            return None;
+        }
+        page.get("next_cursor")
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Apply the attachments toggle to a finished page's `threads`. The cached
+    /// recent page is already narrowed in SQL (so its cursor stays exact); the
+    /// other sources — search, starred, feeds — are narrowed here, card by card.
+    pub fn retain_attachment_threads(&self, page: &mut Value) {
+        if !self.attachments {
+            return;
+        }
+        if let Some(threads) = page.get_mut("threads").and_then(Value::as_array_mut) {
+            threads.retain(|thread| {
+                thread
+                    .get("has_attachments")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            });
         }
     }
 
@@ -110,8 +166,9 @@ impl ThreadListQuery {
 pub enum MailSource {
     /// Starred-only view, unpaginated.
     Starred,
-    /// Newest-first page, cursor paged, optionally unread-only.
-    Recent { unread_only: bool },
+    /// Newest-first cached page, cursor paged, optionally narrowed to unread
+    /// mail or mail with attachments.
+    Recent { filter: store::RecentFilter },
     /// Text search across the folder plus Sent, cursor-paginated.
     Search,
 }
@@ -187,7 +244,9 @@ pub fn rss_page(conn: &Connection, account: &str, query: &ThreadListQuery) -> Re
         query.limit as i64,
     )?;
     let folder_unread = rss::unread_count(conn, account)?;
-    Ok(json!({ "threads": threads, "folder_unread": folder_unread }))
+    let mut page = json!({ "threads": threads, "folder_unread": folder_unread });
+    query.retain_attachment_threads(&mut page);
+    Ok(page)
 }
 
 /// Mail accounts: shape a fetched header page into the bridge payload.
@@ -238,13 +297,24 @@ mod tests {
     #[test]
     fn filters_pick_the_same_source_for_both_frontends() {
         let query = |params: Value| ThreadListQuery::from_params(&params, "folder");
+        let recent = |unread_only, attachments_only| MailSource::Recent {
+            filter: store::RecentFilter {
+                unread_only,
+                attachments_only,
+            },
+        };
         assert_eq!(
             query(json!({"filter": "all"})).source(),
-            MailSource::Recent { unread_only: false }
+            recent(false, false)
         );
         assert_eq!(
             query(json!({"filter": "unread"})).source(),
-            MailSource::Recent { unread_only: true }
+            recent(true, false)
+        );
+        // The attachments toggle combines with the read-state filter.
+        assert_eq!(
+            query(json!({"filter": "unread", "attachments": true})).source(),
+            recent(true, true)
         );
         assert_eq!(
             query(json!({"filter": "starred"})).source(),
@@ -258,7 +328,48 @@ mod tests {
         // A blank search is not a search.
         assert_eq!(
             query(json!({"query": "   "})).source(),
-            MailSource::Recent { unread_only: false }
+            recent(false, false)
+        );
+    }
+
+    #[test]
+    fn attachments_toggle_reads_on_past_emptied_pages() {
+        let on = ThreadListQuery::from_params(&json!({"attachments": true}), "folder");
+        let off = ThreadListQuery::from_params(&json!({}), "folder");
+        let empty = json!({"threads": [], "next_cursor": "date:1:2"});
+        assert_eq!(
+            on.next_attachment_cursor(&empty, 0).as_deref(),
+            Some("date:1:2")
+        );
+        // Without the toggle an empty page is the folder's own answer.
+        assert_eq!(off.next_attachment_cursor(&empty, 0), None);
+        // A page with matches, or the last page, is the answer.
+        let found = json!({"threads": [{"id": "t"}], "next_cursor": "date:1:2"});
+        assert_eq!(on.next_attachment_cursor(&found, 0), None);
+        assert_eq!(on.next_attachment_cursor(&json!({"threads": []}), 0), None);
+        // And the walk is bounded.
+        assert_eq!(
+            on.next_attachment_cursor(&empty, ATTACHMENT_PAGE_HOPS),
+            None
+        );
+    }
+
+    #[test]
+    fn attachments_toggle_narrows_finished_pages() {
+        let mut page = json!({"threads": [
+            {"id": "plain", "has_attachments": false},
+            {"id": "files", "has_attachments": true},
+            {"id": "feed"},
+        ]});
+        let off = ThreadListQuery::from_params(&json!({}), "folder");
+        off.retain_attachment_threads(&mut page);
+        assert_eq!(page["threads"].as_array().unwrap().len(), 3);
+
+        let on = ThreadListQuery::from_params(&json!({"attachments": true}), "folder");
+        on.retain_attachment_threads(&mut page);
+        assert_eq!(
+            page["threads"],
+            json!([{"id": "files", "has_attachments": true}])
         );
     }
 

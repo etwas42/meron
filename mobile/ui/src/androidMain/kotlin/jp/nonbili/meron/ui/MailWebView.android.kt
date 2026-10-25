@@ -2,8 +2,10 @@ package jp.nonbili.meron.ui
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Color
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -13,6 +15,7 @@ import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
@@ -28,6 +31,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.net.URI
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 internal const val MAIL_WEB_VIEW_ORIGIN = "https://appassets.androidplatform.net/"
@@ -42,8 +46,15 @@ actual fun MailWebView(
     onOpenImage: (String) -> Unit,
     onLinkLongPress: (String, DpOffset) -> Unit,
     fitWideContent: Boolean,
+    transparentBackground: Boolean,
     onQuoteToggle: (Boolean) -> Unit,
+    onNaturalWidth: (Dp) -> Unit,
+    onOverflowExtent: (Int, Int) -> Unit,
+    mediaMissing: Int,
 ) {
+    val mediaRecovery = remember { MailMediaRecovery(mediaMissing) }
+    val latestOnOverflowExtent = rememberUpdatedState(onOverflowExtent)
+    val latestOnNaturalWidth = rememberUpdatedState(onNaturalWidth)
     val latestOnQuoteToggle = rememberUpdatedState(onQuoteToggle)
     val latestOnHeight = rememberUpdatedState(onContentHeight)
     val latestOnOpenUrl = rememberUpdatedState(onOpenUrl)
@@ -77,6 +88,13 @@ actual fun MailWebView(
             LongPressWebView(context).apply {
                 webViewClient =
                     object : WebViewClient() {
+                        override fun onPageFinished(
+                            view: WebView?,
+                            url: String?,
+                        ) {
+                            view?.retryRecoveredMedia(mediaRecovery)
+                        }
+
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?,
@@ -116,7 +134,14 @@ actual fun MailWebView(
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = false
                 settings.defaultFontSize = 16
-                // The view sizes to content, so it never scrolls internally.
+                // Pinch to zoom, for mail whose text or pictures stay too small
+                // at the size they fit the view in. The on-screen +/- buttons
+                // are the deprecated half of the same switch.
+                settings.setSupportZoom(true)
+                settings.builtInZoomControls = true
+                settings.displayZoomControls = false
+                // The view sizes to content, so it never scrolls internally --
+                // except sideways once zoomed in (see LongPressWebView).
                 isVerticalScrollBarEnabled = false
                 isHorizontalScrollBarEnabled = false
                 setOnLongClickListener {
@@ -140,6 +165,27 @@ actual fun MailWebView(
                         }
                     },
                     "MeronHeight",
+                )
+                addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun report(cssPx: Int) {
+                            post { latestOnNaturalWidth.value(cssPx.dp) }
+                        }
+                    },
+                    "MeronWidth",
+                )
+                addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun report(
+                            cssPx: Int,
+                            widthCssPx: Int,
+                        ) {
+                            post { latestOnOverflowExtent.value(cssPx, widthCssPx) }
+                        }
+                    },
+                    "MeronOverflow",
                 )
                 addJavascriptInterface(
                     object {
@@ -216,12 +262,23 @@ actual fun MailWebView(
                 // sp-sized body in the app and leave the open HTML one behind.
                 textZoom = htmlTextZoom
             }
-            if (webView.tag != html) {
+            // Both ways explicitly, as with the settings above: the view is
+            // retained, and white is WebView's own default.
+            webView.setBackgroundColor(if (transparentBackground) Color.TRANSPARENT else Color.WHITE)
+            val documentChanged = webView.tag != html
+            mediaRecovery.update(mediaMissing, documentChanged)
+            if (documentChanged) {
                 webView.tag = html
-                webView.loadDataWithBaseURL(MAIL_WEB_VIEW_ORIGIN, html, "text/html", "UTF-8", null)
+                webView.loadDataWithBaseURL(MAIL_WEB_VIEW_ORIGIN, mailHtmlWithMediaGeneration(html, mediaRecovery.generation), "text/html", "UTF-8", null)
             }
+            webView.retryRecoveredMedia(mediaRecovery)
         },
     )
+}
+
+private fun WebView.retryRecoveredMedia(recovery: MailMediaRecovery) {
+    val request = recovery.request() ?: return
+    evaluateJavascript(request.script) { result -> recovery.acknowledge(request, result == "true") }
 }
 
 internal fun localMailMediaResponse(
@@ -294,7 +351,12 @@ private fun encodeIllegalUriCharacters(value: String): String =
     }
 
 /** Remembers where the finger went down: [View.OnLongClickListener] is not told the
- *  press position, and without it a link menu can only be placed at the view corner. */
+ *  press position, and without it a link menu can only be placed at the view corner.
+ *
+ *  Also keeps the gestures that are the page's own away from the list or reader
+ *  scrolling around it, which would otherwise take the touch over (and cancel it
+ *  here) as soon as a finger drifted vertically: a pinch, and a sideways drag
+ *  across a page zoomed wider than the view. */
 private class LongPressWebView(
     context: Context,
 ) : WebView(context) {
@@ -302,16 +364,40 @@ private class LongPressWebView(
         private set
     var lastTouchY = 0f
         private set
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-            lastTouchX = event.x
-            lastTouchY = event.y
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastTouchX = event.x
+                lastTouchY = event.y
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - lastTouchX
+                val dy = event.y - lastTouchY
+                if (ownsDrag(dx, dy, touchSlop, canScrollHorizontally(if (dx < 0) 1 else -1))) {
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
+            }
         }
         return super.onTouchEvent(event)
     }
 }
+
+/** Whether a one-finger drag of ([dx], [dy]) from where it went down pans the
+ *  zoomed page sideways rather than scrolling what the web view sits in. */
+internal fun ownsDrag(
+    dx: Float,
+    dy: Float,
+    touchSlop: Int,
+    canPan: Boolean,
+): Boolean = canPan && abs(dx) > touchSlop && abs(dx) > abs(dy)
 
 @Suppress("DEPRECATION")
 internal fun webViewLinkUrl(
@@ -329,3 +415,7 @@ internal fun webViewLinkUrl(
         }
 
 internal actual val MailWebViewFollowsSystemFontScale: Boolean = true
+
+internal actual val MailWebViewFitsWideContent: Boolean = true
+
+internal actual val MailWebViewPinchZooms: Boolean = true

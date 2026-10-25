@@ -316,27 +316,7 @@ func extractEmbeddedSidecar() (string, error) {
 	if info, err := os.Stat(path); err == nil && info.Size() == int64(len(embeddedSidecar)) {
 		return path, nil
 	}
-	tmp, err := os.CreateTemp(dir, name+".tmp-*")
-	if err != nil {
-		return "", err
-	}
-	tmpName := tmp.Name()
-	if _, err := tmp.Write(embeddedSidecar); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := tmp.Chmod(0o755); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return "", err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
+	if err := writeFileAtomic(path, embeddedSidecar, 0o755, 0o755); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -371,7 +351,14 @@ func sidecarCallTimeout(method string) time.Duration {
 	// writing every account, feed and setting.
 	case "backup.export", "backup.import":
 		return 30 * time.Second
-	case "messages.read", "messages.thread", "messages.markRead", "messages.markAllRead", "send", "save_draft", "folders.delete":
+	// A batch is a handful of full messages, attachments included.
+	// A copy downloads every message in the thread in full, then APPENDs each
+	// one to the target.
+	case "messages.saveRawBatch", "messages.copy":
+		return 2 * time.Minute
+	case "messages.exportUids":
+		return 30 * time.Second
+	case "messages.read", "messages.thread", "messages.markRead", "messages.markStarred", "messages.markAllRead", "messages.markAllReadUnified", "send", "save_draft", "folders.delete":
 		return 30 * time.Second
 	case "folders.list", "folders.create", "folders.archive", "messages.recent", "messages.sync", "rss.markRead", "rss.markAllRead", "watch.start", "watch.stop", "discard_draft", "account.addRss", "feed.add", "rss.importOpml":
 		return 15 * time.Second

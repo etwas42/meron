@@ -9,22 +9,24 @@ export function isRssAccount(account: Account | undefined, accountId: string): b
 // Pure thread filter shared by the chat thread list and kanban columns. `keepId`
 // is an open thread to keep visible even when it no longer matches the filter
 // (e.g. selecting an unread thread marks it read but it shouldn't vanish).
+// `attachmentsOnly` is the independent attachments toggle, applied on top of
+// the read-state `mode`.
 export function filterThreads(
   threads: Message[],
   mode: FilterMode,
   keepId?: string,
   keepIds?: Record<string, boolean>,
+  attachmentsOnly = false,
 ): Message[] {
-  if (mode === 'unread') {
-    return threads.filter((thread) => thread.unread || thread.thread_id === keepId || !!keepIds?.[thread.thread_id])
-  }
-  if (mode === 'starred') {
-    return threads.filter(
-      (thread) =>
-        thread.starred || thread.has_starred_items || thread.thread_id === keepId || !!keepIds?.[thread.thread_id],
-    )
-  }
-  return threads
+  const matchesMode = (thread: Message) =>
+    mode === 'unread' ? thread.unread : mode === 'starred' ? thread.starred || !!thread.has_starred_items : true
+  if (mode === 'all' && !attachmentsOnly) return threads
+  return threads.filter(
+    (thread) =>
+      thread.thread_id === keepId ||
+      !!keepIds?.[thread.thread_id] ||
+      (matchesMode(thread) && (!attachmentsOnly || thread.has_attachments)),
+  )
 }
 
 // Mark a set of threads read on the backend. Mail accounts are marked folder-wide

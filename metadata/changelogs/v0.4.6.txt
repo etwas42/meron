@@ -1,0 +1,4 @@
+- Add setting to quote the original in replies
+- Add "Add to Tasks" button to the thread header
+- Add Copy message text to the message menu
+- Show up to four digits in the unread badge

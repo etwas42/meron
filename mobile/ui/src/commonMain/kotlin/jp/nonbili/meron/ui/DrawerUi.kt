@@ -35,6 +35,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
@@ -42,6 +43,7 @@ import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Event
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.History
@@ -243,9 +245,13 @@ internal fun MailDrawer(
     showUnifiedInboxNav: Boolean,
     kanbanBoards: List<KanbanBoardSpec>,
     activeKanbanBoardId: String,
+    tasksEnabled: Boolean,
+    calendarEnabled: Boolean,
     onSelectUnified: () -> Unit,
     onSelectAccount: (AccountSummary) -> Unit,
     onSelectKanbanBoard: (KanbanBoardSpec) -> Unit,
+    onSelectTasks: () -> Unit,
+    onSelectCalendar: () -> Unit,
     onAddAccount: () -> Unit,
     onOpenSettings: () -> Unit,
     onShowAbout: () -> Unit,
@@ -323,8 +329,35 @@ internal fun MailDrawer(
                     )
                 }
             }
-            if (accounts.isNotEmpty() && kanbanBoards.isNotEmpty()) {
+            if (accounts.isNotEmpty() && (kanbanBoards.isNotEmpty() || tasksEnabled || calendarEnabled)) {
                 item { DrawerLabel(tr("drawer.views"), chat) }
+            }
+            // Calendar and Tasks are a row each, shown once switched on.
+            if (calendarEnabled) {
+                item {
+                    SidebarRow(
+                        selected = currentScreen == Screen.Calendar,
+                        chat = chat,
+                        onClick = onSelectCalendar,
+                        leading = { Icon(Icons.Filled.Event, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                        title = tr("calendar.title"),
+                        trailing = null,
+                    )
+                }
+            }
+            if (tasksEnabled) {
+                item {
+                    SidebarRow(
+                        selected = currentScreen == Screen.Tasks,
+                        chat = chat,
+                        onClick = onSelectTasks,
+                        leading = { Icon(Icons.Filled.Checklist, contentDescription = null, modifier = Modifier.size(20.dp)) },
+                        title = tr("tasks.title"),
+                        trailing = null,
+                    )
+                }
+            }
+            if (accounts.isNotEmpty() && kanbanBoards.isNotEmpty()) {
                 items(kanbanBoards, key = { it.id }) { board ->
                     SidebarRow(
                         selected = currentScreen == Screen.Kanban && board.id == activeKanbanBoardId,
@@ -485,7 +518,7 @@ internal fun SidebarRow(
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else Color.Transparent)
+            .background(if (selected) chat.sidebarSelected else Color.Transparent)
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -608,7 +641,7 @@ internal fun EmptyState(
 // Shown while the first load is still in flight, so a cold start reads as
 // "loading" rather than an empty inbox.
 @Composable
-internal fun LoadingState(text: String = "Loading…") {
+internal fun LoadingState(text: String = tr("common.loading")) {
     Column(
         Modifier.fillMaxSize().padding(32.dp),
         verticalArrangement = Arrangement.Center,

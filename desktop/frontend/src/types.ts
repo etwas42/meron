@@ -91,12 +91,44 @@ export type Folder = {
   role: string
   delimiter?: string
   unread: number
+  /** The user opted this folder in to live sync and new-mail notifications. */
+  notify?: boolean
 }
 
 /** A correspondent surfaced for recipient autocomplete. */
 export type Contact = {
   name: string
   addr: string
+}
+
+export type InviteResponse = 'accepted' | 'tentative' | 'declined'
+
+export type Invite = {
+  /** Lowercase iTIP method: `request`, `cancel`, `reply`, `publish`, … */
+  method: string
+  uid: string
+  summary: string
+  location: string
+  description: string
+  /** Unix seconds. For an all-day event these are UTC midnights with `end`
+   * exclusive, so format them in UTC. */
+  start: number
+  end: number
+  all_day: boolean
+  recurring: boolean
+  cancelled: boolean
+  organizer: { name: string; addr: string }
+  attendees: { name: string; addr: string; partstat: string }[]
+  /** Whether Accept / Maybe / Decline apply: an open request from someone else. */
+  can_respond: boolean
+  /** The user's answer as far as this device knows; empty when none. */
+  response: InviteResponse | ''
+  /** The calendar event this invitation is filed as; empty when it is not in
+   * the calendar. */
+  event_id: string
+  /** Which occurrence of a repeating event this is about (Unix seconds); 0
+   * for the whole event. */
+  recurrence_id: number
 }
 
 export type Attachment = {
@@ -121,13 +153,16 @@ export type ComposerAttachment = {
 
 /** Both reply forms of one message, as address-list strings: `to`/`cc` for a
  * plain reply, `all_to`/`all_cc` for reply-all, and whether reply-all reaches
- * anyone the plain reply does not — false hides the reply-all actions. */
+ * anyone the plain reply does not — false hides the reply-all actions.
+ * `accepts_replies` is false when the reply would go only to a no-reply or
+ * bounce address; quick replies then answer an earlier message. */
 export type ReplyRecipients = {
   to: string
   cc: string
   all_to: string
   all_cc: string
   all_adds_recipients: boolean
+  accepts_replies?: boolean
 }
 
 export type Message = {
@@ -161,6 +196,14 @@ export type Message = {
   /** True when the body isn't cached yet — the on-demand fetch failed or is
    * still filling in the background (a `mail.synced` re-read delivers it). */
   body_missing?: boolean
+  /** With `body_missing`: the body is downloading in the background right
+   * now, rather than having failed (absent otherwise). */
+  body_loading?: boolean
+  /** How many attachment files this message refers to are not on disk yet
+   * (absent when none): the body is shown first and a `mail.synced` re-read
+   * lowers this as they come back. The body and its `/media` URLs do not
+   * change when it does. */
+  media_missing?: number
   /** Send time as Unix epoch seconds (0 when unknown). Format via lib/date helpers. */
   date: number
   /** Sent by this account, classified by the core (own address or Sent-folder
@@ -179,11 +222,17 @@ export type Message = {
   has_draft?: boolean
   has_attachments: boolean
   attachments?: Attachment[]
+  /** The calendar event this message carries, when it is an invitation (or an
+   * update, cancellation or reply to one). Read by meron-core/src/calendar.rs. */
+  invite?: Invite
   /** The recipients a reply to this message gets, decided by the core (see
    * meron-core/src/reply.rs) so desktop, mobile and the MCP tools all address a
    * reply the same way. Absent on thread cards, which carry no recipient
    * headers, and on RSS items. */
   reply?: ReplyRecipients
+  /** The item's original page; present on RSS items only (empty when the
+   * feed gave none). */
+  link?: string
   /** Source feed URL; present on RSS feed threads only. */
   feed_url?: string
   /** Cached feed-icon media key (served at `/media/<key>`); present on RSS feed
@@ -199,6 +248,10 @@ export type Message = {
   /** Long sender lists keep only the first and the last two; true when senders
    * between the first entry and the rest were left out. */
   senders_truncated?: boolean
+  /** On a thread card, the attachments of its cached messages in thread order,
+   * for the chips under the row. Messages whose body is not cached yet are not
+   * known, so an older thread may list none. */
+  files?: { filename: string; mime: string }[]
   /** Local send lifecycle for an optimistically-rendered outgoing message.
    * Absent on messages loaded from the engine (treated as already sent). */
   send_status?: 'sending' | 'sent' | 'failed'
@@ -234,6 +287,12 @@ export type ComposeDraft = {
    * `SignatureTracking` in lib/signature.ts — the three states differ.
    */
   signature?: SignatureMark | null
+  /**
+   * The message this reply answers, quoted but folded away (see `replyQuote`):
+   * it goes out under the body until the user unfolds it into the body or
+   * removes it. Absent for every other draft.
+   */
+  quote?: { html: string; text: string }
   /** Server-side draft row this compose tab was restored from, if any. */
   sourceDraft?: {
     threadId: string
@@ -257,6 +316,10 @@ export type MessageTab = {
   folderId?: string
   subject: string
   from: string
+  /** Sender address and, for feed items, the cached feed icon, snapshotted at
+   * open time for the tab strip's avatar. Thread and reader tabs only. */
+  fromAddr?: string
+  feedIcon?: string
   /** Raw correspondent header strings ("Name <addr>", comma-separated), snapshotted
    * at open time so the reader tab can show the full From/To/Cc/Reply-To list.
    * Present only on reader tabs. */
@@ -277,16 +340,19 @@ export type MessageTab = {
    *  while the tab stays open. Reader tabs only. */
   revealRemote?: boolean
   /** Whether the message is the user's own (an identity of its account sent it),
-   *  snapshotted at open time: the tab has no Message to re-derive it from, and
-   *  trusting your own address is a no-op that still grows the allowlist.
-   *  Reader tabs only. */
+   *  snapshotted at open time: trusting your own address is a no-op that still
+   *  grows the allowlist. Reader tabs only. */
   outgoing?: boolean
+  /** The message a reader tab was opened from, for the actions its bottom bar
+   *  offers. Reader tabs are never persisted, so this lives only in memory. */
+  message?: Message
   /** Present only when kind === "compose". */
   compose?: ComposeDraft
 }
 
 export type SystemCheck = {
   platform: string
+  tray_monochrome?: boolean
   mail_engine: 'meron_mail'
   meron_mail: {
     configured: boolean

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent } from 'react'
-import { Loader2, Pause, Rss } from 'lucide-react'
+import { Loader2, Pause, Rss, Search } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { clsx } from '../../lib/utils'
@@ -22,6 +22,7 @@ import {
 import { isRssAccount } from '../../lib/threadActions'
 import { Avatar } from '../avatar/Avatar'
 import type { ColumnWrapper } from './KanbanBoardColumn'
+import { boardWallpaper } from '../../lib/wallpapers'
 
 // Collapsed column: a vertical strip showing the account avatar, folder name and
 // unread badge. Clicking it (or any unminimize) expands back to the full column.
@@ -49,14 +50,18 @@ export function KanbanColumnMinimized({
   const searchScope = useValue(kanban$.searchScope)
 
   const labelFolders = useMemo(() => mergeLabelFolders(folders, foldersByAccount), [folders, foldersByAccount])
+  // On a saved search column the board search narrows the column's own query.
   const searchActive = columnSearchActive(key, searchQuery, searchScope)
-  const overWallpaper = !!useValue(settings$.kanbanBoards).find((board) => board.id === boardId)?.wallpaper
+  const overWallpaper = !!boardWallpaper(
+    useValue(settings$.kanbanBoards).find((board) => board.id === boardId)?.wallpaper,
+  )
   const columnUnreadCount = kanbanColumnUnreadCount(column, unreadCount, rawThreads)
   const columnAccount = column.accountId !== 'unified' ? accounts.find((a) => a.id === column.accountId) : undefined
   const columnAccountLabel = columnAccount ? columnAccount.display_name || columnAccount.email || columnAccount.id : ''
   const isPaused = !!columnAccount?.paused
   const isRss = isRssAccount(columnAccount, column.accountId)
-  const label = folderLabel(column, labelFolders, accounts, t)
+  const folder = folderLabel(column, labelFolders, accounts, t)
+  const label = column.query ? `${folder} · ${column.query}` : folder
 
   // WebKitGTK (Wails on Linux) can mis-measure the intrinsic size of vertical-rl
   // text, and horizontal and vertical glyph advances are not necessarily equal.
@@ -90,7 +95,7 @@ export function KanbanColumnMinimized({
       className={clsx(
         'relative flex h-full shrink-0 flex-col items-center gap-3 rounded-lg border p-2 transition-colors',
         columnSearchHighlightClass(searchActive, overWallpaper),
-        columnDropTargetClass(wrapper.isOver, !!wrapper.dropRejection),
+        columnDropTargetClass(wrapper.isOver || !!wrapper.isDragging, !!wrapper.dropRejection),
         wrapper.dragHandle ? 'cursor-grab touch-none active:cursor-grabbing' : 'cursor-pointer',
       )}
       // Too narrow for the reason the expanded column shows, so it lives in the
@@ -106,7 +111,6 @@ export function KanbanColumnMinimized({
       <div className="relative shrink-0">
         <Avatar
           name={columnAccountLabel || accountLabel(column.accountId, accounts)}
-          email={isRss ? undefined : columnAccount?.email}
           src={columnAccount?.avatar_url}
           size={26}
           fallback={isRss ? <Rss size={13} /> : undefined}
@@ -118,6 +122,15 @@ export function KanbanColumnMinimized({
             title={t('settings.account.paused', { defaultValue: 'Paused' })}
           >
             <Pause size={7} className="fill-current" />
+          </span>
+        )}
+        {/* A saved search marks its avatar too, so it stands apart from the folder's plain column. */}
+        {!isPaused && column.query && (
+          <span
+            className="absolute -bottom-1 -right-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-white ring-2 ring-chats"
+            title={column.query}
+          >
+            <Search size={8} strokeWidth={3} />
           </span>
         )}
       </div>
@@ -146,7 +159,7 @@ export function KanbanColumnMinimized({
           {columnUnreadCount}
         </div>
       )}
-      {searchActive && loading && <Loader2 size={14} className="animate-spin text-accent" />}
+      {(searchActive || !!column.query) && loading && <Loader2 size={14} className="animate-spin text-accent" />}
     </section>
   )
 }

@@ -4,8 +4,12 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.OpenInBrowser
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -180,6 +184,7 @@ internal fun MessageLinkContextMenu(
     DropdownMenu(expanded = true, onDismissRequest = onDismiss, offset = target.offset) {
         DropdownMenuItem(
             text = { Text(tr("chat.actions.openLink")) },
+            leadingIcon = { Icon(Icons.Filled.OpenInBrowser, contentDescription = null) },
             onClick = {
                 onDismiss()
                 onOpenUrl(target.url)
@@ -187,6 +192,7 @@ internal fun MessageLinkContextMenu(
         )
         DropdownMenuItem(
             text = { Text(tr("chat.actions.copyLinkAddress")) },
+            leadingIcon = { Icon(Icons.Filled.Link, contentDescription = null) },
             onClick = {
                 onDismiss()
                 clipboardManager.setText(AnnotatedString(target.url))

@@ -22,3 +22,70 @@ export function formatThreadDate(epochSeconds: number): string {
       : { month: 'short', day: 'numeric', year: 'numeric' }
   return date.toLocaleDateString([], options)
 }
+
+/** A task's due date: month/day, with the year once it isn't this one. */
+export function formatDueDate(epochSeconds: number): string {
+  const date = fromEpochSeconds(epochSeconds)
+  if (!date) return ''
+  const options: Intl.DateTimeFormatOptions =
+    date.getFullYear() === new Date().getFullYear()
+      ? { month: 'short', day: 'numeric' }
+      : { month: 'short', day: 'numeric', year: 'numeric' }
+  return date.toLocaleDateString([], options)
+}
+
+/** `<input type="date">` wants a local-time YYYY-MM-DD, not an ISO instant. */
+export function toDateInputValue(epochSeconds: number): string {
+  const date = fromEpochSeconds(epochSeconds)
+  if (!date) return ''
+  const month = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  return `${date.getFullYear()}-${month}-${day}`
+}
+
+/** The inverse: a date input's value as epoch seconds at local midnight. */
+export function fromDateInputValue(value: string): number {
+  if (!value) return 0
+  const [year, month, day] = value.split('-').map(Number)
+  if (!year || !month || !day) return 0
+  return Math.floor(new Date(year, month - 1, day).getTime() / 1000)
+}
+
+/** A date-only deadline becomes overdue on the following local day. */
+export function taskIsOverdue(dueAt: number, nowMillis = Date.now()): boolean {
+  const today = new Date(nowMillis)
+  today.setHours(0, 0, 0, 0)
+  return dueAt > 0 && dueAt * 1000 < today.getTime()
+}
+
+/** When a calendar event happens: its day (or days), and its times unless it
+ * lasts all day. All-day bounds are UTC midnights with an exclusive end. */
+export function formatEventRange(start: number, end: number, allDay: boolean): string {
+  if (!start) return ''
+  const from = new Date(start * 1000)
+  if (allDay) {
+    const options: Intl.DateTimeFormatOptions = {
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+      timeZone: 'UTC',
+    }
+    const last = new Date(Math.max(start, end - 86_400) * 1000)
+    return formatRange(new Intl.DateTimeFormat([], options), from, last)
+  }
+  const options: Intl.DateTimeFormatOptions = {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }
+  return formatRange(new Intl.DateTimeFormat([], options), from, new Date(Math.max(start, end) * 1000))
+}
+
+function formatRange(format: Intl.DateTimeFormat, from: Date, to: Date): string {
+  if (from.getTime() === to.getTime()) return format.format(from)
+  return format.formatRange ? format.formatRange(from, to) : `${format.format(from)} – ${format.format(to)}`
+}

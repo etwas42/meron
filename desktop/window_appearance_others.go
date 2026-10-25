@@ -1,7 +1,10 @@
-//go:build (!linux && !darwin) || (linux && bindings)
+//go:build (!linux && !darwin && !windows) || (linux && bindings)
 
 package main
 
-// Windows needs nothing here: the wails runtime's theme call already switches
-// the DWM caption. Any other platform has no native chrome to tint.
+// No native chrome to tint here.
 func setNativeWindowDark(dark bool) {}
+
+func setNativeTitlebarColors(bg, fg string) {}
+
+func refreshNativeTitlebarCss() {}

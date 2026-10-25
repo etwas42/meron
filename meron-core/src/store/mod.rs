@@ -42,22 +42,26 @@ use crate::imap::MessageHeader;
 pub const DEFAULT_RSS_SYNC_INTERVAL_MINUTES: u64 = 60;
 
 mod accounts;
+mod calendar;
 mod contacts;
 mod folders;
 mod messages;
 mod rss;
 mod search;
 mod settings;
+mod tasks;
 mod threads;
 mod updates;
 
 pub use accounts::*;
+pub use calendar::*;
 pub use contacts::*;
 pub use folders::*;
 pub use messages::*;
 pub use rss::*;
 pub use search::*;
 pub use settings::*;
+pub use tasks::*;
 pub use threads::*;
 pub use updates::*;
 
@@ -95,13 +99,6 @@ fn search_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageHe
 fn parse_recipients_json(json: Option<String>) -> Vec<crate::imap::Recipient> {
     json.and_then(|s| serde_json::from_str::<Vec<crate::imap::Recipient>>(&s).ok())
         .unwrap_or_default()
-}
-
-fn escape_like(value: String) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 #[cfg(test)]

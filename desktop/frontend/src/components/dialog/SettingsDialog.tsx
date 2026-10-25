@@ -1,15 +1,19 @@
-import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
 import type { LucideIcon } from 'lucide-react'
 import {
+  CalendarDays,
   X,
+  UnfoldVertical,
   Upload,
   Download,
   SlidersHorizontal,
   Image as ImageIcon,
   Send,
   Inbox,
+  SquareCheckBig,
   Plus,
   Trash2,
   Camera,
@@ -18,6 +22,7 @@ import {
   Globe,
   KeyRound,
   SpellCheck,
+  Quote,
   Pause,
   BellOff,
   ScrollText,
@@ -26,6 +31,13 @@ import {
   Keyboard,
   Archive,
   Server,
+  PanelTop,
+  PanelTopClose,
+  Moon,
+  Shrink,
+  PanelBottom,
+  SquarePen,
+  Contrast,
 } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { importOpml, exportOpml } from '../../states/feeds'
@@ -40,6 +52,8 @@ import {
   KANBAN_COLUMN_MIN_WIDTH,
   sendShortcutLabel,
   setUnifiedInboxSideNavVisible,
+  setCalendarEnabled,
+  setTasksEnabled,
   type ConversationLayout,
   type KanbanBoard,
   type SendShortcut,
@@ -57,6 +71,7 @@ import { AccountProxyCard, ProxySettingsSection } from './ProxySettingsCard'
 import { AccountSignatureCard, SignatureSettingsSection } from './SignatureSettingsCard'
 import { AccountProfileGroup } from './AccountProfileGroup'
 import { useAccountAvatar } from './useAccountAvatar'
+import { RemoveImageBadge } from './RemoveImageBadge'
 import { AccountAliasesCard } from './AccountAliasesCard'
 import { AccountTogglesSection } from './AccountTogglesSection'
 import { AccountWallpaperCard } from './AccountWallpaperCard'
@@ -65,13 +80,21 @@ import { BoardPanel } from './BoardSettingsPanel'
 import { RemoteSendersDialog } from './RemoteSendersDialog'
 import { pickImageFile } from '../../lib/nativeFilePicker'
 import { invoke } from '../../lib/bridge'
+import { isMac } from '../../lib/shortcuts'
+import { offersMonochromeTrayIcon } from '../../lib/monochromeTrayIcon'
 import { McpSettingsPanel } from './McpSettingsPanel'
+import { setIntegratedTitlebar, windowChrome$ } from '../../lib/windowChrome'
 
-// General uses the empty selection; MCP has its own section below. Account
-// and board IDs share the selection state with these settings sections.
-const SECTIONS: { id: 'general'; label: string; icon: LucideIcon }[] = [
-  { id: 'general', label: 'General', icon: SlidersHorizontal },
+// General uses the empty selection; Messages, Composer and MCP have ids of
+// their own. Account and board IDs share the selection state with these
+// settings sections.
+type SectionId = 'general' | 'messages' | 'composer'
+const SECTIONS: { id: SectionId; labelKey: string; icon: LucideIcon }[] = [
+  { id: 'general', labelKey: 'settings.sections.general', icon: SlidersHorizontal },
+  { id: 'messages', labelKey: 'settings.sections.messages', icon: MessagesSquare },
+  { id: 'composer', labelKey: 'settings.sections.composer', icon: SquarePen },
 ]
+const PAGE_IDS = new Set<string>(['messages', 'composer', 'mcp'])
 
 const SEND_SHORTCUT_OPTIONS: { value: SendShortcut; label: string }[] = [
   { value: 'enter', label: sendShortcutLabel('enter') },
@@ -128,7 +151,7 @@ export function SettingsDialog() {
   const selectedAccount = accounts.find((acc) => acc.id === selected)
   const selectedBoard = !selectedAccount ? boards.find((board) => board.id === selected) : undefined
   // A removed account/board (or a stale id) falls back to General.
-  const activeKey: string = selectedAccount || selectedBoard || selected === 'mcp' ? selected : 'general'
+  const activeKey: string = selectedAccount || selectedBoard || PAGE_IDS.has(selected) ? selected : 'general'
 
   const mailAccounts = accounts.filter((acc) => !isRssAccount(acc))
   const feedAccounts = accounts.filter(isRssAccount)
@@ -138,18 +161,6 @@ export function SettingsDialog() {
     ui$.settingsOpen.set(false)
   }
 
-  const onBackdropMouseDown = (event: MouseEvent<HTMLDivElement>) => {
-    if (event.target !== event.currentTarget || ui$.setupOpen.peek()) return
-    onClose()
-  }
-
-  // Esc closes the dialog, unless the add-account dialog is layered on top (it
-  // owns the keystroke then).
-  useEscapeKey(() => {
-    if (ui$.setupOpen.peek()) return
-    onClose()
-  })
-
   // Open the add-account dialog layered on top of Settings (Settings stays open
   // underneath, so cancelling or saving returns here).
   const onAddAccount = (mode: SetupMode) => {
@@ -158,68 +169,78 @@ export function SettingsDialog() {
   }
 
   return (
-    <div
-      onMouseDown={onBackdropMouseDown}
-      className="fixed inset-0 flex items-center justify-center bg-black/35 dark:bg-black/60 backdrop-blur-[3px] z-50 p-4 select-none animate-fade-in"
+    <Dialog
+      onClose={() => {
+        if (!ui$.setupOpen.peek()) onClose()
+      }}
+      aria-label={t('settings.label')}
+      backdropClassName="bg-black/35"
+      className="border-border/80 max-w-4xl h-[760px] max-h-[92vh] shadow-black/20 dark:shadow-black/45 flex flex-col overflow-hidden"
     >
-      <div className="bg-chats border border-border/80 text-primary max-w-4xl w-full h-[760px] max-h-[92vh] rounded-3xl shadow-2xl shadow-black/20 dark:shadow-black/45 animate-slide-up flex flex-col overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between gap-4 px-6 py-4.5 border-b border-border/60 shrink-0 bg-chats/95">
-          <div className="min-w-0">
-            <h2 className="text-base font-bold tracking-tight leading-tight">{t('settings.label')}</h2>
-          </div>
-          <IconButton icon={X} iconSize={16} label={t('buttons.close')} size="sm" onClick={onClose} />
+      {/* Header */}
+      <div className="flex items-center justify-between gap-4 px-6 py-4.5 border-b border-border/60 shrink-0 bg-chats/95">
+        <div className="min-w-0">
+          <h2 className="text-base font-bold tracking-tight leading-tight">{t('settings.label')}</h2>
         </div>
+        <IconButton icon={X} iconSize={16} label={t('buttons.close')} size="sm" onClick={onClose} />
+      </div>
 
-        {/* Body: nav rail + content */}
-        <div className="flex flex-1 min-h-0">
-          {/* Nav rail */}
-          <nav className="w-56 shrink-0 border-r border-border/60 p-3.5 flex flex-col gap-1 bg-raised/70 overflow-y-auto">
-            {SECTIONS.map(({ id, label, icon: Icon }) => (
-              <NavItem key={id} active={activeKey === id} onClick={selectGeneral}>
-                <Icon size={15} className="shrink-0" />
-                <span className="truncate">{id === 'general' ? t('settings.sections.general') : label}</span>
-              </NavItem>
-            ))}
-
-            <NavItem active={activeKey === 'mcp'} onClick={() => selectAccount('mcp')}>
-              <Server size={15} className="shrink-0" />
-              <span>{t('mcp.title')}</span>
+      {/* Body: nav rail + content */}
+      <div className="flex flex-1 min-h-0">
+        {/* Nav rail */}
+        <nav className="w-56 shrink-0 border-r border-border/60 p-3.5 flex flex-col gap-1 bg-raised/70 overflow-y-auto">
+          {SECTIONS.map(({ id, labelKey, icon: Icon }) => (
+            <NavItem
+              key={id}
+              active={activeKey === id}
+              onClick={id === 'general' ? selectGeneral : () => selectAccount(id)}
+            >
+              <Icon size={15} className="shrink-0" />
+              <span className="truncate">{t(labelKey)}</span>
             </NavItem>
-            <BoardGroup boards={boards} activeKey={activeKey} onSelect={selectAccount} />
-            <AccountGroup
-              label={t('settings.sections.mailAccounts')}
-              accounts={mailAccounts}
-              activeKey={activeKey}
-              onSelect={selectAccount}
-              onAdd={() => onAddAccount('gmail')}
-              emptyLabel={t('settings.sections.noMailAccounts')}
-            />
-            <AccountGroup
-              label={t('settings.sections.feedAccounts')}
-              accounts={feedAccounts}
-              activeKey={activeKey}
-              onSelect={selectAccount}
-              onAdd={() => onAddAccount('rss')}
-              emptyLabel={t('settings.sections.noFeedAccounts')}
-            />
-          </nav>
+          ))}
 
-          {/* Content */}
-          <div className="flex-1 min-w-0 overflow-y-auto bg-chats p-6">
-            {selectedAccount ? (
-              <AccountPanel account={selectedAccount} />
-            ) : selectedBoard ? (
-              <BoardPanel board={selectedBoard} />
-            ) : selected === 'mcp' ? (
-              <McpSettingsPanel />
-            ) : (
-              <GeneralSection />
-            )}
-          </div>
+          <NavItem active={activeKey === 'mcp'} onClick={() => selectAccount('mcp')}>
+            <Server size={15} className="shrink-0" />
+            <span>{t('mcp.title')}</span>
+          </NavItem>
+          <BoardGroup boards={boards} activeKey={activeKey} onSelect={selectAccount} />
+          <AccountGroup
+            label={t('settings.sections.mailAccounts')}
+            accounts={mailAccounts}
+            activeKey={activeKey}
+            onSelect={selectAccount}
+            onAdd={() => onAddAccount('gmail')}
+            emptyLabel={t('settings.sections.noMailAccounts')}
+          />
+          <AccountGroup
+            label={t('settings.sections.feedAccounts')}
+            accounts={feedAccounts}
+            activeKey={activeKey}
+            onSelect={selectAccount}
+            onAdd={() => onAddAccount('rss')}
+            emptyLabel={t('settings.sections.noFeedAccounts')}
+          />
+        </nav>
+
+        {/* Content */}
+        <div className="flex-1 min-w-0 overflow-y-auto bg-chats p-6">
+          {selectedAccount ? (
+            <AccountPanel account={selectedAccount} />
+          ) : selectedBoard ? (
+            <BoardPanel board={selectedBoard} />
+          ) : selected === 'mcp' ? (
+            <McpSettingsPanel />
+          ) : selected === 'messages' ? (
+            <MessagesSection />
+          ) : selected === 'composer' ? (
+            <ComposerSection />
+          ) : (
+            <GeneralSection />
+          )}
         </div>
       </div>
-    </div>
+    </Dialog>
   )
 }
 
@@ -365,14 +386,11 @@ function BoardGroup({
 
 function GeneralSection() {
   const { t } = useTranslation()
-  const [remoteSendersOpen, setRemoteSendersOpen] = useState(false)
-  const remoteImageSenders = useValue(settings$.remoteImageSenders)
   const showRealAvatars = useValue(settings$.showRealAvatars)
   const showUnreadAccountBadge = useValue(settings$.showUnreadAccountBadge)
-  const conversationLayout = useValue(settings$.conversationLayout)
-  const sendShortcut = useValue(settings$.sendShortcut)
-  const spellCheck = useValue(settings$.spellCheck)
   const showUnifiedInbox = useValue(settings$.showUnifiedInboxInSideNav)
+  const tasksEnabled = useValue(settings$.tasksEnabled)
+  const calendarEnabled = useValue(settings$.calendarEnabled)
   const kanbanColumnWidth = useValue(settings$.kanbanColumnWidth)
   const kanbanLockScroll = useValue(settings$.kanbanLockScroll)
   const language = useValue(settings$.language)
@@ -381,35 +399,6 @@ function GeneralSection() {
     <div className="flex flex-col gap-4">
       <SettingsGroup title={t('settings.pages.appearance')}>
         <ThemeSettingsSection />
-        <SegmentedRow
-          icon={<MessagesSquare size={15} />}
-          title={t('settings.appearance.conversationLayout')}
-          hint={t('settings.appearance.conversationLayoutHint')}
-          value={conversationLayout}
-          options={CONVERSATION_LAYOUT_OPTIONS(t)}
-          onChange={(value) => settings$.conversationLayout.set(value)}
-        />
-        <ToggleRow
-          icon={<ImageIcon size={15} />}
-          title={t('settings.appearance.showSenderImages')}
-          hint={t('settings.appearance.showSenderImagesHint')}
-          checked={showRealAvatars}
-          onChange={() => settings$.showRealAvatars.set(!showRealAvatars)}
-        />
-        <ToggleRow
-          icon={<Inbox size={15} />}
-          title={t('settings.appearance.showUnreadAccountBadge')}
-          hint={t('settings.appearance.showUnreadAccountBadgeHint')}
-          checked={showUnreadAccountBadge}
-          onChange={() => settings$.showUnreadAccountBadge.set(!showUnreadAccountBadge)}
-        />
-      </SettingsGroup>
-
-      <SettingsGroup title={t('settings.sections.typography')}>
-        <FontSettingsSection />
-      </SettingsGroup>
-
-      <SettingsGroup title={t('settings.language.label')}>
         <SelectRow
           icon={<Globe size={15} />}
           title={t('settings.language.label')}
@@ -426,6 +415,18 @@ function GeneralSection() {
             settings$.language.set(value === '' ? null : (value as SupportedI18nLanguage))
           }}
         />
+        <ToggleRow
+          icon={<ImageIcon size={15} />}
+          title={t('settings.appearance.showSenderImages')}
+          hint={t('settings.appearance.showSenderImagesHint')}
+          checked={showRealAvatars}
+          onChange={() => settings$.showRealAvatars.set(!showRealAvatars)}
+        />
+        <TrayIconRow />
+      </SettingsGroup>
+
+      <SettingsGroup title={t('settings.sections.typography')}>
+        <FontSettingsSection part="interface" />
       </SettingsGroup>
 
       <SettingsGroup title={t('settings.sections.sideNav')}>
@@ -435,27 +436,14 @@ function GeneralSection() {
           checked={showUnifiedInbox}
           onChange={() => setUnifiedInboxSideNavVisible(!showUnifiedInbox)}
         />
-      </SettingsGroup>
-
-      <SettingsGroup title={t('settings.sections.privacy')}>
-        <SettingRow
-          title={t('settings.privacy.remoteSenders')}
-          hint={t('settings.privacy.remoteSendersHint')}
-          control={
-            <button
-              onClick={() => setRemoteSendersOpen(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors"
-            >
-              {remoteImageSenders.length > 0
-                ? t('settings.privacy.remoteSendersCount', { count: remoteImageSenders.length })
-                : t('settings.privacy.remoteSendersNone')}
-            </button>
-          }
+        <ToggleRow
+          icon={<Inbox size={15} />}
+          title={t('settings.appearance.showUnreadAccountBadge')}
+          hint={t('settings.appearance.showUnreadAccountBadgeHint')}
+          checked={showUnreadAccountBadge}
+          onChange={() => settings$.showUnreadAccountBadge.set(!showUnreadAccountBadge)}
         />
       </SettingsGroup>
-      {remoteSendersOpen && <RemoteSendersDialog onClose={() => setRemoteSendersOpen(false)} />}
-
-      <ProxySettingsSection />
 
       <SettingsGroup title={t('settings.sections.kanban')}>
         <NumberRow
@@ -480,13 +468,152 @@ function GeneralSection() {
         />
       </SettingsGroup>
 
-      <SettingsGroup title={t('settings.sections.composer')}>
+      <ProxySettingsSection />
+
+      <SettingsGroup title={t('settings.sections.app')}>
+        <SettingRow
+          title={t('shortcuts.title')}
+          hint={t('shortcuts.customizeHint')}
+          control={
+            <button
+              onClick={() => ui$.shortcutsOpen.set(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors"
+            >
+              <Keyboard size={12} />
+              {t('shortcuts.customize')}
+            </button>
+          }
+        />
+        <ToggleRow
+          icon={<SquareCheckBig size={15} />}
+          title={t('settings.tasks.enable')}
+          hint={t('settings.tasks.enableHint')}
+          checked={tasksEnabled}
+          onChange={() => setTasksEnabled(!tasksEnabled)}
+        />
+        <ToggleRow
+          icon={<CalendarDays size={15} />}
+          title={t('settings.calendar.enable')}
+          hint={t('settings.calendar.enableHint')}
+          checked={calendarEnabled}
+          onChange={() => setCalendarEnabled(!calendarEnabled)}
+        />
+        <CloseToTrayRow />
+        <IntegratedTitlebarRow />
+        <AutoUpdateRow />
+      </SettingsGroup>
+
+      <SettingsGroup title={t('settings.sections.data')}>
+        <BackupRow />
+        <StorageRows />
+        <LogsRow />
+      </SettingsGroup>
+    </div>
+  )
+}
+
+// How received mail is shown and handled: layout, rendering, the reader's
+// actions, message typography, and whose remote content loads.
+function MessagesSection() {
+  const { t } = useTranslation()
+  const [remoteSendersOpen, setRemoteSendersOpen] = useState(false)
+  const remoteImageSenders = useValue(settings$.remoteImageSenders)
+  const conversationLayout = useValue(settings$.conversationLayout)
+  const chatFullMessages = useValue(settings$.chatFullMessages)
+  const darkMessageBodies = useValue(settings$.darkMessageBodies)
+  const autoFitMessages = useValue(settings$.autoFitMessages)
+  const readerBottomActions = useValue(settings$.readerBottomActions)
+
+  return (
+    <div className="flex flex-col gap-4">
+      <SettingsGroup title={t('settings.pages.appearance')}>
+        <SegmentedRow
+          icon={<MessagesSquare size={15} />}
+          title={t('settings.appearance.conversationLayout')}
+          hint={t('settings.appearance.conversationLayoutHint')}
+          value={conversationLayout}
+          options={CONVERSATION_LAYOUT_OPTIONS(t)}
+          onChange={(value) => settings$.conversationLayout.set(value)}
+        />
+        {conversationLayout === 'chat' && (
+          <ToggleRow
+            icon={<UnfoldVertical size={15} />}
+            title={t('settings.appearance.chatFullMessages')}
+            hint={t('settings.appearance.chatFullMessagesHint')}
+            checked={chatFullMessages}
+            onChange={() => settings$.chatFullMessages.set(!chatFullMessages)}
+          />
+        )}
+        <ToggleRow
+          icon={<Moon size={15} />}
+          title={t('settings.appearance.darkMessageBodies')}
+          hint={t('settings.appearance.darkMessageBodiesHint')}
+          checked={darkMessageBodies}
+          onChange={() => settings$.darkMessageBodies.set(!darkMessageBodies)}
+        />
+        <ToggleRow
+          icon={<Shrink size={15} />}
+          title={t('settings.appearance.autoFitMessages')}
+          hint={t('settings.appearance.autoFitMessagesHint')}
+          checked={autoFitMessages}
+          onChange={() => settings$.autoFitMessages.set(!autoFitMessages)}
+        />
+        <ToggleRow
+          icon={<PanelBottom size={15} />}
+          title={t('settings.appearance.readerBottomActions')}
+          hint={t('settings.appearance.readerBottomActionsHint')}
+          checked={readerBottomActions}
+          onChange={() => settings$.readerBottomActions.set(!readerBottomActions)}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title={t('settings.sections.typography')}>
+        <FontSettingsSection part="message" />
+      </SettingsGroup>
+
+      <SettingsGroup title={t('settings.sections.privacy')}>
+        <SettingRow
+          title={t('settings.privacy.remoteSenders')}
+          hint={t('settings.privacy.remoteSendersHint')}
+          control={
+            <button
+              onClick={() => setRemoteSendersOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors"
+            >
+              {remoteImageSenders.length > 0
+                ? t('settings.privacy.remoteSendersCount', { count: remoteImageSenders.length })
+                : t('settings.privacy.remoteSendersNone')}
+            </button>
+          }
+        />
+      </SettingsGroup>
+      {remoteSendersOpen && <RemoteSendersDialog onClose={() => setRemoteSendersOpen(false)} />}
+    </div>
+  )
+}
+
+function ComposerSection() {
+  const { t } = useTranslation()
+  const sendShortcut = useValue(settings$.sendShortcut)
+  const spellCheck = useValue(settings$.spellCheck)
+  const quoteReplies = useValue(settings$.quoteReplies)
+
+  return (
+    <div className="flex flex-col gap-4">
+      <SettingsGroup title={t('settings.sections.general')}>
         <ToggleRow
           icon={<SpellCheck size={15} />}
           title={t('settings.composer.spellCheck')}
           hint={t('settings.composer.spellCheckHint')}
           checked={spellCheck}
           onChange={() => settings$.spellCheck.set(!spellCheck)}
+        />
+        <ToggleRow
+          icon={<Quote size={15} />}
+          title={t('settings.composer.quoteReplies')}
+          hint={t('settings.composer.quoteRepliesHint')}
+          checked={quoteReplies}
+          onChange={() => settings$.quoteReplies.set(!quoteReplies)}
         />
         <SegmentedRow
           icon={<Send size={15} />}
@@ -503,27 +630,6 @@ function GeneralSection() {
       </SettingsGroup>
 
       <SignatureSettingsSection />
-
-      <SettingsGroup title={t('shortcuts.title')}>
-        <SettingRow
-          title={t('shortcuts.title')}
-          hint={t('shortcuts.customizeHint')}
-          control={
-            <button
-              onClick={() => ui$.shortcutsOpen.set(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors"
-            >
-              <Keyboard size={12} />
-              {t('shortcuts.customize')}
-            </button>
-          }
-        />
-      </SettingsGroup>
-
-      <UpdatesGroup />
-      <BackupGroup />
-      <StorageGroup />
-      <LogsGroup />
     </div>
   )
 }
@@ -534,7 +640,7 @@ function GeneralSection() {
 // Both buttons hand off to a passphrase dialog: exporting to offer encryption,
 // restoring only when the chosen file turns out to be encrypted (which the
 // bridge reports back with the path, so the file dialog isn't shown twice).
-function BackupGroup() {
+function BackupRow() {
   const { t } = useTranslation()
   const [prompt, setPrompt] = useState<BackupPassphraseMode | null>(null)
   const [busy, setBusy] = useState(false)
@@ -602,54 +708,122 @@ function BackupGroup() {
 
   return (
     <>
-      <SettingsGroup title={t('settings.sections.backup')}>
-        <SettingRow
-          title={t('settings.backup.fileTitle')}
-          hint={t('settings.backup.fileHint')}
-          control={
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => runImport('', '')}
-                disabled={busy}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Upload size={12} />
-                {t('settings.backup.restoreAction')}
-              </button>
-              <button
-                onClick={() => {
-                  setError('')
-                  setPrompt('export')
-                }}
-                disabled={busy}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <Archive size={12} />
-                {t('common.export')}
-              </button>
-            </div>
-          }
-        />
-      </SettingsGroup>
+      <SettingRow
+        title={t('settings.backup.fileTitle')}
+        hint={t('settings.backup.fileHint')}
+        control={
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => runImport('', '')}
+              disabled={busy}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Upload size={12} />
+              {t('settings.backup.restoreAction')}
+            </button>
+            <button
+              onClick={() => {
+                setError('')
+                setPrompt('export')
+              }}
+              disabled={busy}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Archive size={12} />
+              {t('common.export')}
+            </button>
+          </div>
+        }
+      />
 
-      {prompt && (
-        <BackupPassphraseDialog
-          mode={prompt}
-          busy={busy}
-          error={error}
-          onCancel={closePrompt}
-          onSubmit={(passphrase, includeSecrets) =>
-            prompt === 'export' ? runExport(passphrase, includeSecrets) : runImport(pendingPath, passphrase)
-          }
-        />
-      )}
+      {/* Portalled: the row sits in a divided card, whose dividers would
+          otherwise land on the overlay too. */}
+      {prompt &&
+        createPortal(
+          <BackupPassphraseDialog
+            mode={prompt}
+            busy={busy}
+            error={error}
+            onCancel={closePrompt}
+            onSubmit={(passphrase, includeSecrets) =>
+              prompt === 'export' ? runExport(passphrase, includeSecrets) : runImport(pendingPath, passphrase)
+            }
+          />,
+          document.body,
+        )}
     </>
+  )
+}
+
+// macOS and Linux only: Windows keeps the colour icon.
+function TrayIconRow() {
+  const { t } = useTranslation()
+  const monochromeTrayIcon = useValue(settings$.monochromeTrayIcon)
+
+  if (!offersMonochromeTrayIcon(navigator.userAgent, navigator.platform ?? '')) return null
+
+  return (
+    <ToggleRow
+      icon={<Contrast size={15} />}
+      title={t('settings.appearance.monochromeTrayIcon')}
+      hint={t('settings.appearance.monochromeTrayIconHint')}
+      checked={monochromeTrayIcon}
+      onChange={() => settings$.monochromeTrayIcon.set(!monochromeTrayIcon)}
+    />
+  )
+}
+
+// macOS has its own split between closing a window and quitting (⌘Q), so the
+// close button's behaviour is only a choice elsewhere.
+function CloseToTrayRow() {
+  const { t } = useTranslation()
+  const closeToTray = useValue(settings$.closeToTray)
+
+  if (isMac) return null
+
+  return (
+    <ToggleRow
+      icon={<PanelTopClose size={15} />}
+      title={t('settings.window.closeToTray')}
+      hint={t('settings.window.closeToTrayHint', { quit: t('tray.quitMeron') })}
+      checked={closeToTray}
+      onChange={() => settings$.closeToTray.set(!closeToTray)}
+    />
+  )
+}
+
+// Linux and Windows. The choice lives in Go (window.json), since it is
+// needed before the window exists. Windows and Linux desktops with native
+// server-side decorations apply it on restart, so the switch shows the saved choice.
+function IntegratedTitlebarRow() {
+  const { t } = useTranslation()
+  const supported = useValue(windowChrome$.supported)
+  const wanted = useValue(windowChrome$.wanted)
+
+  if (!supported) return null
+
+  return (
+    <ToggleRow
+      icon={<PanelTop size={15} />}
+      title={t('settings.window.integratedTitlebar')}
+      hint={t('settings.window.integratedTitlebarHint')}
+      checked={wanted}
+      onChange={() =>
+        void setIntegratedTitlebar(!wanted)
+          .then(() => {
+            if (windowChrome$.wanted.peek() !== windowChrome$.integrated.peek()) {
+              showToast(t('settings.window.restartToApply'), 'success', 4000)
+            }
+          })
+          .catch(() => {})
+      }
+    />
   )
 }
 
 // Only meaningful where the app can actually replace itself; store-managed and
 // dev builds get no toggle at all rather than one that does nothing.
-function UpdatesGroup() {
+function AutoUpdateRow() {
   const { t } = useTranslation()
   const status = useValue(update$.status)
   const autoUpdateCheck = useValue(settings$.autoUpdateCheck)
@@ -657,15 +831,13 @@ function UpdatesGroup() {
   if (!status.supported) return null
 
   return (
-    <SettingsGroup title={t('settings.sections.updates')}>
-      <ToggleRow
-        icon={<RefreshCw size={15} />}
-        title={t('settings.updates.autoCheck')}
-        hint={t('settings.updates.autoCheckHint')}
-        checked={autoUpdateCheck}
-        onChange={() => settings$.autoUpdateCheck.set(!autoUpdateCheck)}
-      />
-    </SettingsGroup>
+    <ToggleRow
+      icon={<RefreshCw size={15} />}
+      title={t('settings.updates.autoCheck')}
+      hint={t('settings.updates.autoCheckHint')}
+      checked={autoUpdateCheck}
+      onChange={() => settings$.autoUpdateCheck.set(!autoUpdateCheck)}
+    />
   )
 }
 
@@ -679,7 +851,7 @@ function formatBytes(bytes: number): string {
   return `${value >= 100 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`
 }
 
-function StorageGroup() {
+function StorageRows() {
   const { t } = useTranslation()
   const [usage, setUsage] = useState<StorageUsage | null>(null)
   const [clearing, setClearing] = useState(false)
@@ -724,7 +896,7 @@ function StorageGroup() {
   }
 
   return (
-    <SettingsGroup title={t('settings.sections.storage')}>
+    <>
       <SettingRow
         title={t('settings.storage.usageTitle')}
         hint={t('settings.storage.usageHint')}
@@ -752,15 +924,15 @@ function StorageGroup() {
           </button>
         }
       />
-    </SettingsGroup>
+    </>
   )
 }
 
-function LogsGroup() {
+function LogsRow() {
   const { t } = useTranslation()
   const [viewerOpen, setViewerOpen] = useState(false)
   return (
-    <SettingsGroup title={t('settings.sections.logs')}>
+    <>
       <SettingRow
         title={t('settings.sections.logs')}
         hint={t('settings.syncDiagnosticLogHint')}
@@ -774,8 +946,8 @@ function LogsGroup() {
           </button>
         }
       />
-      {viewerOpen && <LogViewerDialog onClose={() => setViewerOpen(false)} />}
-    </SettingsGroup>
+      {viewerOpen && createPortal(<LogViewerDialog onClose={() => setViewerOpen(false)} />, document.body)}
+    </>
   )
 }
 
@@ -807,10 +979,6 @@ function LogViewerDialog({ onClose }: { onClose: () => void }) {
     }
   }, [])
 
-  // Layered above Settings; useEscapeKey hands Esc to the topmost layer only,
-  // so Settings stays open underneath.
-  useEscapeKey(onClose)
-
   const exportLog = async () => {
     try {
       const res = await invoke<{ saved: boolean; path?: string }>('log.export')
@@ -821,38 +989,36 @@ function LogViewerDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose()
-      }}
-      className="fixed inset-0 flex items-center justify-center bg-black/35 dark:bg-black/60 backdrop-blur-[3px] z-50 p-4 select-none animate-fade-in"
+    <Dialog
+      onClose={onClose}
+      aria-label={t('settings.viewSyncLog')}
+      backdropClassName="bg-black/35"
+      className="border-border/80 max-w-3xl h-[560px] max-h-[85vh] shadow-black/20 dark:shadow-black/45 flex flex-col overflow-hidden"
     >
-      <div className="bg-chats border border-border/80 text-primary max-w-3xl w-full h-[560px] max-h-[85vh] rounded-3xl shadow-2xl shadow-black/20 dark:shadow-black/45 animate-slide-up flex flex-col overflow-hidden">
-        <div className="flex items-center justify-between gap-4 px-6 py-4.5 border-b border-border/60 shrink-0 bg-chats/95">
-          <h2 className="text-base font-bold tracking-tight leading-tight">{t('settings.viewSyncLog')}</h2>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => void exportLog()}
-              disabled={!log}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Download size={12} />
-              {t('common.export')}
-            </button>
-            <IconButton icon={X} iconSize={16} label={t('buttons.close')} size="sm" onClick={onClose} />
-          </div>
-        </div>
-        <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 select-text">
-          {log === null ? (
-            <p className="text-xs text-secondary">{t('common.loading')}</p>
-          ) : log === '' ? (
-            <p className="text-xs text-secondary">{t('settings.syncLogEmpty')}</p>
-          ) : (
-            <pre className="whitespace-pre-wrap break-all font-mono text-[0.6875rem] leading-4 text-primary">{log}</pre>
-          )}
+      <div className="flex items-center justify-between gap-4 px-6 py-4.5 border-b border-border/60 shrink-0 bg-chats/95">
+        <h2 className="text-base font-bold tracking-tight leading-tight">{t('settings.viewSyncLog')}</h2>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void exportLog()}
+            disabled={!log}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-hover hover:bg-active text-primary font-bold text-[0.625rem] cursor-pointer transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Download size={12} />
+            {t('common.export')}
+          </button>
+          <IconButton icon={X} iconSize={16} label={t('buttons.close')} size="sm" onClick={onClose} />
         </div>
       </div>
-    </div>
+      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto p-4 select-text">
+        {log === null ? (
+          <p className="text-xs text-secondary">{t('common.loading')}</p>
+        ) : log === '' ? (
+          <p className="text-xs text-secondary">{t('settings.syncLogEmpty')}</p>
+        ) : (
+          <pre className="whitespace-pre-wrap break-all font-mono text-[0.6875rem] leading-4 text-primary">{log}</pre>
+        )}
+      </div>
+    </Dialog>
   )
 }
 
@@ -886,11 +1052,11 @@ function OpmlGroup({ account }: { account: string }) {
   )
 }
 
-function AccountPanel({ account }: { account: Account }) {
+export function AccountPanel({ account }: { account: Account }) {
   const { t } = useTranslation()
   const { isRSS, displayName, subtitle } = accountMeta(account, t)
   const [avatarFile, setAvatarFile] = useState<File | null>(null)
-  const { avatarBusy, persistAvatarFile } = useAccountAvatar(account.id)
+  const { avatarBusy, persistAvatarFile, persistAvatarUrl } = useAccountAvatar(account.id)
 
   const reconnectAccount = () => {
     ui$.reconnectAccountId.set(account.id)
@@ -915,18 +1081,27 @@ function AccountPanel({ account }: { account: Account }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3 min-w-0">
-        <button
-          type="button"
-          title={t('settings.account.changeAvatar')}
-          disabled={avatarBusy}
-          onClick={() => void pickAvatarFile()}
-          className="relative shrink-0 rounded-2xl group disabled:cursor-default cursor-pointer"
-        >
-          <Avatar name={displayName} src={account.avatar_url} size={40} className="!rounded-2xl" />
-          <span className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity">
-            <Camera size={15} className="text-white" />
-          </span>
-        </button>
+        <div className="relative shrink-0 group">
+          <button
+            type="button"
+            title={t('settings.account.changeAvatar')}
+            disabled={avatarBusy}
+            onClick={() => void pickAvatarFile()}
+            className="relative block rounded-2xl disabled:cursor-default cursor-pointer"
+          >
+            <Avatar name={displayName} src={account.avatar_url} size={40} className="!rounded-2xl" />
+            <span className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity">
+              <Camera size={15} className="text-white" />
+            </span>
+          </button>
+          {account.avatar_url && (
+            <RemoveImageBadge
+              label={t('settings.account.removeAvatar')}
+              disabled={avatarBusy}
+              onRemove={() => void persistAvatarUrl('')}
+            />
+          )}
+        </div>
         {avatarFile && (
           <AvatarCropDialog
             file={avatarFile}

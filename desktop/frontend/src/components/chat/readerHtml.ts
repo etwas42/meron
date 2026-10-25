@@ -1,13 +1,19 @@
-import { type MessageFrameFont } from '../../lib/fonts'
+import { BUBBLE_HTML_BASE_PX, type MessageFrameFont } from '../../lib/fonts'
+import { copyText } from '../../lib/native'
+import { usesNativeScrollbars } from '../../lib/nativeScrollbars'
 import {
   DEFAULT_READER_THEME,
   LIGHT_ON_DARK_TEXT,
+  darkenedCss,
+  darkenedFloor,
+  darkensCanvas,
   disownStyleElements,
   frameCanvas,
   frameVar,
   frameVarPrefix,
   isOwnStyleElement,
   ownStyleElement,
+  setDarkened,
   type ReaderTheme,
 } from './frameTheme'
 
@@ -19,14 +25,35 @@ export const DEFAULT_READER_FONT: MessageFrameFont = {
   zoom: 1,
 }
 
-const readerCss = (v: (name: string) => string) => `
+// The styled code-block scrollbar is left out where the webview draws the
+// desktop's own overlay ones (lib/nativeScrollbars), as in index.css.
+const preScrollbarCss = (v: (name: string) => string) => `
+  pre::-webkit-scrollbar {
+    height: 10px;
+  }
+  pre::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  pre::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    border-radius: 999px;
+    background-color: var(${v('muted')}, #cbd5e1);
+  }
+  pre::-webkit-scrollbar-thumb:hover {
+    background-color: var(${v('muted-strong')}, #94a3b8);
+    border: 2px solid transparent;
+  }
+`
+
+const readerCss = (v: (name: string) => string, nativeScrollbars: boolean) => `
   html {
     background: var(${v('page-bg')}, #f8fafc);
   }
   body {
     box-sizing: border-box;
     max-width: 760px;
-    margin: 0 auto !important;
+    margin: 0 !important;
     padding: 24px 20px 40px !important;
     color: var(${v('text')}, #0f172a);
     overflow-wrap: anywhere;
@@ -36,10 +63,9 @@ const readerCss = (v: (name: string) => string) => `
   }
   img, video {
     display: inline-block;
-    width: auto !important;
     max-width: 100% !important;
     height: auto !important;
-    max-height: 48vh;
+    max-height: var(${v('media-max-height')}, 48vh);
     object-fit: contain;
   }
   img {
@@ -72,22 +98,7 @@ const readerCss = (v: (name: string) => string) => `
     overflow-y: hidden;
     scrollbar-gutter: stable;
   }
-  pre::-webkit-scrollbar {
-    height: 10px;
-  }
-  pre::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  pre::-webkit-scrollbar-thumb {
-    border: 3px solid transparent;
-    background-clip: padding-box;
-    border-radius: 999px;
-    background-color: var(${v('muted')}, #cbd5e1);
-  }
-  pre::-webkit-scrollbar-thumb:hover {
-    background-color: var(${v('muted-strong')}, #94a3b8);
-    border: 2px solid transparent;
-  }
+  ${nativeScrollbars ? '' : preScrollbarCss(v)}
   pre code {
     display: block;
     min-width: max-content;
@@ -153,6 +164,7 @@ const readerCss = (v: (name: string) => string) => `
     width: 15px;
     height: 15px;
   }
+  ${darkenedCss(v)}
 `
 
 /**
@@ -176,6 +188,7 @@ export function applyReaderTheme(doc: Document, theme: ReaderTheme) {
   // seam around the body. In a dark one the gutter stays dark and the canvas is
   // confined to the reader column, so the message reads as a card on it.
   style.setProperty(v('page-bg'), canvas && theme.appearance === 'light' ? canvas : theme.pageBg)
+  style.setProperty(v('darkened-floor'), darkenedFloor(theme.pageBg))
 
   const vars: Array<[string, string]> = [
     [v('text'), theme.text],
@@ -198,6 +211,10 @@ export function applyReaderTheme(doc: Document, theme: ReaderTheme) {
   // readable foreground — a restored black page with the light-mode default on
   // it is the dark-on-dark case this whole path exists to avoid.
   if (canvasText) style.setProperty(v('text'), canvasText)
+
+  // The canvas is confined to the reader column in a dark appearance, so
+  // inverting the body turns that light card into the gutter's own color.
+  setDarkened(doc, darkensCanvas(theme.appearance, theme.darkenStyled, canvas), darkenedFloor(theme.pageBg))
 }
 
 /**
@@ -289,20 +306,41 @@ export function stripTrackingPixels(html: string): string {
   }
 }
 
+// The reader's column, which the tab's header is aligned to: at the left,
+// 760px wide with 20px sides, on screen. The text size is a zoom on the body,
+// which scales the body's own box too, so its width and padding are divided by
+// it to stay put while the email's text grows. Set on the body itself, where
+// it also outranks the email's own rules.
+function applyReaderColumn(body: HTMLElement, zoom: number) {
+  const px = (value: number) => `${value / zoom}px`
+  body.style.setProperty('box-sizing', 'border-box', 'important')
+  body.style.setProperty('max-width', px(760), 'important')
+  body.style.setProperty('margin', '0', 'important')
+  body.style.setProperty('padding', `${px(24)} ${px(20)} ${px(40)}`, 'important')
+}
+
 /**
- * Paint a reader frame with the user's message typography. Declarations are
- * only emitted when a preference is actually set, so by default the email's own
- * fonts (and the browser default) render exactly as before. No `!important`
- * either: an email that names its own fonts keeps them. The text size arrives as
- * a body `zoom` so it also moves the emails that size their own text.
+ * Paint a reader frame with the user's message typography. Mail gets the base
+ * size and leading its bubble has, so a message reads the same in a tab as in
+ * the conversation; a feed `article` keeps the engine's larger reading size.
+ * The base sits in `:where()` so anything the email says about its own text
+ * wins. The family and zoom are only emitted when a preference is actually set,
+ * and without `!important`: an email that names its own fonts keeps them. The
+ * text size arrives as a body `zoom` so it also moves the emails that size
+ * their own text.
  */
-export function applyReaderFont(doc: Document, font: MessageFrameFont) {
+export function applyReaderFont(doc: Document, font: MessageFrameFont, article = false) {
+  if (doc.body) applyReaderColumn(doc.body, font.zoom)
   const rules: string[] = []
   if (font.family) rules.push(`font-family: ${font.family};`)
   if (font.zoom !== 1) rules.push(`zoom: ${font.zoom};`)
 
+  const css: string[] = []
+  if (!article) css.push(`:where(html) { font-size: ${BUBBLE_HTML_BASE_PX}px; line-height: 1.45; }`)
+  if (rules.length > 0) css.push(`body { ${rules.join(' ')} }`)
+
   let style = ownStyle(doc, READER_FONT_STYLE_ID)
-  if (rules.length === 0) {
+  if (css.length === 0) {
     style?.remove()
     return
   }
@@ -312,7 +350,7 @@ export function applyReaderFont(doc: Document, font: MessageFrameFont) {
     ownStyleElement(style)
     ;(doc.head ?? doc.documentElement).appendChild(style)
   }
-  style.textContent = `body { ${rules.join(' ')} }`
+  style.textContent = css.join(' ')
 }
 
 // Apply the reader-width layout to a rendered frame document: inject the reader
@@ -323,15 +361,16 @@ export function applyReaderLayout(
   doc: Document,
   font: MessageFrameFont = DEFAULT_READER_FONT,
   theme: ReaderTheme = DEFAULT_READER_THEME,
+  article = false,
 ) {
-  applyReaderFont(doc, font)
+  applyReaderFont(doc, font, article)
   applyReaderTheme(doc, theme)
 
   if (!ownStyle(doc, READER_STYLE_ID)) {
     const prefix = frameVarPrefix(doc)
     const style = doc.createElement('style')
     style.id = READER_STYLE_ID
-    style.textContent = readerCss((name) => frameVar(prefix, name))
+    style.textContent = readerCss((name) => frameVar(prefix, name), usesNativeScrollbars(navigator.userAgent))
     ownStyleElement(style)
     ;(doc.head ?? doc.documentElement).appendChild(style)
   }
@@ -360,17 +399,71 @@ export function applyReaderLayout(
     button.addEventListener('click', (event) => {
       event.preventDefault()
       event.stopPropagation()
-      navigator.clipboard?.writeText(pre.innerText).catch(() => undefined)
+      copyText(pre.innerText).catch(() => undefined)
     })
     wrapper.appendChild(button)
   }
 
+  const mediaMaxHeight = `var(${frameVar(frameVarPrefix(doc), 'media-max-height')}, 48vh)`
+  // Media keeps the width the email gives it (an avatar drawn at 20px from a
+  // larger picture) and is only capped to the reader's width and the window's
+  // height, its height following to keep its shape, as in the bubbles.
   for (const media of doc.querySelectorAll<HTMLImageElement | HTMLVideoElement>('img,video')) {
-    media.removeAttribute('width')
-    media.removeAttribute('height')
-    media.style.setProperty('width', 'auto', 'important')
     media.style.setProperty('max-width', '100%', 'important')
     media.style.setProperty('height', 'auto', 'important')
-    media.style.setProperty('max-height', '48vh', 'important')
+    media.style.setProperty('max-height', mediaMaxHeight, 'important')
   }
+}
+
+const VIEWPORT_HEIGHT_LENGTH = /(-?(?:\d+\.?\d*|\.\d+))[dsl]?vh\b/g
+
+function pinStyleViewportHeights(style: CSSStyleDeclaration, viewportHeight: number) {
+  for (let index = 0; index < style.length; index++) {
+    const name = style[index]
+    const value = style.getPropertyValue(name)
+    if (!value.includes('vh')) continue
+    const pinned = value.replace(
+      VIEWPORT_HEIGHT_LENGTH,
+      (_, amount: string) => `${Math.round((parseFloat(amount) * viewportHeight) / 100)}px`,
+    )
+    style.setProperty(name, pinned, style.getPropertyPriority(name))
+  }
+}
+
+function pinRuleViewportHeights(rules: CSSRuleList, viewportHeight: number) {
+  for (const rule of Array.from(rules)) {
+    const style = (rule as CSSStyleRule).style
+    if (style) pinStyleViewportHeights(style, viewportHeight)
+    const nested = (rule as CSSGroupingRule).cssRules
+    if (nested) pinRuleViewportHeights(nested, viewportHeight)
+  }
+}
+
+// A frame sized to its content is its own viewport, so a block the email sizes
+// in `vh` (a full-height hero) would fill the frame, grow it by the body's
+// padding, and fill it again without end. Its `vh` lengths are taken as the
+// window's instead, where the email is actually seen, once, as it is shown.
+export function pinViewportHeights(doc: Document, viewportHeight: number) {
+  for (const sheet of Array.from(doc.styleSheets)) {
+    let rules: CSSRuleList
+    try {
+      rules = sheet.cssRules
+    } catch {
+      continue
+    }
+    pinRuleViewportHeights(rules, viewportHeight)
+  }
+  for (const element of doc.querySelectorAll<HTMLElement>('[style*="vh"]')) {
+    pinStyleViewportHeights(element.style, viewportHeight)
+  }
+}
+
+// A frame sized to its content has its own height for a viewport, so `vh`
+// there would grow with every image it caps. Cap media at a share of the
+// window the frame is shown in instead; call again when that window resizes.
+export function applyReaderMediaHeight(doc: Document, viewportHeight: number) {
+  doc.documentElement.style.setProperty(
+    frameVar(frameVarPrefix(doc), 'media-max-height'),
+    `${Math.round(viewportHeight * 0.48)}px`,
+  )
 }

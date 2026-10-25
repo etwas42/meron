@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"log"
 	"net/http"
@@ -18,11 +19,14 @@ var assets embed.FS
 //go:embed build/appicon.png
 var appIconPNG []byte
 
-//go:embed build/trayicon.png
+//go:embed build/tray-color.png
 var trayIconPNG []byte
 
-//go:embed build/trayicon-unread.png
+//go:embed build/tray-color-unread.png
 var trayIconUnreadPNG []byte
+
+//go:embed build/trayicon-mono.png
+var trayIconMonoPNG []byte
 
 //go:embed build/trayicon.ico
 var trayIconICO []byte
@@ -37,26 +41,36 @@ func main() {
 
 	app := NewApp()
 	globalApp = app
+	startMaximised := app.window.Maximised
+	integrated := integratedTitlebarSupported && app.window.Titlebar != titlebarSystem
+	integratedTitlebar.Store(integrated)
+	installWindowChrome(integrated)
 
 	err := wails.Run(&options.App{
-		Title:                    "Meron",
-		Width:                    1200,
-		Height:                   800,
-		WindowStartState:         startWindowState(),
-		HideWindowOnClose:        true,
+		Title:                    appTitle(),
+		Width:                    app.window.Width,
+		Height:                   app.window.Height,
+		WindowStartState:         startWindowState(startMaximised),
+		StartHidden:              startWindowHidden,
+		HideWindowOnClose:        hideOnCloseNatively,
+		Frameless:                framelessTitlebar && integrated,
 		EnableDefaultContextMenu: true,
+		BackgroundColour:         windowBackgroundColour(),
 		AssetServer: &assetserver.Options{
 			Assets:     assets,
 			Handler:    mediaHandler(),
 			Middleware: cspMiddleware,
 		},
+		// Linux only: see filedrop.go.
+		DragAndDrop: &options.DragAndDrop{EnableFileDrop: nativeFileDrop},
 		Linux: &linux.Options{
-			Icon: appIconPNG,
+			Icon:                appIconPNG,
+			WindowIsTranslucent: roundedWindowCorners,
 		},
 		Mac: &mac.Options{
 			// Hide the native title bar and extend content to the top edge,
-			// keeping the traffic-light buttons. The frontend draws a slim
-			// draggable strip in their place (see MacTitleBar).
+			// keeping the traffic-light buttons. TitleBar.tsx draws the 40px
+			// draggable bar; alignNativeTitlebar centres the native buttons.
 			TitleBar:  mac.TitleBarHidden(),
 			OnUrlOpen: app.openMailtoURL,
 		},
@@ -66,9 +80,13 @@ func main() {
 				app.HandleSecondInstanceLaunch(data.Args)
 			},
 		},
-		OnStartup:  app.Startup,
-		OnDomReady: maximiseOnDomReady,
-		OnShutdown: app.Shutdown,
+		OnStartup: app.Startup,
+		OnDomReady: func(ctx context.Context) {
+			alignNativeTitlebar()
+			maximiseOnDomReady(ctx, startMaximised)
+		},
+		OnBeforeClose: app.beforeClose,
+		OnShutdown:    app.Shutdown,
 		Bind: []interface{}{
 			app,
 		},

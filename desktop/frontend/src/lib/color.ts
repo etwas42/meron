@@ -144,6 +144,15 @@ export function formatColor({ r, g, b, a }: Rgba): string {
   return `rgba(${clamp255(r)}, ${clamp255(g)}, ${clamp255(b)}, ${Math.round(clamp01(a) * 100) / 100})`
 }
 
+/** "#rrggbb", or "#rrggbbaa" when translucent; null if unparseable. */
+export function toHex(input: string): string | null {
+  const parsed = parseColor(input)
+  if (!parsed) return null
+  const to2 = (n: number) => clamp255(n).toString(16).padStart(2, '0')
+  const alpha = parsed.a >= 1 ? '' : to2(clamp01(parsed.a) * 255)
+  return `#${to2(parsed.r)}${to2(parsed.g)}${to2(parsed.b)}${alpha}`
+}
+
 /** Linear blend of two colors: weight 0 -> a, 1 -> b. */
 export function mix(colorA: string, colorB: string, weight: number): string {
   const a = parseColor(colorA)
@@ -175,11 +184,66 @@ export function withAlpha(color: string, alpha: number): string {
   return formatColor({ ...parsed, a: clamp01(alpha) })
 }
 
+/** `color` composited over the opaque `base`, as an opaque color. */
+export function flatten(color: string, base: string): string {
+  const top = parseColor(color)
+  const bottom = parseColor(base)
+  if (!top || !bottom) return color
+  const blend = (a: number, b: number) => a * top.a + b * (1 - top.a)
+  return formatColor({ r: blend(top.r, bottom.r), g: blend(top.g, bottom.g), b: blend(top.b, bottom.b), a: 1 })
+}
+
 /** Perceived luminance 0..1 (WCAG-ish, good enough to pick contrasting text). */
 export function luminance(color: string): number {
   const parsed = parseColor(color)
   if (!parsed) return 0
   return (0.2126 * parsed.r + 0.7152 * parsed.g + 0.0722 * parsed.b) / 255
+}
+
+/** OKLCH coordinates: perceptual lightness 0..1, chroma, hue in degrees. */
+export type Oklch = { l: number; c: number; h: number }
+
+const toLinear = (channel: number) => {
+  const value = channel / 255
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+}
+const fromLinear = (value: number) =>
+  255 * (value <= 0.0031308 ? 12.92 * value : 1.055 * Math.max(0, value) ** (1 / 2.4) - 0.055)
+
+/** OKLCH of an opaque color; null if unparseable. */
+export function toOklch(color: string): Oklch | null {
+  const parsed = parseColor(color)
+  if (!parsed) return null
+  const [r, g, b] = [toLinear(parsed.r), toLinear(parsed.g), toLinear(parsed.b)]
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+  const lightness = 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s
+  const a = 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s
+  const bb = 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s
+  return { l: lightness, c: Math.hypot(a, bb), h: ((Math.atan2(bb, a) * 180) / Math.PI + 360) % 360 }
+}
+
+/** "#rrggbb" for OKLCH coordinates, clipped to sRGB. */
+export function fromOklch({ l: lightness, c, h }: Oklch): string {
+  const a = c * Math.cos((h * Math.PI) / 180)
+  const b = c * Math.sin((h * Math.PI) / 180)
+  const l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3
+  const m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3
+  const s = (lightness - 0.0894841775 * a - 1.291485548 * b) ** 3
+  return formatColor({
+    r: fromLinear(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    g: fromLinear(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    b: fromLinear(-0.0041960863 * l - 0.7034186147 * m + 1.7076949135 * s),
+    a: 1,
+  })
+}
+
+/** `color`'s hue and chroma at perceptual lightness `lightness` (0..1). */
+export function withLightness(color: string, lightness: number): string {
+  const oklch = toOklch(color)
+  if (!oklch) return color
+  return fromOklch({ ...oklch, l: clamp01(lightness) })
 }
 
 export function isValidColor(input: string): boolean {

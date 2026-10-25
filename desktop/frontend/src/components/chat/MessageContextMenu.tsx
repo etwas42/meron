@@ -3,16 +3,20 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FilePen,
   Forward,
+  Globe,
   Link2,
   Mail,
   MailOpen,
+  Reply,
   ReplyAll,
   Printer,
   SquarePen,
   Star,
   Trash2,
 } from 'lucide-react'
+import { mailHtmlToText } from '../../lib/html'
 import { useTranslation } from '../../lib/i18n'
 import {
   openMessageTab,
@@ -23,22 +27,15 @@ import {
 } from '../../states/compose'
 import { messageCanReplyAll } from '../../states/composeReply'
 import { printMail } from '../../lib/printMail'
-import { saveMessageAsEml } from '../../states/mail'
+import { copyAttachmentImage, downloadAttachment, saveMessageAsEml } from '../../states/mail'
 import { markMessageReadState, starMessage } from '../../states/mailFlags'
 import { isDraftFolder } from '../../states/mailFolders'
 import { deleteMessage } from '../../states/mailMoves'
-import { openExternal } from '../../lib/native'
+import { copyText, openExternal } from '../../lib/native'
 import { FloatingContextMenu } from '../menu/FloatingContextMenu'
 import { MenuItem } from '../menu/MenuItem'
+import type { MessageContextMenuState } from '../../states/thread'
 import type { Message } from '../../types'
-
-export type MessageContextMenuState = {
-  x: number
-  y: number
-  message: Message
-  linkUrl?: string
-  hideOpenInNewTab?: boolean
-}
 
 // Right-click menu for a message (or a link inside it). Clamps itself inside the
 // viewport on mount since clientX/clientY can land near the right/bottom edge.
@@ -48,6 +45,10 @@ export function MessageContextMenu({
   headerOnly = false,
   onClose,
   onSelectMessage,
+  onMessageChange,
+  onReply,
+  onPrint,
+  onDeleted,
 }: {
   state: MessageContextMenuState
   isRSS: boolean
@@ -56,6 +57,16 @@ export function MessageContextMenu({
   headerOnly?: boolean
   onClose: () => void
   onSelectMessage?: (message: Message) => void
+  /** Hears the read and star changes the menu makes once they succeed, for a
+   * holder of its own copy of the message (a reader tab), which the thread's
+   * update can miss. */
+  onMessageChange?: (patch: Partial<Message>) => void
+  /** Offers Reply, where no quick reply sits under the message (a reader tab). */
+  onReply?: () => void
+  /** Prints in place of the default, for a caller that knows more about it
+   * (a reader tab and the remote content it shows). */
+  onPrint?: () => void
+  onDeleted?: () => void
 }) {
   const { t } = useTranslation()
   const isDraft = isDraftFolder(state.message.folder_id, state.message.account_id)
@@ -66,26 +77,56 @@ export function MessageContextMenu({
       onClose={onClose}
       overlay
       overlayClassName="fixed inset-0 z-[60]"
-      className="fixed z-[61] min-w-[180px] rounded-xl border border-border bg-header p-1 shadow-xl"
+      className="fixed z-[61] min-w-[180px] bg-header shadow-xl"
     >
-      {state.linkUrl ? (
+      {state.linkUrl || state.image ? (
         <>
-          <MenuItem
-            icon={<ExternalLink size={13} className="text-accent" />}
-            label={t('chat.actions.openLink')}
-            onClick={() => {
-              openExternal(state.linkUrl!)
-              onClose()
-            }}
-          />
-          <MenuItem
-            icon={<Link2 size={13} className="text-accent" />}
-            label={t('chat.actions.copyLinkAddress')}
-            onClick={() => {
-              navigator.clipboard?.writeText(state.linkUrl!).catch(() => undefined)
-              onClose()
-            }}
-          />
+          {state.linkUrl && (
+            <>
+              <MenuItem
+                icon={<ExternalLink size={13} className="text-accent" />}
+                label={t('chat.actions.openLink')}
+                onClick={() => {
+                  openExternal(state.linkUrl!)
+                  onClose()
+                }}
+              />
+              <MenuItem
+                icon={<Link2 size={13} className="text-accent" />}
+                label={t('chat.actions.copyLinkAddress')}
+                onClick={() => {
+                  copyText(state.linkUrl!).catch(() => undefined)
+                  onClose()
+                }}
+              />
+            </>
+          )}
+          {/* A linked picture offers both. */}
+          {state.image && (
+            <>
+              <MenuItem
+                icon={<Download size={13} className="text-accent" />}
+                label={t('chat.actions.saveImage')}
+                onClick={() => {
+                  const image = state.image!
+                  onClose()
+                  void downloadAttachment({
+                    ...image,
+                    mime: image.mime ?? state.message.attachments?.find((att) => att.key === image.key)?.mime,
+                  })
+                }}
+              />
+              <MenuItem
+                icon={<Copy size={13} className="text-accent" />}
+                label={t('chat.actions.copyImage')}
+                onClick={() => {
+                  const image = state.image!
+                  onClose()
+                  void copyAttachmentImage(image)
+                }}
+              />
+            </>
+          )}
         </>
       ) : (
         <>
@@ -109,6 +150,26 @@ export function MessageContextMenu({
               }}
             />
           )}
+          {isRSS && state.message.link && (
+            <>
+              <MenuItem
+                icon={<Globe size={13} className="text-accent" />}
+                label={t('chat.actions.openLink')}
+                onClick={() => {
+                  openExternal(state.message.link!)
+                  onClose()
+                }}
+              />
+              <MenuItem
+                icon={<Link2 size={13} className="text-accent" />}
+                label={t('chat.actions.copyLinkAddress')}
+                onClick={() => {
+                  copyText(state.message.link!).catch(() => undefined)
+                  onClose()
+                }}
+              />
+            </>
+          )}
           {onSelectMessage && (
             <MenuItem
               icon={<CheckSquare size={13} className="text-accent" />}
@@ -131,7 +192,11 @@ export function MessageContextMenu({
             onClick={() => {
               const message = state.message
               onClose()
-              void markMessageReadState(message, message.unread)
+              // Only once it took: a failed change is rolled back in the
+              // conversation, and a copy patched ahead would keep it.
+              void markMessageReadState(message, message.unread).then(() =>
+                onMessageChange?.({ unread: !message.unread }),
+              )
             }}
           />
           <MenuItem
@@ -142,9 +207,19 @@ export function MessageContextMenu({
             onClick={() => {
               const message = state.message
               onClose()
-              void starMessage(message, !message.starred)
+              void starMessage(message, !message.starred).then(() => onMessageChange?.({ starred: !message.starred }))
             }}
           />
+          {onReply && !isDraft && !isRSS && (
+            <MenuItem
+              icon={<Reply size={13} className="text-accent" />}
+              label={t('chat.actions.reply')}
+              onClick={() => {
+                onClose()
+                onReply()
+              }}
+            />
+          )}
           {!isDraft && !isRSS && messageCanReplyAll(state.message) && (
             <MenuItem
               icon={<ReplyAll size={13} className="text-accent" />}
@@ -169,12 +244,22 @@ export function MessageContextMenu({
           )}
           {!isDraft && !isRSS && !headerOnly && (
             <MenuItem
-              icon={<Copy size={13} className="text-accent" />}
+              icon={<FilePen size={13} className="text-accent" />}
               label={t('chat.actions.editAsNewMessage')}
               onClick={() => {
                 const message = state.message
                 onClose()
                 void editAsNewMessage(message)
+              }}
+            />
+          )}
+          {!headerOnly && !state.message.body_missing && (
+            <MenuItem
+              icon={<Copy size={13} className="text-accent" />}
+              label={t('chat.copyMessageText')}
+              onClick={() => {
+                copyText(messagePlainText(state.message)).catch(() => undefined)
+                onClose()
               }}
             />
           )}
@@ -195,7 +280,8 @@ export function MessageContextMenu({
               label={t('chat.actions.print')}
               onClick={() => {
                 onClose()
-                void printMail(state.message)
+                if (onPrint) onPrint()
+                else void printMail(state.message)
               }}
             />
           )}
@@ -207,7 +293,9 @@ export function MessageContextMenu({
               onClick={() => {
                 const message = state.message
                 onClose()
-                void deleteMessage(message)
+                void deleteMessage(message).then((deleted) => {
+                  if (deleted) onDeleted?.()
+                })
               }}
             />
           )}
@@ -215,4 +303,10 @@ export function MessageContextMenu({
       )}
     </FloatingContextMenu>
   )
+}
+
+/** The message as plain text: its text body, or the rich body's text when it has none. */
+function messagePlainText(message: Message): string {
+  if (message.body.trim()) return message.body
+  return message.body_html ? mailHtmlToText(message.body_html).trim() : ''
 }

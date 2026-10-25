@@ -1,6 +1,6 @@
 import { invoke } from './bridge'
 import { CONVERSATION_PAGE_SIZE } from './pagination'
-import { htmlToText } from './html'
+import { mailHtmlToText } from './html'
 import { t } from './i18n'
 import { formatFullTimestamp, htmlReferencesMedia } from '../components/chat/messageHelpers'
 import { showToast, ui$ } from '../states/ui'
@@ -56,17 +56,10 @@ export function mailPrintText(mail: Message | MessageTab): string {
   ].filter(Boolean)
   let body = (message ? mail.body_missing : mail.bodyMissing) ? t('chat.couldNotPrintMessage') : mail.body
   if (!body) {
-    const html = new DOMParser().parseFromString((message ? mail.body_html : mail.bodyHtml) || '', 'text/html')
-    html
-      .querySelectorAll('script, style, img, iframe, object, embed, link, video, audio, source')
-      .forEach((el) => el.remove())
-    html.querySelectorAll('*').forEach((el) => {
-      for (const attribute of Array.from(el.attributes)) el.removeAttribute(attribute.name)
-    })
-    body = htmlToText(html.body.innerHTML)
+    body = mailHtmlToText((message ? mail.body_html : mail.bodyHtml) || '')
   }
   const attachments = printAttachmentNames(mail)
-  return `${rows.join('\n')}\n\n${body}${attachments.length ? `\n\n${t('chat.printAttachments')}:\n${attachments.join('\n')}` : ''}`
+  return `${rows.join('\n')}\n\n${body}${attachments.length ? `\n\n${t('chat.attachments')}:\n${attachments.join('\n')}` : ''}`
 }
 
 export async function loadPrintThread(threadId: string): Promise<Message[]> {
@@ -150,7 +143,7 @@ export function mailPrintHtml(mail: Message | MessageTab, allowRemote: boolean):
   if (attachmentNames.length) {
     const attachments = doc.createElement('pre')
     attachments.className = 'meron-print-summary'
-    attachments.textContent = `\n${t('chat.printAttachments')}:\n${attachmentNames.join('\n')}`
+    attachments.textContent = `\n${t('chat.attachments')}:\n${attachmentNames.join('\n')}`
     doc.body.append(attachments)
   }
   const style = doc.createElement('style')
@@ -177,8 +170,70 @@ function printRemoteAllowed(mail: Message | MessageTab): boolean {
   )
 }
 
+// Attributes that fetch something once printed; mailPrintHtml already drops
+// scripts, frames, objects and stylesheet links. href counts outside links (SVG
+// image/use); metadata such as GitHub's itemtype="http://schema.org/…" does not.
+const LOADING_ATTRIBUTES = new Set(['src', 'srcset', 'poster', 'background', 'style', 'href', 'xlink:href'])
+const NAVIGATING_ELEMENTS = new Set(['a', 'area', 'link'])
+
+// A URL attribute is remote when it starts with a scheme or is protocol-relative;
+// inline data (a data: GIF can hold "///") is not. CSS is checked anywhere a URL
+// can start: after a quote, bracket or whitespace.
+const REMOTE_URL = /^\s*(https?:|\/\/)/i
+const REMOTE_CSS_PATTERN = /https?:|['"(\s]\/\//i
+
+// CSS escapes can spell a URL (url(\68 ttps://…) is https://…), so they are
+// decoded first: hex escapes with their optional trailing whitespace, any other
+// escaped character as itself, and line continuations (backslash–newline, which
+// a string drops) removed. Outside strings a continuation is invalid; dropping
+// it there too only errs towards remote.
+function decodeCssEscapes(css: string): string {
+  return css.replace(/\\([0-9a-f]{1,6})(?:\r\n|[ \t\n\r\f])?|\\(\r\n|[\s\S])/gi, (_, hex, char) => {
+    if (hex === undefined) return /^(\r\n|[\n\r\f])$/.test(char) ? '' : char
+    const code = parseInt(hex, 16)
+    return code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) ? '\ufffd' : String.fromCodePoint(code)
+  })
+}
+
+const remoteCss = (css: string) => REMOTE_CSS_PATTERN.test(decodeCssEscapes(css))
+
+/** Whether an email body could load anything remote once printed. Errs towards
+ *  yes for anything that fetches; links and text are ignored. */
+export function referencesRemoteContent(html: string | undefined): boolean {
+  if (!html) return false
+  const doc = new DOMParser().parseFromString(stripTrackingPixels(html), 'text/html')
+  for (const el of doc.querySelectorAll('*')) {
+    if (el.localName === 'style' && remoteCss(el.textContent ?? '')) return true
+    for (const { name, value } of Array.from(el.attributes)) {
+      if (!LOADING_ATTRIBUTES.has(name)) continue
+      if (name === 'href' && NAVIGATING_ELEMENTS.has(el.localName)) continue
+      if (
+        name === 'style'
+          ? remoteCss(value)
+          : name === 'srcset'
+            ? value.split(',').some((candidate) => REMOTE_URL.test(candidate))
+            : REMOTE_URL.test(value)
+      )
+        return true
+    }
+  }
+  return false
+}
+
+// A thread whose messages print under different remote policies cannot share
+// one document, and falls back to per-message frames that slice lines at page
+// edges. A message with nothing remote prints the same under the stricter one.
+function printRemoteDecisions(mails: (Message | MessageTab)[], allowRemote?: boolean): boolean[] {
+  const allowed = mails.map((mail) => allowRemote ?? printRemoteAllowed(mail))
+  if (!allowed.includes(true) || !allowed.includes(false)) return allowed
+  return allowed.map(
+    (allow, index) =>
+      allow && referencesRemoteContent('from_addr' in mails[index] ? mails[index].body_html : mails[index].bodyHtml),
+  )
+}
+
 // Shadow roots isolate each email's CSS without introducing iframe page slicing.
-// Native WebKit on Linux/macOS attaches these templates before printing the document.
+// Native WebKit on Linux/macOS, or pagedPrint elsewhere, attaches these templates before printing.
 export function nativePrintHtml(root: HTMLElement): string | undefined {
   const doc = document.implementation.createHTMLDocument('')
   const title = doc.createElement('title')
@@ -279,6 +334,14 @@ async function printMails(
     })
   }
   const beforePrint = () => measureFrames()
+  // WebKitGTK prints iframes blank while it draws its own overlay scrollbars
+  // (html.native-scrollbars, lib/nativeScrollbars); the styled ones are restored
+  // to print. macOS has the class too and takes the same path, harmlessly.
+  const nativeScrollbars = document.documentElement.classList.contains('native-scrollbars')
+  const printPage = (win: Window) => {
+    document.documentElement.classList.remove('native-scrollbars')
+    win.print()
+  }
   const browserPrint = () => {
     // Browser fallback retains iframe CSP isolation; summaries belong outside
     // that email-controlled style scope.
@@ -291,13 +354,60 @@ async function printMails(
     stopPreparing()
     document.title = printTitle
     changedTitle = true
-    window.print()
+    printPage(window)
   }
-  for (const mail of mails) {
+  // Browsers slice iframes at page edges instead of breaking between lines,
+  // so print the shadow-root document from its own frame as a top-level page.
+  const pagedPrint = async (html: string) => {
+    const frame = document.createElement('iframe')
+    // No allow-scripts: the frame's CSP and sandbox both keep mail markup inert.
+    frame.setAttribute('sandbox', 'allow-same-origin allow-modals')
+    frame.style.cssText = 'display:block;width:100%;border:0;height:1px;'
+    const loaded = new Promise<void>((resolve) => {
+      frame.onload = () => resolve()
+    })
+    frame.srcdoc = html
+    root.append(frame)
+    await loaded
+    const doc = frame.contentDocument
+    const win = frame.contentWindow
+    if (!doc?.body || !win) throw new Error('Print HTML unavailable')
+    const margins = doc.createElement('style')
+    margins.textContent = '@page { margin: 15mm; }'
+    doc.head.append(margins)
+    const images: HTMLImageElement[] = []
+    for (const template of doc.querySelectorAll<HTMLTemplateElement>('template[data-print-message]')) {
+      const mail = new DOMParser().parseFromString(template.content.textContent ?? '', 'text/html')
+      const shadow = template.parentElement!.attachShadow({ mode: 'open' })
+      shadow.append(doc.importNode(mail.documentElement, true))
+      template.remove()
+      images.push(...shadow.querySelectorAll('img'))
+    }
+    // Template images start loading only after attachment.
+    await new Promise<void>((resolve) => {
+      timers.push(window.setTimeout(resolve, 15000))
+      Promise.all(
+        images.map(
+          (img) =>
+            img.complete ||
+            new Promise((done) => {
+              img.addEventListener('load', done, { once: true })
+              img.addEventListener('error', done, { once: true })
+            }),
+        ),
+      ).then(() => resolve())
+    })
+    if (!root.isConnected) return
+    stopPreparing()
+    win.addEventListener('afterprint', cleanup, { once: true })
+    printPage(win)
+  }
+  const remoteDecisions = printRemoteDecisions(mails, allowRemote)
+  for (const [index, mail] of mails.entries()) {
     const section = document.createElement('section')
     root.append(section)
     const content = document.createElement('pre')
-    const html = mailPrintHtml(mail, allowRemote ?? printRemoteAllowed(mail))
+    const html = mailPrintHtml(mail, remoteDecisions[index])
     if (!html) {
       content.textContent = mailPrintText(mail)
       section.append(content)
@@ -333,6 +443,7 @@ async function printMails(
   const cleanup = () => {
     stopPreparing()
     if (changedTitle && document.title === printTitle) document.title = originalTitle
+    if (nativeScrollbars) document.documentElement.classList.add('native-scrollbars')
     root.remove()
     timers.forEach((timer) => window.clearTimeout(timer))
     window.removeEventListener('beforeprint', beforePrint)
@@ -346,12 +457,11 @@ async function printMails(
     await Promise.all(ready)
     if (!root.isConnected) return
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-    if ((window as any).go?.main?.App) {
-      const html = nativePrintHtml(root)
-      const native = html !== undefined && (await invoke<boolean>('mail.print', { html }))
-      if (native) cleanup()
-      else browserPrint()
-    } else browserPrint()
+    const html = nativePrintHtml(root)
+    if (html !== undefined && (window as any).go?.main?.App && (await invoke<boolean>('mail.print', { html })))
+      cleanup()
+    else if (html !== undefined) await pagedPrint(html)
+    else browserPrint()
   } catch {
     cleanup()
     showToast(t(errorKey), 'error')

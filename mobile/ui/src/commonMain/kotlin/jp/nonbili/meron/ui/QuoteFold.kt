@@ -1,8 +1,10 @@
 package jp.nonbili.meron.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -91,11 +93,13 @@ internal fun jsStringLiteral(value: String): String =
     }
 
 /** The "•••" chip between a plain body's reply and its quoted tail. */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun QuoteToggle(
     open: Boolean,
     color: Color,
     onToggle: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val label = if (open) tr("chat.hideQuotedText") else tr("chat.showQuotedText")
     val shape = RoundedCornerShape(50)
@@ -103,15 +107,20 @@ internal fun QuoteToggle(
         Modifier
             .padding(vertical = 6.dp)
             .clip(shape)
-            .border(1.dp, color.copy(alpha = 0.25f), shape)
-            .background(color.copy(alpha = 0.06f))
-            .clickable(onClickLabel = label, onClick = onToggle)
-            .semantics { contentDescription = label }
+            .border(1.dp, color.copy(alpha = if (open) 0.55f else 0.25f), shape)
+            .background(color.copy(alpha = if (open) 0.16f else 0.06f))
+            .then(
+                if (onLongClick == null) {
+                    Modifier.clickable(onClickLabel = label, onClick = onToggle)
+                } else {
+                    Modifier.combinedClickable(onClickLabel = label, onClick = onToggle, onLongClick = onLongClick)
+                },
+            ).semantics { contentDescription = label }
             .padding(horizontal = 10.dp, vertical = 2.dp),
     ) {
         Text(
             text = "•••",
-            color = color.copy(alpha = 0.65f),
+            color = color.copy(alpha = if (open) 0.95f else 0.65f),
             fontSize = 11.sp,
             lineHeight = 12.sp,
             fontWeight = FontWeight.Bold,

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { useEditor } from '@tiptap/react'
+import { Extension, useEditor } from '@tiptap/react'
+import { TextSelection } from '@tiptap/pm/state'
 import { StarterKit } from '@tiptap/starter-kit'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
@@ -10,14 +11,24 @@ import {
   sendComposed,
   appendSentMessage,
   saveComposedDraft,
+  draftIdOfFailedSave,
   updateComposeDraft,
   finishClosingMessageTab,
+  composedContent,
 } from '../../states/compose'
 import { compose$, newDraftMessageId } from '../../states/composeState'
 import { htmlToText } from '../../lib/html'
 import { invoke } from '../../lib/bridge'
+import { isExternalFileDrop } from '../../lib/useFileDrop'
+import {
+  readAttachment,
+  reportUnattachedFiles,
+  settleAttachment,
+  takeWithinAttachmentLimits,
+} from '../../lib/attachFiles'
 import { contextualErrorMessage } from '../../lib/errors'
 import { discardSavedDraftCopy } from '../../states/mailMoves'
+import { discardSentDraft } from '../../states/quickReply'
 import { pickFiles, pickImageFiles } from '../../lib/nativeFilePicker'
 import { getComposeSession, registerComposeSession } from '../../states/composeSessions'
 import { accounts$, isSendableAccount } from '../../states/accounts'
@@ -33,6 +44,27 @@ import {
   textToHtml,
   type NativeClipboardImage,
 } from './composerHelpers'
+
+// A quoted reply's `<blockquote type="cite">` (see replyQuote) keeps its type
+// through the editor, which would otherwise drop it: that attribute is what
+// tells the conversation view the blockquote is a quote to fold.
+const CiteBlockquote = Extension.create({
+  name: 'citeBlockquote',
+  addGlobalAttributes() {
+    return [
+      {
+        types: ['blockquote'],
+        attributes: {
+          type: {
+            default: null,
+            parseHTML: (element) => element.getAttribute('type'),
+            renderHTML: (attributes) => (attributes.type ? { type: attributes.type } : {}),
+          },
+        },
+      },
+    ]
+  },
+})
 
 // All of the Composer's behaviour: the tiptap editor, attachment handling
 // (paste/drop/file-picker, inline images), rich/plain toggling, autosave, and
@@ -76,39 +108,42 @@ export function useComposer(tabId: string) {
    * conversation has no such row — only the tab's conversation, which keeps its
    * card and needs its Draft badge cleared once the draft behind it is gone.
    */
-  const discardRemoteDraft = async (target: ComposeDraft, throwOnError = false) => {
+  const remoteDraftOf = (target: ComposeDraft) => {
     const remoteId = target.draftMessageId?.startsWith('local-draft-') ? undefined : target.draftMessageId
-    if (!remoteId && !target.sourceDraft) return
-    await discardSavedDraftCopy(
-      {
-        threadId: target.sourceDraft?.threadId ?? '',
-        messageId: target.sourceDraft?.messageId ?? '',
-        folderId: target.sourceDraft?.folderId ?? '',
-        accountId: target.accountId,
-        draftMessageId: remoteId,
-        replyThreadId: target.sourceDraft ? '' : (tab?.threadId ?? ''),
-      },
-      { throwOnError },
-    )
+    if (!remoteId && !target.sourceDraft) return null
+    return {
+      threadId: target.sourceDraft?.threadId ?? '',
+      messageId: target.sourceDraft?.messageId ?? '',
+      folderId: target.sourceDraft?.folderId ?? '',
+      accountId: target.accountId,
+      draftMessageId: remoteId,
+      replyThreadId: target.sourceDraft ? '' : (tab?.threadId ?? ''),
+    }
+  }
+  const discardRemoteDraft = async (target: ComposeDraft) => {
+    const remote = remoteDraftOf(target)
+    if (remote) await discardSavedDraftCopy(remote, { throwOnError: true })
   }
 
   /**
-   * Throw the draft away: stop saving, let the queue finish so nothing is left
-   * mid-allocation, close the tab, then delete the server copy. Closing on its own is
-   * not enough — a save still running would put the draft back seconds later,
-   * with nothing left on screen to explain where it came from.
+   * Throw the draft away: stop saving and close the tab at once, then let the
+   * queue finish before deleting the server copy — a save still running would
+   * otherwise put the draft back seconds later. The tab must not wait on that
+   * save: a slow Drafts server would leave the close button seemingly dead.
+   * A save that allocates a new id after the tab is gone discards its own copy
+   * (the tab's account no longer matches), so the snapshot's id is enough here.
    */
   const discardAndClose = async () => {
     setError('')
+    const drained = stopSaving()
+    const current = latestDraft()
+    finishClosingMessageTab(tabId)
     try {
-      await stopSaving()
-      const current = latestDraft()
-      finishClosingMessageTab(tabId)
-      if (current) await discardRemoteDraft(current, true)
+      await drained
+      if (current) await discardRemoteDraft(current)
     } catch (err) {
       const message = contextualErrorMessage(err, t('composer.status.couldNotDiscardDraft'))
       showToast(message, 'error')
-      finishClosingMessageTab(tabId)
     }
   }
   const [saveError, setSaveError] = useState('')
@@ -122,23 +157,25 @@ export function useComposer(tabId: string) {
   const focusBody = useRef((draft?.to ?? '').trim().length > 0).current
   // A seeded signature sits at the top of the body, above any quote, so landing
   // at the end would drop the cursor below it — and below the quote. Start puts
-  // it on the blank line the signature was inserted under.
-  const focusAt = useRef(draft?.signature?.html ? ('start' as const) : ('end' as const)).current
+  // it on the blank line the signature was inserted under. A quote seeded
+  // without a signature (a forward, a quoted reply) still sits below that line.
+  const aboveQuote = draft?.signature?.placement === 'aboveQuote'
+  const focusAt = useRef(draft?.signature?.html || aboveQuote ? ('start' as const) : ('end' as const)).current
 
   const editor = useEditor({
     extensions: [
       StarterKit.configure({ link: { openOnClick: false } }),
-      ResizableImage.configure({
-        allowBase64: true,
-        HTMLAttributes: {
-          class: 'my-2 max-w-full rounded-lg',
-        },
-      }),
+      // No HTMLAttributes: the node view does the styling on screen, and class
+      // names would only go out in the mail, meaning nothing to its recipient.
+      ResizableImage.configure({ allowBase64: true }),
+      CiteBlockquote,
     ],
     content: initialHtml,
     editorProps: {
       attributes: {
-        class: 'tiptap-body focus:outline-none min-h-[240px] text-[0.875rem] leading-relaxed',
+        // Scales with the message text size, like the messages being answered.
+        class:
+          'tiptap-body focus:outline-none min-h-[240px] text-[calc(0.875rem*var(--me-message-scale))] leading-relaxed',
         spellcheck: String(spellCheck),
       },
       handlePaste: (_view, event) => {
@@ -154,16 +191,25 @@ export function useComposer(tabId: string) {
         addFiles(imageFiles, { inline: true })
         return true
       },
-      handleDrop: (_view, event, _slice, moved) => {
-        if (!moved && event.dataTransfer) {
-          const imageFiles = extractClipboardImages(event.dataTransfer)
-          if (imageFiles.length > 0) {
-            event.preventDefault()
-            addFiles(imageFiles, { inline: true })
-            return true
-          }
+      handleDrop: (view, event, _slice, moved) => {
+        if (moved || !event.dataTransfer) return false
+        // Files from outside. On Linux they arrive as their file:// addresses
+        // only, and Composer gets the files themselves (useFileDrop).
+        const hasFiles = (event.dataTransfer.files?.length ?? 0) > 0
+        if (!hasFiles && !isExternalFileDrop(event.dataTransfer)) return false
+        // Nothing of the drop goes into the body as text. Images go in where
+        // they were dropped: the caret is put there for them, here or when
+        // Composer has them. Other files Composer attaches.
+        event.preventDefault()
+        const imageFiles = extractClipboardImages(event.dataTransfer)
+        // Only for images, or files not known yet (Linux): a file that is just
+        // attached leaves the selection where it was.
+        if (imageFiles.length > 0 || !hasFiles) {
+          const at = view.posAtCoords({ left: event.clientX, top: event.clientY })
+          if (at) view.dispatch(view.state.tr.setSelection(TextSelection.near(view.state.doc.resolve(at.pos))))
         }
-        return false
+        if (imageFiles.length > 0) addFiles(imageFiles, { inline: true, afterSelection: true })
+        return true
       },
     },
     autofocus: focusBody ? focusAt : false,
@@ -186,7 +232,10 @@ export function useComposer(tabId: string) {
     const el = textRef.current
     if (!el || !focusBody) return
     const signature = draft?.signature?.text
-    if (!signature) return
+    if (!signature) {
+      if (aboveQuote) el.setSelectionRange(0, 0)
+      return
+    }
     const at = el.value.indexOf(signature)
     if (at < 0) return
     const caret = el.value.slice(0, at).replace(/\s+$/, '').length
@@ -276,7 +325,7 @@ export function useComposer(tabId: string) {
       setSaveStatus('saving')
       setSaveError('')
       try {
-        let content = current.rich ? current.html : current.text
+        let content = composedContent(current)
         let attachments = current.attachments
         if (current.rich) {
           const prepared = await prepareInlineImages(content, attachments)
@@ -299,12 +348,18 @@ export function useComposer(tabId: string) {
           draftMessageId,
           attachments,
         })
+        // A tab closed mid-save lands here too (no latest draft): nothing will
+        // adopt the id, so a freshly allocated copy has to go now.
         const latest = compose$.tabs.peek().find((t) => t.id === tabId)?.compose
         if (latest?.accountId !== current.accountId) {
           if (savedDraftId !== draftMessageId) {
             await discardSavedDraftCopy(
               { threadId: '', messageId: '', folderId: '', accountId: current.accountId, draftMessageId: savedDraftId },
-              { failureMessage: "Couldn't clean up the previous account's draft" },
+              {
+                failureMessage: latest
+                  ? t('composer.status.couldNotCleanUpPreviousAccountDraft')
+                  : t('composer.status.couldNotDiscardDraft'),
+              },
             )
           }
           if (isCurrent()) {
@@ -320,6 +375,25 @@ export function useComposer(tabId: string) {
         setSaveError('')
       } catch (err) {
         console.error('Autosave draft failed:', err)
+        // Keep the id the failed save was writing under, as a successful one
+        // would, so a copy that landed anyway is replaced or discarded later.
+        const attemptedId = draftIdOfFailedSave(err)
+        const latest = latestDraft()
+        if (
+          attemptedId &&
+          latest?.accountId === current.accountId &&
+          latest.draftMessageId === current.draftMessageId &&
+          attemptedId !== current.draftMessageId
+        ) {
+          updateComposeDraft(tabId, { draftMessageId: attemptedId })
+        } else if (!latest && attemptedId && attemptedId !== current.draftMessageId) {
+          // The tab closed mid-save, so nothing will adopt the id; a copy that
+          // landed anyway has to go now, as on the success path.
+          await discardSavedDraftCopy(
+            { threadId: '', messageId: '', folderId: '', accountId: current.accountId, draftMessageId: attemptedId },
+            { failureMessage: t('composer.status.couldNotDiscardDraft') },
+          )
+        }
         if (!isCurrent()) return
         setSaveStatus('error')
         setSaveError(contextualErrorMessage(err, t('composer.status.draftAutosaveFailed')))
@@ -352,6 +426,7 @@ export function useComposer(tabId: string) {
     draft?.rich,
     draft?.text,
     draft?.html,
+    draft?.quote,
     draft?.attachments,
     sending,
     editor,
@@ -381,39 +456,81 @@ export function useComposer(tabId: string) {
     }
   }
 
-  const addFiles = (files: ArrayLike<File>, options: { inline?: boolean } = {}) => {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      const reader = new FileReader()
-      reader.onload = () => {
-        const dataUrl = reader.result as string
-        const base64Data = dataUrl.split(',')[1]
-        const ext = file.type.startsWith('image/') ? file.type.slice(6) : ''
-        const filename = file.name || (ext ? `pasted-image-${Date.now()}.${ext}` : `pasted-${Date.now()}`)
-        const shouldInline = !!options.inline && file.type.toLowerCase().startsWith('image/') && !!editor
-        const next: ComposerAttachment = {
-          id: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-          filename,
-          mime: file.type || 'application/octet-stream',
-          size: file.size,
-          data: base64Data,
-          inlineId: shouldInline ? createInlineId() : undefined,
-        }
-        update({
-          attachments: [...(compose$.tabs.get().find((t) => t.id === tabId)?.compose?.attachments ?? []), next],
-        })
-        if (shouldInline) {
-          invoke<string>('composer.writeMediaFile', { data: base64Data, filename })
-            .then((url) => {
-              editor!.chain().focus().setImage({ src: url, alt: filename }).run()
-            })
-            .catch((err) => {
-              console.error('Failed to write media file:', err)
-              editor!.chain().focus().setImage({ src: dataUrl, alt: filename }).run()
-            })
-        }
+  // A folded quote is unfolded into the end of the body, where the user can trim
+  // it like any other text; from then on it is part of the body.
+  const expandQuote = () => {
+    const quote = draft?.quote
+    if (!quote) return
+    if (draft.rich && editor) {
+      editor.chain().insertContentAt(editor.state.doc.content.size, `<p></p>${quote.html}`).run()
+      update({ html: editor.getHTML(), quote: undefined })
+    } else {
+      update({ text: composedContent(draft), quote: undefined })
+    }
+  }
+
+  const removeQuote = () => update({ quote: undefined })
+
+  // Inline images replace the selection; with `afterSelection` (a drop) they go
+  // in after it, so a dropped image never replaces one that is still selected
+  // from the last insertion. The selection is read when each image is ready:
+  // the body may have been edited while its file was written.
+  const addFiles = (files: ArrayLike<File>, options: { inline?: boolean; afterSelection?: boolean } = {}) => {
+    const attachmentsNow = () => compose$.tabs.get().find((t) => t.id === tabId)?.compose?.attachments ?? []
+    const insertImage = (src: string, alt: string, attachmentId: string) => {
+      try {
+        const chain = editor!.chain().focus()
+        const placed = options.afterSelection
+          ? chain.insertContentAt(editor!.state.selection.to, { type: ResizableImage.name, attrs: { src, alt } }).run()
+          : chain.setImage({ src, alt }).run()
+        if (placed) return
+      } catch (err) {
+        console.error('Failed to insert inline image:', err)
       }
-      reader.readAsDataURL(file)
+      // Not in the body: keep it as an ordinary attachment, not an inline part
+      // nothing refers to.
+      update({
+        attachments: attachmentsNow().map((a) => (a.id === attachmentId ? { ...a, inlineId: undefined } : a)),
+      })
+    }
+    const taken = takeWithinAttachmentLimits(
+      tabId,
+      Array.from(files),
+      attachmentsNow().reduce((bytes, attachment) => bytes + attachment.size, 0),
+    )
+    if (taken.length < files.length) reportUnattachedFiles()
+    // Every file is read and attached as soon as it can be; only placing the
+    // inline images waits its turn, so they keep the order they came in.
+    let placing: Promise<void> = Promise.resolve()
+    for (const file of taken) {
+      const ready = readAttachment(file).then(async ({ attachment, dataUrl }) => {
+        const shouldInline = !!options.inline && file.type.toLowerCase().startsWith('image/') && !!editor
+        const next: ComposerAttachment = { ...attachment, inlineId: shouldInline ? createInlineId() : undefined }
+        update({ attachments: [...attachmentsNow(), next] })
+        settleAttachment(tabId, file)
+        if (!shouldInline) return null
+        const src = await invoke<string>('composer.writeMediaFile', {
+          data: next.data,
+          filename: next.filename,
+        }).catch((err) => {
+          console.error('Failed to write media file:', err)
+          return dataUrl
+        })
+        return { src, next }
+      })
+      // Reported when its turn comes below; until then a failure is not one
+      // nobody handles. A file that never attached is settled here.
+      ready.catch(() => settleAttachment(tabId, file))
+      placing = placing
+        .then(() => ready)
+        .then((image) => {
+          if (image) insertImage(image.src, image.next.filename, image.next.id)
+        })
+        .catch((err) => {
+          // A folder, or a file that can't be read.
+          console.error('Failed to attach file:', err)
+          reportUnattachedFiles()
+        })
     }
   }
 
@@ -579,7 +696,7 @@ export function useComposer(tabId: string) {
     }
     subject = current.subject.trim()
     try {
-      let content = current.rich ? current.html : current.text
+      let content = composedContent(current)
       let attachments = current.attachments
       if (current.rich) {
         const prepared = await prepareInlineImages(content, attachments)
@@ -617,7 +734,12 @@ export function useComposer(tabId: string) {
           attachments,
         })
       }
-      await discardRemoteDraft(current)
+      // The message is out, so the tab closes now rather than after the draft
+      // cleanup: a slow Drafts server must not hold a delivered message on
+      // "Sending". discardSentDraft takes the copy over before the tab lets go
+      // of it, keeping it hidden — and out of the quick reply — until it's gone.
+      const remote = remoteDraftOf(current)
+      if (remote) void discardSentDraft(remote)
       showToast(t('chat.messageSent'))
       finishClosingMessageTab(tabId)
     } catch (err) {
@@ -642,6 +764,8 @@ export function useComposer(tabId: string) {
     canSend,
     update,
     toggleRich,
+    expandQuote,
+    removeQuote,
     addFiles,
     pickAttachmentFiles,
     pickInlineImages,

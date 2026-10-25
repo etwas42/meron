@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Folder, Message } from '../types'
 import { accounts$ } from './accounts'
+import { compose$ } from './composeState'
 import { kanban$ } from './kanban'
 import {
   loadMoreThreads,
@@ -326,6 +327,7 @@ describe('thread message refresh reconciliation', () => {
 
 describe('thread list paging', () => {
   beforeEach(() => {
+    kanban$.activeBoardId.set('')
     mail$.threads.set([thread({ subject: 'Old first page' })])
     mail$.threadsCursor.set('old-cursor')
     mail$.threadsLoadingMore.set(false)
@@ -465,6 +467,33 @@ describe('thread selection on load', () => {
     await loadThreads()
 
     expect(ui$.selectedThread.get()).toBe('')
+  })
+
+  it("keeps an active thread tab's selection the new view does not contain", async () => {
+    // Leaving a kanban board restores the mail view's folder; a tab opened from
+    // a card in another folder still owns the pane and must keep rendering.
+    compose$.tabs.set([
+      {
+        id: 'thread-tab',
+        kind: 'thread',
+        messageId: '',
+        threadId: 'acc:other:thread:9',
+        subject: 'Tab',
+        from: 'sender@example.com',
+        body: '',
+        viewMode: 'plain',
+      },
+    ])
+    compose$.activeTab.set('thread-tab')
+    ui$.selectedThread.set('acc:other:thread:9')
+
+    try {
+      await loadThreads()
+      expect(ui$.selectedThread.get()).toBe('acc:other:thread:9')
+    } finally {
+      compose$.tabs.set([])
+      compose$.activeTab.set('')
+    }
   })
 
   it('keeps a selection whose conversation is still loading', async () => {
@@ -824,7 +853,7 @@ describe('deleteThread', () => {
     await deleteThread('acc:inbox:thread:1')
 
     const threadListCall = calls.find((call) => call.command === 'mail.threadList')
-    expect(threadListCall?.payload).toMatchObject({ refresh: true })
+    expect(threadListCall?.payload).toMatchObject({ refresh: false })
     expect(mail$.threads.get()).toHaveLength(1)
     expect(ui$.toastTone.get()).toBe('error')
     expect(ui$.toast.get()).toBe('Delete failed: thread is still in this folder')
@@ -837,7 +866,7 @@ describe('deleteThread', () => {
     await deleteThread('acc:inbox:thread:1')
 
     const threadListCall = calls.find((call) => call.command === 'mail.threadList')
-    expect(threadListCall?.payload).toMatchObject({ refresh: true })
+    expect(threadListCall?.payload).toMatchObject({ refresh: false })
     expect(mail$.threads.get()).toHaveLength(0)
     expect(ui$.toastTone.get()).toBe('success')
     expect(ui$.toast.get()).toBe('Thread moved to Trash')
@@ -1134,7 +1163,7 @@ describe('moveThreadToFolder undo', () => {
     calls.length = 0
     responses = {
       'mail.move': [
-        { ok: true, moved: 1 },
+        { ok: true, moved: 1, target_uids: [5] },
         { ok: true, moved: 1 },
       ],
       'mail.threadList': [{ threads: [] }, { threads: [thread({ thread_id: 'acc#inbox#t.MQ' })] }],
@@ -1176,6 +1205,7 @@ describe('moveThreadToFolder undo', () => {
     expect(calls.filter((call) => call.command === 'mail.move')[1]?.payload).toMatchObject({
       thread_id: 'acc#Work#t.MQ',
       target_folder_id: 'inbox',
+      message_ids: ['5'],
     })
     expect(ui$.toast.get()).toBe('Thread moved')
     expect(ui$.toastUndo.peek()).toBeNull()
@@ -1243,7 +1273,7 @@ describe('deleteThread trash undo', () => {
   beforeEach(() => {
     calls.length = 0
     responses = {
-      'mail.delete': [{ ok: true, deleted: 1, trash: 'Trash', thread_id: 'acc#Trash#t.MQ' }],
+      'mail.delete': [{ ok: true, deleted: 1, trash: 'Trash', thread_id: 'acc#Trash#t.MQ', target_uids: [42] }],
       'mail.move': [{ ok: true, moved: 1 }],
       'mail.threadList': [{ threads: [] }, { threads: [thread({ thread_id: 'acc#inbox#t.MQ' })] }],
     }
@@ -1290,6 +1320,7 @@ describe('deleteThread trash undo', () => {
     expect(calls.find((call) => call.command === 'mail.move')?.payload).toMatchObject({
       thread_id: 'acc#Trash#t.MQ',
       target_folder_id: 'inbox',
+      message_ids: ['42'],
     })
     expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['acc#inbox#t.MQ'])
     expect(ui$.toast.get()).toBe('Thread moved')
@@ -1326,7 +1357,7 @@ describe('archiveThread undo', () => {
   beforeEach(() => {
     calls.length = 0
     responses = {
-      'mail.archive': [{ ok: true, moved: 1, folder: 'Archive', thread_id: 'acc#Archive#t.MQ' }],
+      'mail.archive': [{ ok: true, moved: 1, folder: 'Archive', thread_id: 'acc#Archive#t.MQ', target_uids: [9] }],
       'mail.threadList': [{ threads: [] }, { threads: [thread({ thread_id: 'acc#inbox#t.MQ' })] }],
       'mail.move': [{ ok: true, moved: 1 }],
     }
@@ -1374,6 +1405,7 @@ describe('archiveThread undo', () => {
     expect(calls.find((call) => call.command === 'mail.move')?.payload).toMatchObject({
       thread_id: 'acc#Archive#t.MQ',
       target_folder_id: 'inbox',
+      message_ids: ['9'],
     })
     expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['acc#inbox#t.MQ'])
     expect(ui$.toastTone.get()).toBe('success')
@@ -1453,7 +1485,7 @@ describe('bulk thread actions', () => {
     expect(ui$.toast.get()).toBe('Marked unread')
   })
 
-  it('rolls back all local removals when a bulk archive fails', async () => {
+  it('keeps completed bulk archives removed and rolls back the failed thread', async () => {
     const second = thread({ id: 'm2', thread_id: 'acc#inbox#t.NQ' })
     mail$.threads.set([thread({ thread_id: 'acc#inbox#t.MQ' }), second])
     responses['mail.archive'] = [
@@ -1464,9 +1496,11 @@ describe('bulk thread actions', () => {
 
     await bulkArchiveSelected(mail$.threads.get().map((item) => bulkItem(item)))
 
-    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['acc#inbox#t.MQ', 'acc#inbox#t.NQ'])
+    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['acc#inbox#t.NQ'])
     expect(ui$.toastTone.get()).toBe('error')
-    expect(ui$.toast.get()).toBe('Archive failed: no matching messages found')
+    expect(ui$.toast.get()).toBe(
+      'Archive failed: no matching messages found Completed 1 of 2 selected threads before the failure. Check the destination before retrying.',
+    )
   })
 
   it('uses one confirmation for permanent bulk delete', async () => {
@@ -1925,7 +1959,9 @@ describe('thread list view identity', () => {
 
     await loadThreads(false)
 
-    expect(calls).toEqual([{ command: 'mail.starredItems', payload: { query: '', filter: 'all', limit: 75 } }])
+    expect(calls).toEqual([
+      { command: 'mail.starredItems', payload: { query: '', filter: 'all', attachments: false, limit: 75 } },
+    ])
     expect(mail$.threads.get()).toEqual(rows.slice(1))
     expect(mail$.threadsCursor.get()).toBe('new-cursor')
   })

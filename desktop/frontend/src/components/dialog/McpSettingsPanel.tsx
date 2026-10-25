@@ -5,6 +5,7 @@ import { accounts$ } from '../../states/accounts'
 import { confirmAction, showToast } from '../../states/ui'
 import { invoke } from '../../lib/bridge'
 import { useTranslation } from '../../lib/i18n'
+import { copyText } from '../../lib/native'
 import { Button } from '../button/Button'
 import { TextInput } from '../field/Field'
 import { NumberRow, SegmentedRow, SettingRow, SettingsGroup, ToggleRow } from './AccountSettingsRows'
@@ -126,8 +127,7 @@ export function McpSettingsPanel() {
   }
 
   const copy = (value: string) => {
-    navigator.clipboard
-      ?.writeText(value)
+    copyText(value)
       .then(() => showToast(t('common.copied')))
       .catch(() => undefined)
   }

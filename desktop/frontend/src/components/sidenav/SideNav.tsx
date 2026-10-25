@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { DragEvent } from 'react'
-import { Mail, MoreHorizontal, EyeOff, SquarePen } from 'lucide-react'
+import { CalendarDays, Mail, SquareCheckBig, MoreHorizontal, EyeOff, SquarePen } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { formatShortcut, isMac, RAIL_SHORTCUT_IDS } from '../../lib/shortcuts'
@@ -15,20 +15,31 @@ import { kanban$, openMailAccount, reorderKanbanBoards, selectKanbanBoard } from
 import { mail$ } from '../../states/mail'
 import { inboxUnread } from '../../states/mailFolders'
 import { settings$, setUnifiedInboxSideNavVisible } from '../../states/settings'
+import { toggleCalendar } from '../../states/calendar'
+import { toggleTasksPanel } from '../../states/tasks'
 import { ui$ } from '../../states/ui'
 import { QuickSettingsMenu } from './QuickSettingsMenu'
-import { SortableBoard, SortableAccount } from './SortableRailItems'
+import { SortableBoard, SortableAccount, railIndicator, railTileShape } from './SortableRailItems'
 import { UnreadCountBadge } from './UnreadCountBadge'
 import { RailContextMenu, RailMenuItem } from './RailContextMenu'
 import { AccountContextMenu } from './AccountContextMenu'
 import { BoardContextMenu } from './BoardContextMenu'
 import { BoardDialog, type BoardDialogState } from './BoardDialog'
+import { useTitleBar } from '../titlebar/TitleBar'
 import type { Account } from '../../types'
+
+// Every rail divider sits 9px from its neighbours, except the compose button's,
+// which lines up with the 48px header borders and so sits 6px under the button.
+const railDivider = 'h-px w-8 shrink-0 bg-sidenav-ink/10'
 
 export function SideNav() {
   const { t } = useTranslation()
   const accounts = useValue(accounts$)
   useValue(settings$.shortcutOverrides)
+  const tasksEnabled = useValue(settings$.tasksEnabled)
+  const tasksPanelOpen = useValue(ui$.tasksPanelOpen)
+  const calendarEnabled = useValue(settings$.calendarEnabled)
+  const calendarOpen = useValue(ui$.calendarOpen)
   const boards = useValue(settings$.kanbanBoards)
   const hiddenSideNavAccounts = useValue(settings$.hiddenSideNavAccounts)
   const showUnifiedInbox = useValue(settings$.showUnifiedInboxInSideNav)
@@ -37,6 +48,9 @@ export function SideNav() {
   const activeBoardId = useValue(kanban$.activeBoardId)
   const selectedAccount = useValue(ui$.selectedAccount)
   const hasSendableAccount = accounts.some(isSendableAccount)
+  // Tasks and the more menu live in Meron's own title bar when there is one.
+  const titleBar = useTitleBar()
+  const utilities = !titleBar
   // Right-click context menu anchored at the cursor for one account.
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null)
   const menuAccount = menu ? accounts.find((acc) => acc.id === menu.id) : null
@@ -49,7 +63,7 @@ export function SideNav() {
 
   // Starred is a folder of the unified view, reachable from the column's folder
   // switcher, so the rail button covers it too.
-  const isUnifiedActive = !activeBoardId && selectedAccount === 'unified'
+  const isUnifiedActive = !calendarOpen && !activeBoardId && selectedAccount === 'unified'
   const unifiedUnread = showUnreadBadge
     ? accounts.reduce(
         (sum, account) =>
@@ -136,7 +150,7 @@ export function SideNav() {
 
   return (
     <aside
-      className="flex w-[60px] shrink-0 flex-col items-center gap-4 border-r border-border bg-sidenav px-0 py-4 max-[768px]:hidden select-none"
+      className={`flex w-[3.75rem] shrink-0 flex-col items-center bg-sidenav px-0 pb-4 max-[768px]:hidden select-none ${titleBar ? 'pt-[calc(5px+var(--me-frame-border-width))]' : 'pt-[10px]'}`}
       onContextMenu={(event) => {
         if (event.defaultPrevented) return
         event.preventDefault()
@@ -146,31 +160,33 @@ export function SideNav() {
       {hasSendableAccount && (
         <>
           <button
-            className="relative isolate flex h-11 w-11 shrink-0 transform-gpu items-center justify-center overflow-hidden rounded-2xl bg-accent text-white hover:bg-accent-hover cursor-pointer"
+            // An action, not a destination: it stays round where the rail's
+            // tiles square up, and lifts on hover instead.
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-accent-label transition-[background-color,color,box-shadow] duration-200 ease-out hover:bg-accent-hover hover:text-accent-hover-label hover:shadow-md cursor-pointer"
             onClick={() => openComposeTab()}
             title={`${t('composer.actions.newMessage')} (${formatShortcut('compose.new').join(isMac ? '' : '+')})`}
             aria-label={t('composer.actions.newMessage')}
           >
-            <SquarePen size={19} />
+            <SquarePen size={18} />
           </button>
-          <div className="h-px w-8 shrink-0 bg-white/10" />
+          {/* 5 + 36 + 6 aligns with the 48px header's bottom border, plus the
+            content frame's border where the theme draws one, and 4px more
+            under the system title bar, where the frame stands clear of the
+            top edge and always has its border. */}
+          <div className={`mt-[6px] ${railDivider}`} />
         </>
       )}
-      <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-4 overflow-y-auto no-scrollbar pt-1.5">
+      <div className="flex min-h-0 w-full flex-1 flex-col items-center overflow-y-auto no-scrollbar py-[9px]">
         {/* Unified Inbox Home Button */}
         {showUnifiedInbox && (
           <div className="relative w-full flex justify-center group">
-            <div
-              className={`absolute left-0 top-1/2 -translate-y-1/2 w-1 rounded-r bg-accent transition-all duration-200 ${
-                isUnifiedActive ? 'h-7' : 'h-0 group-hover:h-3'
-              }`}
-            />
+            {railIndicator(isUnifiedActive)}
             <div className="relative">
               <button
-                className={`flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 cursor-pointer ${
+                className={`flex h-10 w-10 items-center justify-center cursor-pointer ${railTileShape(isUnifiedActive)} ${
                   isUnifiedActive
-                    ? 'bg-accent text-white'
-                    : 'bg-white/10 text-white/60 hover:bg-white/20 hover:text-white hover:scale-105'
+                    ? 'bg-accent text-accent-label'
+                    : 'bg-sidenav-ink/10 text-sidenav-ink/60 group-hover:bg-sidenav-ink/20 group-hover:text-sidenav-ink'
                 }`}
                 onClick={() => selectAccount('unified')}
                 onContextMenu={(event) => {
@@ -187,11 +203,11 @@ export function SideNav() {
           </div>
         )}
 
-        {showUnifiedInbox && (hasBoards || hasAccounts) && <div className="h-px w-8 shrink-0 bg-white/10" />}
+        {showUnifiedInbox && (hasBoards || hasAccounts) && <div className={`my-[9px] ${railDivider}`} />}
 
         {/* Kanban Boards */}
         {hasBoards && (
-          <div className="flex flex-col gap-3 w-full items-center py-1">
+          <div className="flex flex-col gap-3 w-full items-center">
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
@@ -204,7 +220,7 @@ export function SideNav() {
                     key={board.id}
                     board={board}
                     shortcut={railShortcut(Number(showUnifiedInbox) + index)}
-                    active={board.id === activeBoardId}
+                    active={!calendarOpen && board.id === activeBoardId}
                     onSelect={() => selectKanbanBoard(board.id)}
                     onContextMenu={(e) => {
                       e.preventDefault()
@@ -218,11 +234,11 @@ export function SideNav() {
           </div>
         )}
 
-        {hasBoards && hasAccounts && <div className="h-px w-8 shrink-0 bg-white/10" />}
+        {hasBoards && hasAccounts && <div className={`my-[9px] ${railDivider}`} />}
 
         {/* Accounts List */}
         {hasAccounts && (
-          <div className="flex flex-col gap-3 w-full items-center py-1">
+          <div className="flex flex-col gap-3 w-full items-center">
             <DndContext
               sensors={sensors}
               collisionDetection={closestCenter}
@@ -235,7 +251,7 @@ export function SideNav() {
                     key={account.id}
                     account={account}
                     shortcut={railShortcut(Number(showUnifiedInbox) + boards.length + index)}
-                    active={!activeBoardId && account.id === selectedAccount}
+                    active={!calendarOpen && !activeBoardId && account.id === selectedAccount}
                     onSelect={() => selectAccount(account.id)}
                     onContextMenu={(e) => {
                       e.preventDefault()
@@ -252,23 +268,55 @@ export function SideNav() {
         )}
       </div>
 
-      {(showUnifiedInbox || hasBoards || hasAccounts) && <div className="h-px w-8 shrink-0 bg-white/10" />}
+      {utilities && (showUnifiedInbox || hasBoards || hasAccounts) && <div className={`mb-[9px] ${railDivider}`} />}
 
       {/* Utilities */}
-      <div className="flex flex-col gap-3 items-center">
-        <button
-          className={`flex h-10 w-10 items-center justify-center rounded-xl transition-all duration-150 cursor-pointer ${
-            moreMenu ? 'bg-white/20 text-white' : 'bg-white/10 text-white/60 hover:bg-white/20 hover:text-white'
-          }`}
-          onClick={(e) => {
-            const rect = e.currentTarget.getBoundingClientRect()
-            setMoreMenu({ x: rect.right + 8, y: rect.top })
-          }}
-          title={t('common.more')}
-        >
-          <MoreHorizontal size={18} />
-        </button>
-      </div>
+      {utilities && (
+        <div className="flex flex-col gap-3 items-center">
+          {calendarEnabled && (
+            <button
+              type="button"
+              className={`flex h-10 w-10 items-center justify-center rounded-xl transition-colors cursor-pointer ${
+                calendarOpen
+                  ? 'bg-sidenav-ink/20 text-sidenav-ink'
+                  : 'bg-sidenav-ink/10 text-sidenav-ink/60 hover:bg-sidenav-ink/20 hover:text-sidenav-ink'
+              }`}
+              onClick={toggleCalendar}
+              title={t('calendar.title')}
+              aria-label={t('calendar.title')}
+              aria-pressed={calendarOpen}
+            >
+              <CalendarDays size={18} />
+            </button>
+          )}
+          {tasksEnabled && (
+            <button
+              type="button"
+              className="flex h-10 w-10 items-center justify-center rounded-xl bg-sidenav-ink/10 text-sidenav-ink/60 transition-colors hover:bg-sidenav-ink/20 hover:text-sidenav-ink cursor-pointer max-[900px]:hidden"
+              onClick={toggleTasksPanel}
+              title={t('tasks.title')}
+              aria-label={t('tasks.title')}
+              aria-pressed={tasksPanelOpen}
+            >
+              <SquareCheckBig size={18} />
+            </button>
+          )}
+          <button
+            className={`flex h-10 w-10 items-center justify-center rounded-xl transition-all duration-150 cursor-pointer ${
+              moreMenu
+                ? 'bg-sidenav-ink/20 text-sidenav-ink'
+                : 'bg-sidenav-ink/10 text-sidenav-ink/60 hover:bg-sidenav-ink/20 hover:text-sidenav-ink'
+            }`}
+            onClick={(e) => {
+              const rect = e.currentTarget.getBoundingClientRect()
+              setMoreMenu({ x: rect.right + 8, y: rect.top })
+            }}
+            title={t('common.more')}
+          >
+            <MoreHorizontal size={18} />
+          </button>
+        </div>
+      )}
 
       {/* Bottom "more" menu: view switcher + theme settings */}
       {moreMenu && (

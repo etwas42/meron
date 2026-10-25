@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
 import { accounts$ } from '../../states/accounts'
 import { settings$ } from '../../states/settings'
 import { closeMessageTab, openComposeTab, updateComposeDraft } from '../../states/compose'
@@ -33,6 +33,7 @@ describe('Composer', () => {
   // the first is still in flight.
   let holdAllocation: (() => void) | null = null
   let discardFailure = false
+  let saveFailure = false
   let pendingDiscard: Promise<void> | null = null
 
   beforeEach(() => {
@@ -40,6 +41,7 @@ describe('Composer', () => {
     allocations = 0
     holdAllocation = null
     discardFailure = false
+    saveFailure = false
     pendingDiscard = null
     compose$.tabs.set([])
     compose$.activeTab.set('')
@@ -61,6 +63,7 @@ describe('Composer', () => {
               }
               return { message_id: id }
             }
+            if (command === 'mail.saveDraft' && saveFailure) throw new Error('server refused save')
             if (command === 'mail.discardDraft') {
               await pendingDiscard
               if (discardFailure) throw new Error('server refused discard')
@@ -77,6 +80,21 @@ describe('Composer', () => {
   const draftOf = (tabId: string) => compose$.tabs.peek().find((tab) => tab.id === tabId)?.compose
   const bodyHtml = () => document.querySelector('.tiptap-body')?.innerHTML ?? ''
   const savedDraftIds = () => calls.filter((c) => c.command === 'mail.saveDraft').map((c) => c.payload.draft_id)
+
+  it('scales the plain-text body with the message text size', () => {
+    const tabId = openComposeTab({ to: 'x@example.com', subject: 'Hello', text: 'hi', rich: false })!
+    const view = render(<Composer tabId={tabId} />)
+
+    const body = view.container.querySelector('textarea')
+    expect(body?.className).toContain('var(--me-message-scale)')
+  })
+
+  it('scales the rich-text body with the message text size', () => {
+    const tabId = openComposeTab({ to: 'x@example.com', subject: 'Hello', rich: true })!
+    render(<Composer tabId={tabId} />)
+
+    expect(document.querySelector('.tiptap-body')?.className).toContain('var(--me-message-scale)')
+  })
 
   it('allocates one server draft when autosaves overlap', async () => {
     const tabId = openComposeTab({ to: 'x@example.com', subject: 'Hello', text: 'hi' })!
@@ -265,7 +283,7 @@ describe('Composer', () => {
     })
     await act(async () => {
       view.getByTitle('Close tab').click()
-      expect(draftOf(tabId)).toBeDefined()
+      expect(draftOf(tabId)).toBeUndefined()
       holdAllocation?.()
       holdAllocation = null
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -274,6 +292,32 @@ describe('Composer', () => {
     const order = calls.map((call) => call.command)
     expect(order.lastIndexOf('mail.discardDraft')).toBeGreaterThan(order.lastIndexOf('mail.saveDraft'))
     expect(draftOf(tabId)).toBeUndefined()
+  })
+
+  it('discards the copy a failed save may have written after the tab closed', async () => {
+    const tabId = openComposeTab({ to: 'x@example.com', subject: 'Hello', text: 'hi' })!
+    const view = render(
+      <>
+        <ConversationTabs />
+        <Composer tabId={tabId} />
+      </>,
+    )
+
+    holdAllocation = () => {}
+    saveFailure = true
+    await act(async () => {
+      updateComposeDraft(tabId, { fromEmail: 'a@example.com' })
+    })
+    await act(async () => {
+      view.getByTitle('Close tab').click()
+      holdAllocation?.()
+      holdAllocation = null
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    })
+
+    expect(draftOf(tabId)).toBeUndefined()
+    const discarded = calls.filter((call) => call.command === 'mail.discardDraft')
+    expect(discarded.map((call) => call.payload.draft_id)).toContain('allocated-1@example.com')
   })
 
   it('deduplicates simultaneous footer and external close requests', async () => {
@@ -501,5 +545,45 @@ describe('Composer', () => {
 
     expect(bodyHtml()).toContain('Hello there')
     expect(bodyHtml()).toContain('From B')
+  })
+
+  it('starts the caret above a quote seeded without a signature', () => {
+    accounts$.set([{ ...account('a', ''), signature: { mode: 'none', html: '' } }])
+    const tabId = openComposeTab({
+      to: 'them@example.com',
+      rich: false,
+      text: '\n\n---------- Forwarded message ---------\nLunch?',
+      signaturePlacement: 'aboveQuote',
+    })!
+    const view = render(<Composer tabId={tabId} />)
+
+    const body = view.container.querySelector('textarea') as HTMLTextAreaElement
+    expect(body.selectionStart).toBe(0)
+  })
+
+  it('unfolds a folded quote into the body, or drops it', async () => {
+    accounts$.set([{ ...account('a', ''), signature: { mode: 'none', html: '' } }])
+    const quote = { rich: false, html: '<p>On Mon, Them wrote:</p>', text: 'On Mon, Them wrote:\n> Lunch?' }
+    const tabId = openComposeTab({ to: 'them@example.com', rich: false, text: 'Sounds good', quote })!
+    const view = render(<Composer tabId={tabId} />)
+
+    await act(async () => {
+      view.getByTitle('Show quoted text').click()
+    })
+    expect(draftOf(tabId)?.text).toBe('Sounds good\n\nOn Mon, Them wrote:\n> Lunch?')
+    expect(draftOf(tabId)?.quote).toBeUndefined()
+    expect(view.queryByTitle('Show quoted text')).toBeNull()
+
+    const other = openComposeTab({ to: 'them@example.com', rich: false, text: 'Sounds good', quote })!
+    cleanup()
+    const second = render(<Composer tabId={other} />)
+    await act(async () => {
+      fireEvent.contextMenu(second.getByTitle('Show quoted text'))
+    })
+    await act(async () => {
+      second.getByText('Remove quoted text').click()
+    })
+    expect(draftOf(other)?.text).toBe('Sounds good')
+    expect(draftOf(other)?.quote).toBeUndefined()
   })
 })

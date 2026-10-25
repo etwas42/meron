@@ -4,7 +4,7 @@
 //! per-account secrets are stored) are injected via the [`EngineHost`] trait.
 
 use anyhow::Context as _;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
@@ -15,9 +15,12 @@ mod append;
 mod background_sync;
 mod folders;
 mod prefetch;
+#[cfg(test)]
+pub(crate) use prefetch::transfer_clock_tests::slow_fetch_engine;
 mod read;
 mod search;
 mod sync;
+mod transfers;
 
 pub use append::*;
 pub use background_sync::{BackgroundSyncCancelled, BackgroundSyncTimedOut, retry_background_sync};
@@ -26,6 +29,7 @@ pub use prefetch::*;
 pub use read::*;
 pub use search::*;
 pub use sync::*;
+pub use transfers::*;
 
 pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -60,8 +64,8 @@ fn oauth_defaults() -> OAuthDefaults {
 /// Engine state: per-account credentials plus the on-disk store.
 /// Reads serve from SQLite; syncs reconnect to IMAP and refresh stored rows.
 pub struct Engine {
-    pub accounts: Mutex<HashMap<String, imap::Creds>>,
-    pub db: std::sync::Mutex<rusqlite::Connection>,
+    pub accounts: Arc<Mutex<HashMap<String, imap::Creds>>>,
+    pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     /// Accounts with a live IDLE task, to avoid spawning duplicates.
     /// Keyed by `account\nfolder` because IMAP IDLE watches one selected mailbox
     /// per connection.
@@ -75,10 +79,30 @@ pub struct Engine {
     /// open would re-open an IMAP connection to re-search for them. Cleared on
     /// restart, which lets a genuinely-late ancestor be retried.
     pub gap_attempts: std::sync::Mutex<HashMap<String, HashSet<String>>>,
-    /// Threads with an in-flight background body fetch, keyed by
-    /// `account|thread_key`, so re-opening a thread while its missing bodies
-    /// are still downloading doesn't spawn a duplicate IMAP fetch run.
+    /// Messages with an in-flight background body fetch, keyed by
+    /// [`message_key`], so re-reads cannot duplicate a download while other
+    /// pages and new messages in the thread remain independently fetchable.
     pub body_fetches: std::sync::Mutex<HashSet<String>>,
+    /// Uncached-body background failures and when each happened, consumed by
+    /// the next read so its UI can show an error without starting an automatic
+    /// fetch/notification loop. Only answers for [`BODY_FAILURE_TTL`]: an old
+    /// failure says nothing about the connection now.
+    pub body_fetch_failures: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Pulsed when a background body fetch ends, so a read waiting on one of
+    /// its messages looks at the cache again.
+    pub body_fetch_done: Notify,
+    /// Messages ([`message_key`]) whose attachment files are not to be
+    /// fetched again yet. `None`: a download arrived and the files were still
+    /// missing, or a successful FETCH omitted the UID (expunged). Another
+    /// download is not known to help, and an open thread would
+    /// otherwise refetch, notify and re-read without end. `Some(until)`: the
+    /// download itself failed, so readers stop waiting on it until then.
+    /// Cleared for a message once its files are on disk.
+    pub media_recovery_hold: std::sync::Mutex<HashMap<String, Option<std::time::Instant>>>,
+    /// Messages ([`message_key`]) the prefetcher leaves to the on-demand
+    /// reader for the rest of this run: each failed to download, then failed
+    /// again straight after other mail had come down on the same connection.
+    pub prefetch_skipped: std::sync::Mutex<HashSet<String>>,
     /// Pulsed when an account is paused so live IDLE watchers wake and re-check
     /// their paused state (and stop) instead of blocking up to the IDLE timeout.
     pub pause_signal: Notify,
@@ -102,7 +126,7 @@ pub struct Engine {
     connect_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Platform integration: opens the SQLite store and loads/stores per-account
     /// secrets (OS keychain on desktop, the keyed DB on mobile).
-    pub host: Box<dyn EngineHost>,
+    pub host: Arc<dyn EngineHost>,
 }
 
 /// Platform hooks the [`Engine`] needs but that differ between the desktop
@@ -165,7 +189,33 @@ pub fn pool_debug(account: &str, what: &str) {
     }
 }
 
+/// Whether `err` is core's "this account must sign in again" failure, from any
+/// of the paths that refuse to use missing or rejected credentials. Hosts get
+/// it as an `account.needsReconnect` event; see [`needs_reconnect_event`].
+pub fn is_needs_reconnect_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("account needs reconnect")
+}
+
+/// The event that tells a host `account` has to be reconnected, when `err` is
+/// that failure. Carries the account id itself so hosts never have to recover
+/// it from the message text.
+pub fn needs_reconnect_event(
+    account: &str,
+    err: &anyhow::Error,
+) -> Option<(&'static str, serde_json::Value)> {
+    is_needs_reconnect_error(err).then(|| {
+        (
+            "account.needsReconnect",
+            serde_json::json!({ "account": account }),
+        )
+    })
+}
+
 pub fn creds_have_required_secret(creds: &imap::Creds) -> bool {
+    // A secret the provider has refused is as good as none.
+    if creds.auth_rejected() {
+        return false;
+    }
     if creds.is_oauth() {
         creds
             .refresh_token
@@ -213,6 +263,76 @@ pub const MAX_IDLE: Duration = Duration::from_secs(120);
 /// still answer within the bridge budget. Write ops are exempt: cutting off a
 /// slow but progressing APPEND/SEND mid-command is worse than waiting.
 pub const POOLED_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a pooled session gets to answer the NOOP that precedes a transfer.
+/// A live server answers in a round trip; a socket that died over a sleep or a
+/// network change says nothing, and every second spent finding that out comes
+/// off the download's budget.
+const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a recorded body download failure stands in for a new attempt.
+/// Long enough for the re-read its notification triggers; short enough that
+/// reconnecting or retrying by hand reaches the server again.
+const BODY_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+impl Engine {
+    /// Note that a background fetch could not deliver `key`'s body.
+    pub(crate) fn record_body_failure(&self, key: String, error: String) {
+        let now = std::time::Instant::now();
+        let mut failures = self.body_fetch_failures.lock().unwrap();
+        failures.retain(|_, (_, at)| now.duration_since(*at) < BODY_FAILURE_TTL);
+        failures.insert(key, (error, now));
+    }
+
+    /// The recent failure recorded for `key`, if any. Taking it is what lets
+    /// the read after this one try the server again.
+    pub(crate) fn take_body_failure(&self, key: &str) -> Option<String> {
+        let (error, at) = self.body_fetch_failures.lock().unwrap().remove(key)?;
+        (at.elapsed() < BODY_FAILURE_TTL).then_some(error)
+    }
+}
+
+/// The key the engine's per-message bookkeeping files a message under.
+pub(crate) fn message_key(account: &str, folder: &str, uid: u32) -> String {
+    format!("{}{uid}", folder_key_prefix(account, folder))
+}
+
+/// What every [`message_key`] of one folder starts with.
+pub(crate) fn folder_key_prefix(account: &str, folder: &str) -> String {
+    format!("{account}|{folder}|")
+}
+
+/// A body download ran out of its budget. Typed so callers can tell a message
+/// that is too slow to fetch from a connection that went away.
+#[derive(Debug)]
+pub struct TransferTimedOut(pub Duration);
+
+impl std::fmt::Display for TransferTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IMAP transfer timed out after {}s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for TransferTimedOut {}
+
+/// How [`Engine::run_session`] treats the session it runs `f` on.
+#[derive(Clone, Copy)]
+enum SessionUse {
+    /// Mutating. Never interrupted and never run twice, so a connection
+    /// dropped mid-command can't double-apply.
+    Write,
+    /// Read-only. A pooled session that fails, or stalls past
+    /// [`POOLED_READ_TIMEOUT`], is replaced by a fresh one and `f` runs once
+    /// more.
+    Read,
+    /// A read that transfers message bytes, due by `deadline` however many
+    /// connections it takes. See [`Engine::with_transfer_session`].
+    Transfer {
+        deadline: tokio::time::Instant,
+        budget: Duration,
+    },
+}
+
 /// Do not let a wedged fresh handshake make every later operation wait for the
 /// per-account connection coordinator indefinitely. Normal startup handshakes
 /// serialize; after this, availability wins and the caller connects independently.
@@ -244,17 +364,21 @@ impl Engine {
             accounts.insert(id, creds);
         }
         Ok(Self {
-            accounts: Mutex::new(accounts),
-            db: std::sync::Mutex::new(conn),
+            accounts: Arc::new(Mutex::new(accounts)),
+            db: Arc::new(std::sync::Mutex::new(conn)),
             watched: std::sync::Mutex::new(HashSet::new()),
             syncing: std::sync::Mutex::new(HashSet::new()),
             gap_attempts: std::sync::Mutex::new(HashMap::new()),
             body_fetches: std::sync::Mutex::new(HashSet::new()),
+            body_fetch_failures: std::sync::Mutex::new(HashMap::new()),
+            body_fetch_done: Notify::new(),
+            media_recovery_hold: std::sync::Mutex::new(HashMap::new()),
+            prefetch_skipped: std::sync::Mutex::new(HashSet::new()),
             pause_signal: Notify::new(),
             resume_signal: Notify::new(),
             pool: std::sync::Mutex::new(HashMap::new()),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
-            host,
+            host: Arc::from(host),
         })
     }
 
@@ -268,25 +392,46 @@ impl Engine {
         store::account_muted(&self.db.lock().unwrap(), account).unwrap_or(false)
     }
 
+    /// Refresh and persist credentials in an owned task. Dropping a read or
+    /// transfer must not cancel a refresh after the provider accepted it.
     pub async fn ensure_valid_creds(&self, account: &str) -> anyhow::Result<imap::Creds> {
-        let mut accounts = self.accounts.lock().await;
+        let accounts = self.accounts.clone();
+        let db = self.db.clone();
+        let host = self.host.clone();
+        let account = account.to_string();
+        tokio::spawn(
+            async move { Self::refresh_creds(&accounts, &db, host.as_ref(), &account).await },
+        )
+        .await?
+    }
+
+    async fn refresh_creds(
+        accounts: &Mutex<HashMap<String, imap::Creds>>,
+        db: &std::sync::Mutex<rusqlite::Connection>,
+        host: &dyn EngineHost,
+        account: &str,
+    ) -> anyhow::Result<imap::Creds> {
+        let mut accounts = accounts.lock().await;
         // Lazily hydrate accounts added out-of-band (the mobile host adds/edits
         // accounts through the stateless command path, not this Engine, so a
         // long-lived foreground Engine can miss them). A no-op on desktop, where
         // the dispatch loop keeps `accounts` authoritative.
         if !accounts.contains_key(account) {
-            let loaded = store::load_accounts(&self.db.lock().unwrap())
+            let loaded = store::load_accounts(&db.lock().unwrap())
                 .ok()
                 .and_then(|rows| rows.into_iter().find(|(id, _)| id == account));
             if let Some((id, mut creds)) = loaded {
-                self.host
-                    .apply_secret(&self.db.lock().unwrap(), &id, &mut creds);
+                host.apply_secret(&db.lock().unwrap(), &id, &mut creds);
                 accounts.insert(id, creds);
             }
         }
         let creds = accounts
             .get_mut(account)
             .ok_or_else(|| anyhow::anyhow!("account needs reconnect: {account}"))?;
+        // Already refused once: asking again only repeats the answer.
+        if creds.auth_rejected() {
+            anyhow::bail!("account needs reconnect: {account}");
+        }
 
         if creds.is_oauth() {
             let now = std::time::SystemTime::now()
@@ -380,7 +525,7 @@ impl Engine {
                 } else {
                     Some(owned_scope.as_str())
                 };
-                let (new_access, expires_in) = imap::refresh_oauth_token(
+                let refreshed = imap::refresh_oauth_token(
                     &token_url,
                     &client_id,
                     &client_secret,
@@ -388,17 +533,45 @@ impl Engine {
                     scope,
                     creds.proxy.resolve(),
                 )
-                .await?;
-                creds.access_token = Some(new_access);
-                creds.token_expires_at = now + expires_in;
+                .await;
+                let refreshed = match refreshed {
+                    Ok(tokens) => tokens,
+                    // The grant is dead, not the network: remember it, so the
+                    // account shows as needing a reconnect and every later sync
+                    // stops here instead of asking the provider again.
+                    //
+                    // The verdict is filed under the token that earned it, so
+                    // an account reconnected while we were asking is unaffected.
+                    Err(err) if imap::oauth_grant_rejected(&err) => {
+                        let fingerprint = imap::grant_fingerprint(refresh_token);
+                        if let Err(save_err) = store::set_account_rejected_grant(
+                            &db.lock().unwrap(),
+                            account,
+                            &fingerprint,
+                        ) {
+                            eprintln!(
+                                "meron-core: could not record rejected sign-in for {account}: {save_err:#}"
+                            );
+                        }
+                        creds.rejected_grant = Some(fingerprint);
+                        return Err(err.context(format!("account needs reconnect: {account}")));
+                    }
+                    Err(err) => return Err(err),
+                };
+                creds.access_token = Some(refreshed.access_token);
+                creds.token_expires_at = now + refreshed.expires_in;
+                // A rotated refresh token replaces the one just used; without
+                // it the old one stays, as for providers that never rotate.
+                if let Some(rotated) = refreshed.refresh_token {
+                    creds.refresh_token = Some(rotated);
+                }
 
-                // Persist: token_expires_at to SQLite, the new access token to
-                // the host's secret store (keychain on desktop, keyed DB on mobile).
+                // Persist: token_expires_at to SQLite, the new tokens to the
+                // host's secret store (keychain on desktop, keyed DB on mobile).
                 {
-                    let db = self.db.lock().unwrap();
+                    let db = db.lock().unwrap();
                     store::save_account_config(&db, account, creds)?;
-                    self.host
-                        .store_secret(&db, account, &secrets::Secrets::from_creds(creds))?;
+                    host.store_secret(&db, account, &secrets::Secrets::from_creds(creds))?;
                 }
             }
         }
@@ -407,14 +580,21 @@ impl Engine {
     }
 
     /// Pop the hottest non-expired pooled session for `account`, discarding any
-    /// that have been idle past `MAX_IDLE` (likely dropped by the server).
+    /// that have been idle past `MAX_IDLE` or whose socket the server has
+    /// already closed.
     pub fn take_pooled(&self, account: &str) -> Option<imap::Session> {
-        pool_take(
-            &mut self.pool.lock().unwrap(),
-            account,
-            std::time::Instant::now(),
-            MAX_IDLE,
-        )
+        loop {
+            let session = pool_take(
+                &mut self.pool.lock().unwrap(),
+                account,
+                std::time::Instant::now(),
+                MAX_IDLE,
+            )?;
+            if imap::session_looks_open(&session) {
+                return Some(session);
+            }
+            pool_debug(account, "closed-evict");
+        }
     }
 
     /// Return a healthy session to the pool, or drop it if the account is
@@ -472,56 +652,53 @@ impl Engine {
     /// [`with_read_session`](Self::with_read_session) /
     /// [`with_write_session`](Self::with_write_session) instead of calling this
     /// directly.
-    pub async fn with_session<T, F>(
+    pub async fn with_session<T, F>(&self, account: &str, retry: bool, f: F) -> anyhow::Result<T>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let usage = if retry {
+            SessionUse::Read
+        } else {
+            SessionUse::Write
+        };
+        self.run_session(account, usage, f).await
+    }
+
+    async fn run_session<T, F>(
         &self,
         account: &str,
-        retry: bool,
+        usage: SessionUse,
         mut f: F,
     ) -> anyhow::Result<T>
     where
         F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
         T: Send,
     {
-        if let Some(mut session) = self.take_pooled(account) {
-            // Retryable (read-only) ops get a bounded reuse attempt so a dead
-            // pooled connection fails over to the fresh-connect path below
-            // instead of hanging until TCP keepalive notices; see
-            // POOLED_READ_TIMEOUT. Writes must not be interrupted mid-command.
-            let result = if retry {
-                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "pooled session command timed out after {}s",
-                        POOLED_READ_TIMEOUT.as_secs()
-                    )),
-                }
-            } else {
-                f(&mut session).await
-            };
-            match result {
-                Ok(val) => {
-                    pool_debug(account, "reuse");
-                    self.return_pooled(account, session);
-                    return Ok(val);
-                }
-                Err(err) => {
-                    // Discard the suspect session (do not pool it).
-                    drop(session);
-                    if !retry {
-                        return Err(err);
-                    }
-                    pool_debug(account, "stale-retry");
-                    // Fall through to a fresh connection and try once more.
-                }
+        let mut command_attempted = false;
+        if let Some(session) = self.take_pooled(account) {
+            match self
+                .run_pooled(account, usage, session, &mut f, &mut command_attempted)
+                .await
+            {
+                Some(result) => return result,
+                // Fall through to a fresh connection and try once more.
+                None => pool_debug(account, "stale-retry"),
             }
         }
 
         pool_debug(account, "fresh-connect");
         let connect_lock = self.connect_lock(account);
-        let mut connect_guard =
-            tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                .await
-                .ok();
+        let mut connect_guard = tokio::time::timeout(
+            match usage {
+                SessionUse::Transfer { deadline, .. } => connect_coordination_timeout()
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                _ => connect_coordination_timeout(),
+            },
+            connect_lock.lock(),
+        )
+        .await
+        .ok();
         if connect_guard.is_none() {
             crate::mlog!(
                 crate::log::Level::Warn,
@@ -531,41 +708,51 @@ impl Engine {
         }
         // The task ahead of us may have completed its operation and returned the
         // session while we waited for its handshake coordinator.
-        let pooled_after_wait = self.take_pooled(account);
-        if let Some(mut session) = pooled_after_wait {
+        if let Some(session) = self.take_pooled(account) {
             drop(connect_guard.take());
-            let result = if retry {
-                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "pooled session command timed out after {}s",
-                        POOLED_READ_TIMEOUT.as_secs()
-                    )),
-                }
-            } else {
-                f(&mut session).await
-            };
-            match result {
-                Ok(value) => {
-                    self.return_pooled(account, session);
-                    return Ok(value);
-                }
-                Err(error) => {
-                    drop(session);
-                    if !retry {
-                        return Err(error);
-                    }
+            match self
+                .run_pooled(account, usage, session, &mut f, &mut command_attempted)
+                .await
+            {
+                Some(result) => return result,
+                None => {
                     pool_debug(account, "stale-retry");
-                    connect_guard =
-                        tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                            .await
-                            .ok();
+                    connect_guard = tokio::time::timeout(
+                        match usage {
+                            SessionUse::Transfer { deadline, .. } => connect_coordination_timeout()
+                                .min(
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                ),
+                            _ => connect_coordination_timeout(),
+                        },
+                        connect_lock.lock(),
+                    )
+                    .await
+                    .ok();
                 }
             }
         }
-        let creds = self.ensure_valid_creds(account).await?;
+        // The caller's wait is bounded. ensure_valid_creds owns a spawned task,
+        // so cancellation still lets a rotated token reach durable storage.
+        let creds = match usage {
+            SessionUse::Transfer { deadline, .. } => {
+                tokio::time::timeout_at(deadline, self.ensure_valid_creds(account))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("IMAP session preparation timed out"))??
+            }
+            _ => self.ensure_valid_creds(account).await?,
+        };
         let connect_started = std::time::Instant::now();
-        let mut session = imap::connect(&creds).await?;
+        let mut session = match usage {
+            // Not `TransferTimedOut`: no transfer started, and callers read
+            // that one as the message being too slow to download.
+            SessionUse::Transfer { deadline, .. } => {
+                tokio::time::timeout_at(deadline, imap::connect(&creds))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("IMAP connect timed out"))??
+            }
+            SessionUse::Write | SessionUse::Read => imap::connect(&creds).await?,
+        };
         let connect_ms = connect_started.elapsed().as_millis();
         if connect_ms > 2_000 {
             crate::mlog!(
@@ -575,12 +762,98 @@ impl Engine {
             );
         }
         drop(connect_guard);
-        match f(&mut session).await {
-            Ok(val) => {
-                self.return_pooled(account, session);
-                Ok(val)
+        let result = match usage {
+            SessionUse::Transfer { deadline, budget } => {
+                match tokio::time::timeout_at(deadline, f(&mut session)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(TransferTimedOut(budget).into()),
+                }
             }
-            Err(err) => Err(err),
+            SessionUse::Write | SessionUse::Read => f(&mut session).await,
+        };
+        // A failed or timed-out command leaves the socket mid-command. Drop it
+        // instead of returning it to the pool.
+        let val = result?;
+        self.return_pooled(account, session);
+        Ok(val)
+    }
+
+    /// Run `f` on a pooled session. `None` means the session was stale (it has
+    /// been dropped) and the caller should connect fresh and run `f` again.
+    async fn run_pooled<T, F>(
+        &self,
+        account: &str,
+        usage: SessionUse,
+        mut session: imap::Session,
+        f: &mut F,
+        command_attempted: &mut bool,
+    ) -> Option<anyhow::Result<T>>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let may_retry = !*command_attempted;
+        let result = match usage {
+            // Writes must not be interrupted mid-command.
+            SessionUse::Write => f(&mut session).await,
+            // A bounded reuse attempt, so a dead pooled connection fails over
+            // to a fresh one instead of hanging until TCP keepalive notices.
+            SessionUse::Read => {
+                // A second pooled checkout may also be stale after a network
+                // change. Reject it before spending the command's only retry.
+                if !may_retry {
+                    let probe = tokio::time::timeout(
+                        TRANSFER_PROBE_TIMEOUT,
+                        session.run_command_and_check_ok("NOOP"),
+                    )
+                    .await;
+                    if !matches!(probe, Ok(Ok(()))) {
+                        return None;
+                    }
+                }
+                *command_attempted = true;
+                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
+                    Ok(result) => result,
+                    Err(_) if may_retry => return None,
+                    Err(_) => return Some(Err(anyhow::anyhow!("pooled IMAP read timed out"))),
+                }
+            }
+            // The short timeout covers a NOOP only: enough to notice a dead
+            // socket without cutting a slow download short.
+            SessionUse::Transfer { deadline, budget } => {
+                let probe = tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::timeout(
+                        TRANSFER_PROBE_TIMEOUT,
+                        session.run_command_and_check_ok("NOOP"),
+                    ),
+                )
+                .await;
+                if !matches!(probe, Ok(Ok(Ok(())))) {
+                    return None;
+                }
+                *command_attempted = true;
+                match tokio::time::timeout_at(deadline, f(&mut session)).await {
+                    Ok(result) => result,
+                    // Alive, only slow: starting over would not be faster.
+                    Err(_) => return Some(Err(TransferTimedOut(budget).into())),
+                }
+            }
+        };
+        match result {
+            Ok(val) => {
+                pool_debug(account, "reuse");
+                self.return_pooled(account, session);
+                Some(Ok(val))
+            }
+            // Discard the suspect session (do not pool it).
+            Err(err) => match usage {
+                SessionUse::Write => Some(Err(err)),
+                SessionUse::Read | SessionUse::Transfer { .. } if may_retry => None,
+                // A session returned during coordination can serve the retry,
+                // but its command failure must not trigger a third execution.
+                SessionUse::Read | SessionUse::Transfer { .. } => Some(Err(err)),
+            },
         }
     }
 
@@ -592,6 +865,34 @@ impl Engine {
         T: Send,
     {
         self.with_session(account, true, f).await
+    }
+
+    /// Run a read that transfers message bytes (a body FETCH).
+    ///
+    /// A reused socket is only given a short NOOP to prove it is alive.
+    /// Wrapping the FETCH itself in [`POOLED_READ_TIMEOUT`] aborts a
+    /// slow-but-alive transfer and starts it over, which is how a large or
+    /// high-latency message ends up taking twice as long to appear.
+    ///
+    /// `budget` is for the whole call: the probe, the wait for a reconnect,
+    /// the handshake, credential wait and a second run of `f` all come out of
+    /// it. A spawned credential refresh continues if this caller times out.
+    /// Running out mid-transfer fails with [`TransferTimedOut`]. `f` runs
+    /// at most twice on pooled command errors. A session returned during
+    /// coordination can serve the retry; otherwise a fresh connection does.
+    pub async fn with_transfer_session<T, F>(
+        &self,
+        account: &str,
+        budget: Duration,
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let deadline = tokio::time::Instant::now() + budget;
+        self.run_session(account, SessionUse::Transfer { deadline, budget }, f)
+            .await
     }
 
     /// Run a mutating operation against a pooled (or fresh) session. Never
@@ -616,6 +917,40 @@ impl Engine {
     pub async fn with_preflighted_write_session<T, P, F>(
         &self,
         account: &str,
+        preflight: P,
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        P: FnMut(&mut imap::Session) -> SessionOp<'_, ()> + Send,
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        self.preflighted_write(account, false, preflight, f).await
+    }
+
+    /// Like [`with_preflighted_write_session`](Self::with_preflighted_write_session),
+    /// for idempotent writes such as `+FLAGS`/`-FLAGS` stores. The server can
+    /// close a pooled connection between the preflight and the write, so when
+    /// the write fails on a pooled session with a dropped connection it is run
+    /// again, preflight included, on a fresh one. Applying it twice is harmless.
+    pub async fn with_flag_write_session<T, P, F>(
+        &self,
+        account: &str,
+        preflight: P,
+        f: F,
+    ) -> anyhow::Result<T>
+    where
+        P: FnMut(&mut imap::Session) -> SessionOp<'_, ()> + Send,
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        self.preflighted_write(account, true, preflight, f).await
+    }
+
+    async fn preflighted_write<T, P, F>(
+        &self,
+        account: &str,
+        replay_dropped: bool,
         mut preflight: P,
         mut f: F,
     ) -> anyhow::Result<T>
@@ -624,6 +959,17 @@ impl Engine {
         F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
         T: Send,
     {
+        let replay = |err: &anyhow::Error| {
+            let dropped = replay_dropped && background_sync::is_transient_sync_error(err);
+            if dropped {
+                crate::mlog!(
+                    crate::log::Level::Warn,
+                    "net",
+                    "pooled connection dropped during write for {account}, replaying on a fresh one: {err:#}"
+                );
+            }
+            dropped
+        };
         if let Some(mut session) = self.take_pooled(account) {
             let ready =
                 match tokio::time::timeout(POOLED_READ_TIMEOUT, preflight(&mut session)).await {
@@ -644,9 +990,13 @@ impl Engine {
                         }
                         Err(err) => {
                             // The mutation may have reached the server. Drop
-                            // the connection and report the result as-is.
+                            // the connection, and report the result as-is
+                            // unless the write is safe to replay.
                             drop(session);
-                            return Err(err);
+                            if !replay(&err) {
+                                return Err(err);
+                            }
+                            pool_debug(account, "stale-replay");
                         }
                     }
                 }
@@ -691,7 +1041,19 @@ impl Engine {
                             self.return_pooled(account, session);
                             return Ok(value);
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            drop(session);
+                            if !replay(&error) {
+                                return Err(error);
+                            }
+                            pool_debug(account, "stale-replay");
+                            connect_guard = tokio::time::timeout(
+                                connect_coordination_timeout(),
+                                connect_lock.lock(),
+                            )
+                            .await
+                            .ok();
+                        }
                     }
                 }
                 Err(_) => {
@@ -724,6 +1086,35 @@ impl Engine {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Set or clear `\Seen` on UIDs spread over several of the account's
+    /// mailboxes — a thread spans folders, and UIDs are mailbox-local — with
+    /// one preflighted write per mailbox.
+    pub async fn store_seen_by_folder(
+        &self,
+        account: &str,
+        by_folder: &BTreeMap<String, Vec<u32>>,
+        seen: bool,
+    ) -> anyhow::Result<()> {
+        for (folder, uids) in by_folder {
+            if uids.is_empty() {
+                continue;
+            }
+            self.with_flag_write_session(
+                account,
+                |session| {
+                    let folder = folder.clone();
+                    Box::pin(async move { imap::prepare_flag_update(session, &folder).await })
+                },
+                |session| {
+                    let uids = uids.clone();
+                    Box::pin(async move { imap::store_seen(session, &uids, seen).await })
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 

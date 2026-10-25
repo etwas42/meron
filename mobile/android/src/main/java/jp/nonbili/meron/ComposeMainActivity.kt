@@ -431,6 +431,9 @@ class ComposeMainActivity : ComponentActivity() {
         foregroundEngineJob?.cancel()
         foregroundEngineJob = null
         super.onStop()
+        // Mail read or archived in the app changes the count the home screen
+        // is about to show.
+        AndroidUnreadWidget.refreshAsync(this)
         foregroundEngineScope.launch {
             foregroundEngineMutex.withLock {
                 // A newer onStart may have won while this stop was queued.

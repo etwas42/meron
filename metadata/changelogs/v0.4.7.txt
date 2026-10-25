@@ -1,0 +1,7 @@
+- Add a local calendar of events, accepted invitations and due tasks
+- Show calendar invite cards with Accept/Maybe/Decline
+- Support saved search columns on the board, editable in place
+- Add search options form and search operators like from:, to:, subject:, is:unread
+- Save and copy inline images from the message menu and the gallery
+- Add recent thread move and copy shortcuts
+- Support cross-account thread moves

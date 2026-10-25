@@ -7,6 +7,7 @@ import {
   closeCommandPalette,
   focusGlobalSearch,
   focusQuickReply,
+  modalOpen,
 } from '../../states/ui'
 import { settings$, visibleSideNavAccounts } from '../../states/settings'
 import { accounts$ } from '../../states/accounts'
@@ -16,10 +17,11 @@ import {
   selectKanbanBoard,
   closeKanbanBoard,
   openMailAccount,
-  closeKanbanPane,
+  closeCurrentConversation,
+  kanbanPaneThreadId,
 } from '../../states/kanban'
 import { openThreadSearch, thread$ } from '../../states/thread'
-import { syncMail, selectAdjacentThread } from '../../states/mail'
+import { getActiveThread, syncMail, selectAdjacentThread } from '../../states/mail'
 import {
   toggleStarWithUndo,
   markUnreadWithUndo,
@@ -27,12 +29,13 @@ import {
   bulkStarSelected,
 } from '../../states/mailFlags'
 import { archiveThread, deleteThread, bulkArchiveSelected, bulkDeleteSelected } from '../../states/mailMoves'
-import { openComposeTab, openReplyInFullEditor, closeMessageTab } from '../../states/compose'
+import { openComposeTab, openReplyInFullEditor, closeMessageTab, toggleConversationMode } from '../../states/compose'
 import { compose$ } from '../../states/composeState'
 import { handleEditUndoKeyDown } from '../../lib/editUndo'
 import {
-  isBareShortcut,
+  isBareKeystroke,
   isMac,
+  isTyping,
   matchShortcut,
   shortcutForChord,
   RAIL_SHORTCUT_IDS,
@@ -44,27 +47,7 @@ import {
 // Whether the conversation pane (and thus its in-thread search) is on screen.
 function threadSearchVisible(): boolean {
   if (!ui$.selectedThread.peek()) return false
-  return !kanban$.activeBoardId.peek() || !!kanban$.paneThreadId.peek()
-}
-
-// Is the user currently typing into a field? Bare single-key shortcuts must
-// stand down so they don't clobber text entry.
-function isTyping(target: EventTarget | null): boolean {
-  const el = target as HTMLElement | null
-  if (!el) return false
-  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable
-}
-
-function modalOpen(): boolean {
-  return (
-    ui$.paletteOpen.peek() ||
-    ui$.shortcutsOpen.peek() ||
-    ui$.settingsOpen.peek() ||
-    ui$.setupOpen.peek() ||
-    !!ui$.addFeedAccount.peek() ||
-    !!ui$.editFeed.peek() ||
-    !!ui$.confirm.peek()
-  )
+  return !kanban$.activeBoardId.peek() || !!kanbanPaneThreadId()
 }
 
 // Bare shortcuts are thread-list/conversation actions. They apply in the kanban
@@ -75,19 +58,35 @@ function bareShortcutsActive(): boolean {
 }
 
 function kanbanArrowNavigationActive(): boolean {
-  return !!kanban$.activeBoardId.peek() && !modalOpen()
+  return !!kanban$.activeBoardId.peek() && !modalOpen() && !ui$.calendarOpen.peek()
 }
 
 function chatArrowNavigationActive(): boolean {
-  return !kanban$.activeBoardId.peek() && !modalOpen()
+  return !kanban$.activeBoardId.peek() && !modalOpen() && !ui$.calendarOpen.peek()
 }
 
-// The thread a bare action applies to. On a board the open card wins: an RSS
-// card opens in a reader tab without retargeting ui$.selectedThread, which would
-// otherwise leave a stale chat-list selection as the target. Same precedence as
-// selectAdjacentKanbanThread.
+// Shortcuts that act on the mail on screen. The calendar takes the place of
+// mail (and of a board) while keeping their selection for when it closes, so
+// these must not reach mail the user can no longer see.
+const MAIL_VIEW_ACTIONS = new Set<ShortcutId>([
+  'thread.next',
+  'thread.prev',
+  'thread.archive',
+  'thread.star',
+  'thread.unread',
+  'thread.delete',
+  'thread.details',
+  'thread.viewMode',
+  'reply.focus',
+  'compose.replyFull',
+  'search.thread',
+])
+
+// The thread a bare action applies to. On a board it's the one the pane shows:
+// an RSS card opens in a reader tab without retargeting ui$.selectedThread,
+// which would otherwise leave a stale chat-list selection as the target.
 function activeThreadId(): string {
-  if (kanban$.activeBoardId.peek()) return kanban$.paneThreadId.peek() || ui$.selectedThread.peek()
+  if (kanban$.activeBoardId.peek()) return kanbanPaneThreadId() || ui$.selectedThread.peek()
   return ui$.selectedThread.peek()
 }
 
@@ -139,7 +138,8 @@ function deleteKeyFocusAllowed(): boolean {
 // Active in both the chat and kanban views (selection lives in
 // ui$.selectedThread either way), unlike the other bare shortcuts.
 function handleDeleteKey(key: string, target: EventTarget | null): boolean {
-  if (key !== 'Delete' || isTyping(target) || modalOpen() || !deleteKeyFocusAllowed()) return false
+  if (key !== 'Delete' || isTyping(target) || modalOpen() || ui$.calendarOpen.peek() || !deleteKeyFocusAllowed())
+    return false
   const threadId = activeThreadId()
   const bulkItems = selectedBulkItems()
   if (bulkItems.length > 0) {
@@ -214,7 +214,7 @@ export function AppHotkeys() {
         kanban$.paneThreadId.peek()
       ) {
         event.preventDefault()
-        closeKanbanPane()
+        closeCurrentConversation()
         return
       }
 
@@ -255,9 +255,11 @@ export function AppHotkeys() {
 
       // Gate single-key shortcuts: never steal a keystroke from a text field,
       // and only act in the chat view with no modal open.
-      if (isBareShortcut(action)) {
+      if (isBareKeystroke(event)) {
         if (isTyping(event.target) || !bareShortcutsActive()) return
       }
+
+      if (MAIL_VIEW_ACTIONS.has(action) && ui$.calendarOpen.peek()) return
 
       const selected = () => activeThreadId()
       const bulkSelected = () => selectedBulkItems()
@@ -376,6 +378,13 @@ export function AppHotkeys() {
           event.preventDefault()
           thread$.mediaOpen.set(!thread$.mediaOpen.peek())
           break
+        case 'thread.viewMode':
+          // A reader tab has its own HTML / plain switch, so it counts even
+          // when no conversation is open behind it.
+          if (!compose$.activeTab.peek() && !threadSearchVisible()) return
+          if (!toggleConversationMode(getActiveThread()?.account_id)) return
+          event.preventDefault()
+          break
         case 'reply.focus':
           if (!threadSearchVisible()) return
           event.preventDefault()
@@ -385,8 +394,9 @@ export function AppHotkeys() {
     }
 
     // Keys forwarded out of an HTML message iframe, which the global keydown
-    // listener never sees: ⌘/Ctrl (or Alt) chords such as ⌘/Ctrl+F, plus bare
-    // ArrowUp/ArrowDown. The detail is the chord HtmlFrame reconstructed.
+    // listener never sees: ⌘/Ctrl (or Alt) chords such as ⌘/Ctrl+F, bare
+    // single-key shortcuts, plus bare ArrowUp/ArrowDown. The detail is the
+    // chord HtmlFrame reconstructed.
     const onFrameKeyDown = (event: Event) => {
       const chord = (event as CustomEvent<Chord | undefined>).detail
       if (!chord?.key) return

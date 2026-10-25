@@ -3,7 +3,7 @@ import { Check, SquareChevronRight } from 'lucide-react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from '../dialog/Dialog'
 import { ui$, closeCommandPalette } from '../../states/ui'
 import { formatShortcut, isMac } from '../../lib/shortcuts'
 import { useCommandList } from './useCommandList'
@@ -19,23 +19,12 @@ export function CommandPalette() {
   const commands = useCommandList()
   const filtered = useMemo(() => filterCommands(commands, query), [commands, query])
 
-  // Focus the search field whenever the palette opens.
-  useEffect(() => {
-    if (!open) return
-    const id = window.setTimeout(() => inputRef.current?.focus(), 0)
-    return () => window.clearTimeout(id)
-  }, [open])
-
   // Keep the highlighted index in range as the filtered list shrinks.
   useEffect(() => {
     if (!open) return
     const max = Math.max(0, filtered.length - 1)
     if (index > max) ui$.paletteIndex.set(max)
   }, [open, filtered.length, index])
-
-  // Joins the Escape stack so the palette claims the key even when it is opened
-  // on top of another dialog, which would otherwise close underneath it.
-  useEscapeKey(closeCommandPalette, open)
 
   if (!open) return null
 
@@ -66,69 +55,63 @@ export function CommandPalette() {
   // already up, and it is then the newest layer — so it has to paint on top as
   // well as be the layer Escape closes (see useEscapeKey).
   return (
-    <div
-      className="fixed inset-0 z-[130] flex items-start justify-center bg-black/40 px-4 pt-[12vh] backdrop-blur-sm"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) closeCommandPalette()
-      }}
+    <Dialog
+      onClose={closeCommandPalette}
+      initialFocusRef={inputRef}
+      backdropClassName="z-[130] items-start pt-[12vh] dark:bg-black/40 backdrop-blur-sm"
+      className="max-w-[560px] overflow-hidden rounded-xl"
+      aria-label={t('palette.label')}
+      onKeyDown={onKeyDown}
     >
-      <div
-        className="w-full max-w-[560px] overflow-hidden rounded-xl border border-border bg-chats shadow-2xl animate-fade-in"
-        role="dialog"
-        aria-modal="true"
-        aria-label={t('palette.label')}
-        onKeyDown={onKeyDown}
-      >
-        <div className="flex items-center gap-2.5 border-b border-border px-4 py-3">
-          <SquareChevronRight size={16} className="shrink-0 text-secondary" />
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(event) => {
-              ui$.paletteQuery.set(event.target.value)
-              ui$.paletteIndex.set(0)
-            }}
-            placeholder={t('palette.placeholder')}
-            className="w-full border-0 bg-transparent text-sm text-primary outline-none placeholder:text-secondary"
-          />
-        </div>
-
-        <div className="max-h-[min(50vh,380px)] overflow-y-auto p-2">
-          {filtered.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-secondary">{t('palette.noMatches')}</div>
-          ) : (
-            filtered.map((command, i) => {
-              const selected = i === index
-              return (
-                <button
-                  key={command.id}
-                  onMouseEnter={() => ui$.paletteIndex.set(i)}
-                  onClick={() => command.run()}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-[0.8125rem] transition-colors cursor-pointer ${
-                    selected ? 'bg-accent/10 text-primary' : 'text-primary hover:bg-hover'
-                  }`}
-                >
-                  <span className="shrink-0 text-secondary">{command.icon}</span>
-                  <span className="flex-1 truncate">{command.label}</span>
-                  {command.active && <Check size={14} className="shrink-0 text-accent" />}
-                  {command.shortcut && (
-                    <kbd className="shrink-0 rounded border border-border bg-app px-1.5 py-0.5 text-[0.625rem] font-medium text-secondary">
-                      {formatShortcut(command.shortcut).join(isMac ? '' : '+')}
-                    </kbd>
-                  )}
-                </button>
-              )
-            })
-          )}
-        </div>
-
-        <div className="flex items-center gap-4 border-t border-border px-4 py-2 text-[0.625rem] text-secondary">
-          <Hint keys="Enter" label={t('palette.hints.run')} />
-          <Hint keys="↑↓" label={t('palette.hints.navigate')} />
-          <Hint keys="Esc" label={t('palette.hints.close')} />
-        </div>
+      <div className="flex items-center gap-2.5 border-b border-border px-4 py-3">
+        <SquareChevronRight size={16} className="shrink-0 text-secondary" />
+        <input
+          ref={inputRef}
+          value={query}
+          onChange={(event) => {
+            ui$.paletteQuery.set(event.target.value)
+            ui$.paletteIndex.set(0)
+          }}
+          placeholder={t('palette.placeholder')}
+          className="w-full border-0 bg-transparent text-sm text-primary outline-none placeholder:text-secondary"
+        />
       </div>
-    </div>
+
+      <div className="max-h-[min(50vh,380px)] overflow-y-auto p-2">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-6 text-center text-xs text-secondary">{t('palette.noMatches')}</div>
+        ) : (
+          filtered.map((command, i) => {
+            const selected = i === index
+            return (
+              <button
+                key={command.id}
+                onMouseEnter={() => ui$.paletteIndex.set(i)}
+                onClick={() => command.run()}
+                className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-[0.8125rem] transition-colors cursor-pointer ${
+                  selected ? 'bg-accent/10 text-primary' : 'text-primary hover:bg-hover'
+                }`}
+              >
+                <span className="shrink-0 text-secondary">{command.icon}</span>
+                <span className="flex-1 truncate">{command.label}</span>
+                {command.active && <Check size={14} className="shrink-0 text-accent" />}
+                {command.shortcut && (
+                  <kbd className="shrink-0 rounded border border-border bg-app px-1.5 py-0.5 text-[0.625rem] font-medium text-secondary">
+                    {formatShortcut(command.shortcut).join(isMac ? '' : '+')}
+                  </kbd>
+                )}
+              </button>
+            )
+          })
+        )}
+      </div>
+
+      <div className="flex items-center gap-4 border-t border-border px-4 py-2 text-[0.625rem] text-secondary">
+        <Hint keys="Enter" label={t('palette.hints.run')} />
+        <Hint keys="↑↓" label={t('palette.hints.navigate')} />
+        <Hint keys="Esc" label={t('palette.hints.close')} />
+      </div>
+    </Dialog>
   )
 }
 

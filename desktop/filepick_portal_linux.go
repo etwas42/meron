@@ -13,6 +13,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/google/uuid"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 const (
@@ -20,6 +21,7 @@ const (
 	portalDesktopPath        = dbus.ObjectPath("/org/freedesktop/portal/desktop")
 	portalRequestNamespace   = dbus.ObjectPath("/org/freedesktop/portal/desktop/request")
 	portalFileChooserOpen    = "org.freedesktop.portal.FileChooser.OpenFile"
+	portalFileChooserSave    = "org.freedesktop.portal.FileChooser.SaveFile"
 	portalRequestResponse    = "org.freedesktop.portal.Request.Response"
 	portalRequestInterface   = "org.freedesktop.portal.Request"
 	portalRequestCloseMethod = "org.freedesktop.portal.Request.Close"
@@ -42,20 +44,66 @@ func openFilePicker(
 	imagesOnly bool,
 	multiple bool,
 ) ([]string, bool, error) {
-	if os.Getenv("FLATPAK_ID") == "" {
+	if !useFileChooserPortal() {
 		paths, err := openWailsFilePicker(ctx, title, defaultDir, imagesOnly, multiple)
 		return paths, false, err
 	}
 
-	uris, err := openPortalFiles(ctx, title, imagesOnly, multiple)
-	if err != nil {
-		return nil, true, err
-	}
-	paths, err := portalFilePaths(uris)
+	paths, err := portalFileChooser(ctx, portalFileChooserOpen, title, portalOpenFileOptions(imagesOnly, multiple))
 	return paths, true, err
 }
 
-func openPortalFiles(ctx context.Context, title string, imagesOnly, multiple bool) ([]string, error) {
+// useFileChooserPortal reports whether file dialogs must go through the
+// xdg-desktop-portal. Wails builds its GTK dialog in-process, which inside the
+// Flatpak sandbox can only browse the sandbox itself, while the portal shows
+// the host filesystem and grants access to just the chosen file.
+func useFileChooserPortal() bool {
+	return os.Getenv("FLATPAK_ID") != ""
+}
+
+// saveFileDialog is wailsRuntime.SaveFileDialog, routed through the portal
+// when sandboxed. It returns "" when the user cancels.
+func saveFileDialog(ctx context.Context, options wailsRuntime.SaveDialogOptions) (string, error) {
+	if !useFileChooserPortal() {
+		return wailsRuntime.SaveFileDialog(ctx, options)
+	}
+	portalOptions := portalBaseOptions()
+	if options.DefaultFilename != "" {
+		portalOptions["current_name"] = dbus.MakeVariant(options.DefaultFilename)
+	}
+	addPortalFilters(portalOptions, options.Filters)
+	return firstPortalPath(portalFileChooser(ctx, portalFileChooserSave, options.Title, portalOptions))
+}
+
+// openFileDialog is wailsRuntime.OpenFileDialog, routed through the portal
+// when sandboxed. It returns "" when the user cancels.
+func openFileDialog(ctx context.Context, options wailsRuntime.OpenDialogOptions) (string, error) {
+	if !useFileChooserPortal() {
+		return wailsRuntime.OpenFileDialog(ctx, options)
+	}
+	portalOptions := portalBaseOptions()
+	addPortalFilters(portalOptions, options.Filters)
+	return firstPortalPath(portalFileChooser(ctx, portalFileChooserOpen, options.Title, portalOptions))
+}
+
+func firstPortalPath(paths []string, err error) (string, error) {
+	if err != nil || len(paths) == 0 {
+		return "", err
+	}
+	return paths[0], nil
+}
+
+// portalFileChooser runs one FileChooser portal request and returns the
+// chosen local paths, or none when the user cancels.
+func portalFileChooser(ctx context.Context, method, title string, options map[string]dbus.Variant) ([]string, error) {
+	uris, err := portalFileChooserURIs(ctx, method, title, options)
+	if err != nil {
+		return nil, err
+	}
+	return portalFilePaths(uris)
+}
+
+func portalFileChooserURIs(ctx context.Context, method, title string, options map[string]dbus.Variant) ([]string, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return nil, fmt.Errorf("connect to file chooser portal: %w", err)
@@ -76,11 +124,10 @@ func openPortalFiles(ctx context.Context, title string, imagesOnly, multiple boo
 	}
 	defer conn.RemoveMatchSignal(matchOptions...)
 
-	options := portalOpenFileOptions(imagesOnly, multiple)
 	var handle dbus.ObjectPath
 	call := conn.Object(portalDesktopName, portalDesktopPath).CallWithContext(
 		ctx,
-		portalFileChooserOpen,
+		method,
 		0,
 		"",
 		title,
@@ -110,11 +157,43 @@ func openPortalFiles(ctx context.Context, title string, imagesOnly, multiple boo
 	}
 }
 
-func portalOpenFileOptions(imagesOnly, multiple bool) map[string]dbus.Variant {
-	options := map[string]dbus.Variant{
+func portalBaseOptions() map[string]dbus.Variant {
+	return map[string]dbus.Variant{
 		"handle_token": dbus.MakeVariant("meron_" + strings.ReplaceAll(uuid.NewString(), "-", "_")),
-		"multiple":     dbus.MakeVariant(multiple),
+		"modal":        dbus.MakeVariant(true),
 	}
+}
+
+// addPortalFilters converts Wails filters ("*.opml;*.xml") into portal glob
+// filters, preselecting the first one as Wails does.
+func addPortalFilters(options map[string]dbus.Variant, filters []wailsRuntime.FileFilter) {
+	converted := portalFilters(filters)
+	if len(converted) == 0 {
+		return
+	}
+	options["filters"] = dbus.MakeVariant(converted)
+	options["current_filter"] = dbus.MakeVariant(converted[0])
+}
+
+func portalFilters(filters []wailsRuntime.FileFilter) []portalFilter {
+	var converted []portalFilter
+	for _, filter := range filters {
+		var rules []portalFilterRule
+		for _, pattern := range strings.Split(filter.Pattern, ";") {
+			if pattern = strings.TrimSpace(pattern); pattern != "" {
+				rules = append(rules, portalFilterRule{Kind: 0, Pattern: pattern})
+			}
+		}
+		if len(rules) > 0 {
+			converted = append(converted, portalFilter{Name: filter.DisplayName, Rules: rules})
+		}
+	}
+	return converted
+}
+
+func portalOpenFileOptions(imagesOnly, multiple bool) map[string]dbus.Variant {
+	options := portalBaseOptions()
+	options["multiple"] = dbus.MakeVariant(multiple)
 	if imagesOnly {
 		options["filters"] = dbus.MakeVariant([]portalFilter{
 			{

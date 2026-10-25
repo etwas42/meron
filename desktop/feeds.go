@@ -91,7 +91,7 @@ func (a *App) exportOpml(payload map[string]any) (any, error) {
 		return nil, errors.New("no feeds to export")
 	}
 
-	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+	dest, err := saveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:                "Export feeds",
 		DefaultFilename:      "meron-feeds.opml",
 		CanCreateDirectories: true,
@@ -123,7 +123,7 @@ func (a *App) importOpml(payload map[string]any) (any, error) {
 	if account == "" {
 		return nil, errors.New("account id required")
 	}
-	src, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+	src, err := openFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 		Title: "Import feeds",
 		Filters: []wailsRuntime.FileFilter{
 			{DisplayName: "OPML files (*.opml, *.xml)", Pattern: "*.opml;*.xml"},

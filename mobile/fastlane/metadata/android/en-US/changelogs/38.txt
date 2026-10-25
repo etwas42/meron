@@ -1,0 +1,4 @@
+- Share and import custom themes as a one-line color string
+- Size chat bubbles to their text and images
+- Theme polish and themed navigation drawer
+- Quick replies skip no-reply and bounce messages in a thread

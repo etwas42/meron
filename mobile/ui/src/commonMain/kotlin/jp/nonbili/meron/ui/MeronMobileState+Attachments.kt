@@ -27,7 +27,7 @@ internal suspend fun MeronMobileState.readAttachmentBytes(attachment: MessageAtt
 internal fun MeronMobileState.saveMessageAttachment(attachment: MessageAttachment) {
     if (attachment.key.isBlank()) {
         status =
-            if (attachment.url.isNotBlank()) "Remote attachments can be opened but are not cached for saving." else "Attachment is not cached."
+            trs(if (attachment.url.isNotBlank()) "mobile.status.attachmentRemoteNotCached" else "mobile.status.attachmentNotCached")
         return
     }
     if (!coreLoaded) {
@@ -35,7 +35,7 @@ internal fun MeronMobileState.saveMessageAttachment(attachment: MessageAttachmen
         return
     }
     pendingAttachmentSave = attachment
-    launchAttachmentSave(safeAttachmentFilename(attachment.filename))
+    launchAttachmentSave(safeAttachmentFilename(attachment))
 }
 
 internal fun MeronMobileState.openMessageAttachment(attachment: MessageAttachment) {
@@ -44,7 +44,7 @@ internal fun MeronMobileState.openMessageAttachment(attachment: MessageAttachmen
         return
     }
     if (attachment.key.isBlank()) {
-        status = "Attachment is not cached."
+        status = trs("mobile.status.attachmentNotCached")
         return
     }
     if (!coreLoaded) {
@@ -61,32 +61,32 @@ internal fun MeronMobileState.openMessageAttachment(attachment: MessageAttachmen
         }.onSuccess { (bytes, image) ->
             if (attachment.mimeType.startsWith("image/")) {
                 if (image == null) {
-                    status = "Attachment image could not be decoded"
+                    status = trs("mobile.status.imageDecodeFailed")
                     return@onSuccess
                 }
                 imagePreview =
                     ImagePreview(
-                        title = attachment.filename.ifBlank { "Image" },
+                        title = attachment.filename.ifBlank { trs("mobile.status.imageTitle") },
                         image = image,
                         bytes = bytes,
                         mimeType = attachment.mimeType.ifBlank { "image/*" },
-                        fileName = safeAttachmentFilename(attachment.filename),
+                        fileName = safeAttachmentFilename(attachment),
                     )
             } else {
                 when (
                     services.openFile(
                         bytes,
-                        safeAttachmentFilename(attachment.filename),
+                        safeAttachmentFilename(attachment),
                         attachment.mimeType.ifBlank { "application/octet-stream" },
                     )
                 ) {
                     AttachmentOpenResult.Opened -> Unit
-                    AttachmentOpenResult.Unsupported -> status = "No app can open this attachment."
-                    AttachmentOpenResult.Blocked -> status = "This attachment type is blocked for safety."
+                    AttachmentOpenResult.Unsupported -> status = trs("mobile.status.noAppForAttachment")
+                    AttachmentOpenResult.Blocked -> status = trs("mobile.status.attachmentBlocked")
                 }
             }
         }.onFailure {
-            status = "Attachment open failed: ${it.message}"
+            status = trsError("mobile.status.attachmentOpenFailed", it)
         }
     }
 }
@@ -96,8 +96,8 @@ internal fun MeronMobileState.shareImagePreview(preview: ImagePreview) {
 }
 
 internal fun MeronMobileState.copyImagePreview(preview: ImagePreview) {
-    services.copyImage(preview.bytes, preview.mimeType.ifBlank { "image/*" }, preview.title.ifBlank { "Image" })
-    status = "Image copied."
+    services.copyImage(preview.bytes, preview.mimeType.ifBlank { "image/*" }, preview.title.ifBlank { trs("mobile.status.imageTitle") })
+    status = trs("chat.imageCopied")
 }
 
 internal fun MeronMobileState.shareImageAttachment(attachment: MessageAttachment) {
@@ -106,7 +106,7 @@ internal fun MeronMobileState.shareImageAttachment(attachment: MessageAttachment
         return
     }
     if (attachment.key.isBlank()) {
-        status = "Attachment is not cached."
+        status = trs("mobile.status.attachmentNotCached")
         return
     }
     scope.launch {
@@ -115,28 +115,28 @@ internal fun MeronMobileState.shareImageAttachment(attachment: MessageAttachment
         }.onSuccess { bytes ->
             services.shareFile(
                 bytes,
-                safeAttachmentFilename(attachment.filename),
+                safeAttachmentFilename(attachment),
                 attachment.mimeType.ifBlank { "image/*" },
             )
         }.onFailure {
-            status = "Image share failed: ${it.message}"
+            status = trsError("mobile.status.imageShareFailed", it)
         }
     }
 }
 
 internal fun MeronMobileState.copyImageAttachment(attachment: MessageAttachment) {
     if (attachment.key.isBlank()) {
-        status = "Attachment is not cached."
+        status = trs("mobile.status.attachmentNotCached")
         return
     }
     scope.launch {
         runCatching {
             withContext(ioDispatcher) { readAttachmentBytes(attachment) }
         }.onSuccess { bytes ->
-            services.copyImage(bytes, attachment.mimeType.ifBlank { "image/*" }, attachment.filename.ifBlank { "Image" })
-            status = "Image copied."
+            services.copyImage(bytes, attachment.mimeType.ifBlank { "image/*" }, attachment.filename.ifBlank { trs("mobile.status.imageTitle") })
+            status = trs("chat.imageCopied")
         }.onFailure {
-            status = "Image copy failed: ${it.message}"
+            status = trsError("chat.couldNotCopyImage", it)
         }
     }
 }

@@ -116,7 +116,8 @@ function ScaleRow({
   )
 }
 
-export function FontSettingsSection() {
+/** The interface's fonts (General) or the message bodies' (Messages). */
+export function FontSettingsSection({ part }: { part: 'interface' | 'message' }) {
   const { t } = useTranslation()
   const fontFamily = useValue(settings$.fontFamily)
   const messageFontFamily = useValue(settings$.messageFontFamily)
@@ -149,25 +150,32 @@ export function FontSettingsSection() {
     setValue(value)
   }
 
+  if (part === 'interface') {
+    return (
+      <>
+        <SelectRow
+          icon={<CaseSensitive size={15} />}
+          title={t('settings.appearance.uiFont')}
+          hint={t('settings.appearance.uiFontHint')}
+          value={uiCustom ? CUSTOM_VALUE : fontFamily}
+          options={familyOptions(t('settings.appearance.fontDefault'))}
+          onChange={(value) => selectFamily(value, (next) => settings$.fontFamily.set(next), setUiCustom)}
+        />
+        {uiCustom && <CustomFontRow value={fontFamily} onChange={(value) => settings$.fontFamily.set(value)} />}
+        <ScaleRow
+          icon={<ALargeSmall size={15} />}
+          title={t('settings.appearance.textSize')}
+          hint={t('settings.appearance.textSizeHint')}
+          value={fontScale}
+          max={MAX_FONT_SCALE}
+          onChange={(value) => settings$.fontScale.set(value)}
+        />
+      </>
+    )
+  }
+
   return (
     <>
-      <SelectRow
-        icon={<CaseSensitive size={15} />}
-        title={t('settings.appearance.uiFont')}
-        hint={t('settings.appearance.uiFontHint')}
-        value={uiCustom ? CUSTOM_VALUE : fontFamily}
-        options={familyOptions(t('settings.appearance.fontDefault'))}
-        onChange={(value) => selectFamily(value, (next) => settings$.fontFamily.set(next), setUiCustom)}
-      />
-      {uiCustom && <CustomFontRow value={fontFamily} onChange={(value) => settings$.fontFamily.set(value)} />}
-      <ScaleRow
-        icon={<ALargeSmall size={15} />}
-        title={t('settings.appearance.textSize')}
-        hint={t('settings.appearance.textSizeHint')}
-        value={fontScale}
-        max={MAX_FONT_SCALE}
-        onChange={(value) => settings$.fontScale.set(value)}
-      />
       <SelectRow
         icon={<MessagesSquare size={15} />}
         title={t('settings.appearance.messageFont')}

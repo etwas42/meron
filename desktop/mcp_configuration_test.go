@@ -269,6 +269,7 @@ func TestMCPSetupOnlyClient(t *testing.T) {
 func TestMCPCreateAccountDoesNotGrantMail(t *testing.T) {
 	app, writer := newMailHandlerTestApp(t,
 		sidecarResponsePlan{Result: map[string]any{"accounts": []any{}}},
+		sidecarResponsePlan{Result: map[string]any{"accounts": []any{}}},
 		sidecarResponsePlan{Result: map[string]any{"ok": true}},
 		sidecarResponsePlan{Result: map[string]any{"ok": true}},
 	)
@@ -281,7 +282,7 @@ func TestMCPCreateAccountDoesNotGrantMail(t *testing.T) {
 	if result.IsError || strings.Contains(string(data), args.Password) {
 		t.Fatalf("%s", data)
 	}
-	if len(writer.calls) != 3 || writer.calls[1].Method != "account.connect" || writer.calls[1].Params["password"] != args.Password {
+	if len(writer.calls) != 4 || writer.calls[2].Method != "account.connect" || writer.calls[2].Params["password"] != args.Password {
 		t.Fatal(writer.calls)
 	}
 	if len(s.config.Clients[0].Accounts) != 0 {

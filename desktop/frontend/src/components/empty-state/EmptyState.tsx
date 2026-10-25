@@ -1,6 +1,7 @@
+import type { ReactNode } from 'react'
 import { AtSign } from 'lucide-react'
 
-export function EmptyState({ title, text }: { title: string; text: string }) {
+export function EmptyState({ title, text, action }: { title: string; text: string; action?: ReactNode }) {
   return (
     <div className="flex h-full w-full items-center justify-center p-8 text-center animate-fade-in select-none">
       <div className="max-w-xs flex flex-col items-center">
@@ -10,6 +11,7 @@ export function EmptyState({ title, text }: { title: string; text: string }) {
         </div>
         <h3 className="mt-5 font-bold text-sm text-primary tracking-tight">{title}</h3>
         <p className="mt-2 text-xs text-secondary leading-relaxed font-normal px-2">{text}</p>
+        {action}
       </div>
     </div>
   )

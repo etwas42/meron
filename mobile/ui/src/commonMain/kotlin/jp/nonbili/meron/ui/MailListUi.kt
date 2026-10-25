@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MarkEmailUnread
@@ -58,6 +59,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -466,9 +468,9 @@ internal fun MailList(
                                 if (deleting || isRss) Icons.Filled.Delete else Icons.Filled.Archive,
                                 contentDescription =
                                     when {
-                                        deleting -> "Delete"
-                                        isRss -> "Remove"
-                                        else -> "Archive"
+                                        deleting -> tr("buttons.delete")
+                                        isRss -> tr("mobile.actions.removeFeed")
+                                        else -> tr("notification.actionArchive")
                                     },
                                 tint =
                                     if (deleting) {
@@ -516,6 +518,7 @@ internal fun MailHeaderSearchField(
     placeholder: String? = null,
     onSearchChange: (String) -> Unit,
     onSearchSubmit: () -> Unit,
+    onOpenOptions: (() -> Unit)? = null,
 ) {
     val effectivePlaceholder = placeholder ?: tr("mobile.mail.searchMail")
     Surface(
@@ -572,6 +575,11 @@ internal fun MailHeaderSearchField(
                     }
                 },
             )
+            if (onOpenOptions != null) {
+                IconButton(onClick = onOpenOptions, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Filled.Tune, contentDescription = tr("search.options"), modifier = Modifier.size(18.dp))
+                }
+            }
             if (search.isNotBlank()) {
                 IconButton(
                     onClick = {
@@ -636,7 +644,7 @@ internal fun MailRow(
             Box(Modifier.size(38.dp), contentAlignment = Alignment.Center) {
                 Icon(
                     Icons.Filled.CheckCircle,
-                    contentDescription = if (selected) "Selected" else "Not selected",
+                    contentDescription = tr(if (selected) "common.selected" else "common.notSelected"),
                     tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant,
                     modifier = Modifier.size(24.dp),
                 )
@@ -750,13 +758,67 @@ internal fun MailRow(
                     IconButton(onClick = onToggleStar, modifier = Modifier.size(30.dp)) {
                         Icon(
                             if (thread.starred) Icons.Filled.Star else Icons.Filled.StarBorder,
-                            contentDescription = if (thread.starred) "Unstar" else "Star",
+                            contentDescription = tr(if (thread.starred) "chat.unstar" else "chat.star"),
                             tint = if (thread.starred) chat.star else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(22.dp),
                         )
                     }
                 }
             }
+            if (thread.files.isNotEmpty()) {
+                MailRowAttachmentChips(thread.files, Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+}
+
+/** How many chips a row names before collapsing the rest into "+N". */
+private const val MAX_ATTACHMENT_CHIPS = 2
+
+// Gmail-style attachment chips under a mail row: the first files by name, then
+// a count of the rest. Display only — the row itself is the click target.
+@Composable
+private fun MailRowAttachmentChips(
+    files: List<MessageAttachment>,
+    modifier: Modifier = Modifier,
+) {
+    val shown = files.take(MAX_ATTACHMENT_CHIPS)
+    val rest = files.size - shown.size
+    Row(
+        modifier.padding(end = 30.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        shown.forEach { file ->
+            Row(
+                Modifier
+                    .weight(1f, fill = false)
+                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(50))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Icon(
+                    fileIconFor(file.filename, file.mimeType),
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(14.dp),
+                )
+                Text(
+                    file.filename,
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+        }
+        if (rest > 0) {
+            Text(
+                "+$rest",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -824,16 +886,14 @@ internal fun SenderAvatar(
     enabled: Boolean,
     size: Dp,
 ) {
-    val urls =
-        remember(label, enabled) {
-            if (enabled) senderImageUrls(label) else emptyList()
-        }
-    var image by remember(label, enabled) { mutableStateOf<ImageBitmap?>(null) }
+    val core = LocalAvatarCore.current
+    val email = remember(label) { extractEmail(label) }
+    var image by remember(email, enabled, core) { mutableStateOf<ImageBitmap?>(null) }
 
-    LaunchedEffect(urls) {
+    LaunchedEffect(email, enabled, core) {
         image = null
-        if (urls.isNotEmpty()) {
-            image = withContext(ioDispatcher) { loadFirstImageBitmap(urls) }
+        if (enabled && email != null && core != null) {
+            image = loadSenderImage(core, email)
         }
     }
 
@@ -899,16 +959,6 @@ internal fun Avatar(
 
 /** RSS accounts fall back to a feed glyph instead of initials, matching desktop. */
 internal fun accountAvatarFallbackIcon(account: AccountSummary): ImageVector? = if (accountSummaryIsRss(account)) Icons.Filled.RssFeed else null
-
-internal fun senderImageUrls(label: String): List<String> {
-    val email = extractEmail(label) ?: return emptyList()
-    val domain = email.substringAfter('@', "").takeIf { it.isNotBlank() } ?: return emptyList()
-    val hash = sha256Hex(email.lowercase().trim())
-    return listOf(
-        "https://www.gravatar.com/avatar/$hash?s=96&d=404",
-        "https://www.google.com/s2/favicons?domain=$domain&sz=96",
-    )
-}
 
 internal fun extractEmail(value: String): String? {
     val match = Regex("[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}", RegexOption.IGNORE_CASE).find(value)

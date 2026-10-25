@@ -52,14 +52,25 @@ internal val mobileSettings =
     listOf(
         // Appearance and language.
         MobileSetting(PrefStore.App, APPEARANCE_MODE_PREF, PrefType.Str),
+        MobileSetting(PrefStore.App, THEME_FOLLOW_SYSTEM_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, LIGHT_THEME_PREF, PrefType.Str),
+        MobileSetting(PrefStore.App, DARK_THEME_PREF, PrefType.Str),
+        MobileSetting(PrefStore.App, CUSTOM_THEMES_PREF, PrefType.Str),
         MobileSetting(PrefStore.App, APP_LANGUAGE_PREF, PrefType.Str),
         MobileSetting(PrefStore.App, MESSAGE_FONT_SCALE_PREF, PrefType.Int),
         MobileSetting(PrefStore.App, SHOW_SENDER_IMAGES_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, DARK_MAIL_BODIES_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, AUTO_FIT_MESSAGES_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, CHAT_FULL_MESSAGES_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, READER_BOTTOM_ACTIONS_PREF, PrefType.Bool),
         MobileSetting(PrefStore.App, SHOW_UNREAD_BADGES_PREF, PrefType.Bool),
         // Layout and navigation.
         MobileSetting(PrefStore.App, SHOW_UNIFIED_INBOX_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, TASKS_ENABLED_PREF, PrefType.Bool),
+        MobileSetting(PrefStore.App, CALENDAR_ENABLED_PREF, PrefType.Bool),
         MobileSetting(PrefStore.App, CONVERSATION_LAYOUT_PREF, PrefType.Str),
         MobileSetting(PrefStore.App, SEND_SHORTCUT_PREF, PrefType.Str),
+        MobileSetting(PrefStore.App, QUOTE_REPLIES_PREF, PrefType.Bool),
         MobileSetting(PrefStore.App, HIDDEN_NAV_ACCOUNTS_PREF, PrefType.StrSet),
         MobileSetting(PrefStore.App, KANBAN_COLUMN_WIDTH_PREF, PrefType.Int),
         // Sync and notifications.

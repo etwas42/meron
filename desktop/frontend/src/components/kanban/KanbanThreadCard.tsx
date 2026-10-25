@@ -3,8 +3,8 @@ import { useDraggable } from '@dnd-kit/core'
 import { CSS } from '@dnd-kit/utilities'
 import { useValue } from '@legendapp/state/react'
 import { accounts$ } from '../../states/accounts'
-import { toggleBulkSelection, ui$, type BulkSelectionItem } from '../../states/ui'
-import { openMessageTab, openDraftConversationOrCompose } from '../../states/compose'
+import { ui$ } from '../../states/ui'
+import { openMessageTab, openDraftConversationOrCompose, openThreadTab } from '../../states/compose'
 import { compose$ } from '../../states/composeState'
 import { isDraftFolder } from '../../states/mailFolders'
 import { thread$ } from '../../states/thread'
@@ -27,7 +27,6 @@ export function KanbanThreadCard({
   onBulkRangeSelect,
   onBulkModeSelect,
   onBulkPlainSelect,
-  bulkItem,
 }: {
   boardId: string
   thread: Message
@@ -41,7 +40,6 @@ export function KanbanThreadCard({
   onBulkRangeSelect?: () => void
   onBulkModeSelect?: () => void
   onBulkPlainSelect?: () => void
-  bulkItem?: BulkSelectionItem
 }) {
   const accounts = useValue(accounts$)
   // Highlight is keyed off the open pane, not ui$.selectedThread, so a card can
@@ -52,18 +50,39 @@ export function KanbanThreadCard({
   const starredColumn = isUnifiedStarredColumn(column)
   const account = accounts.find((item) => item.id === thread.account_id)
   const starredFeed = starredColumn && isRssAccount(account, thread.account_id)
-  const draggableId = starredFeed ? thread.id : thread.thread_id
+  // Scoped to the column: the same thread can sit in two columns of one board
+  // (a unified inbox next to the account's own), and draggable ids must be unique.
+  const draggableId = `${ownerKey}\n${starredFeed ? thread.id : thread.thread_id}`
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: draggableId,
     // A unified column's cards are draggable too: the card carries the thread's
     // real account/folder, which the drop resolves as the move's origin.
     data: { type: 'thread', threadId: thread.thread_id, source: column },
   })
-  const active = thread.thread_id === paneThreadId
+  // A starred feed item opens in its own reader tab rather than as the card
+  // conversation, so it reads as selected while that tab is on screen. Its
+  // thread_id is the whole feed's, so match the tab by the item's own id.
+  const activeTab = useValue(compose$.activeTab)
+  const active = starredFeed ? activeTab === thread.id : thread.thread_id === paneThreadId
 
   useEffect(() => {
     if (active) selectedItemRef.current?.scrollIntoView({ block: 'nearest' })
   }, [active])
+
+  // Ctrl/Cmd+click and double-click. Starred feed items are single articles and
+  // open in a reader tab, as their plain click does. The pane shows for any
+  // active tab, so paneThreadId stays the card conversation behind the tabs:
+  // pointing it at the tab would leave an empty, unclosable Current behind.
+  const openInNewTab = () => {
+    if (starredFeed) openMessageTab(thread)
+    else openThreadTab(thread)
+    kanban$.paneColumnKey.set(kanbanBoardColumnKey(boardId, column))
+    ui$.mobilePane.set('conversation')
+  }
+
+  // Cards are dragged by pointer only: the board's keyboard sensor is for column
+  // headers, and here it would swallow Enter/Space meant for the row.
+  const { onKeyDown: _keyboardDrag, ...pointerListeners } = listeners ?? {}
 
   const style = {
     transform: transform && !isDragging ? CSS.Translate.toString(transform) : undefined,
@@ -72,21 +91,19 @@ export function KanbanThreadCard({
   }
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+    <div ref={setNodeRef} style={style} {...attributes} {...pointerListeners}>
       <ThreadListItem
         thread={thread}
-        accounts={accounts}
-        selectedAccount={column.accountId}
-        selectedThread={paneThreadId}
-        active={starredColumn ? active : undefined}
+        contextMenuOpen={threadMenu.isOpen(thread, ownerKey)}
+        active={starredColumn ? active : thread.thread_id === paneThreadId}
         rootRef={active ? selectedItemRef : undefined}
-        showAccountBadge={column.accountId === 'unified'}
+        badgeAccount={column.accountId === 'unified' ? account : undefined}
         className="rounded-lg border border-border bg-chats shadow-sm overflow-hidden"
         bulkSelectable={bulkSelectable}
         bulkSelected={bulkSelected}
         onSelect={(event) => {
-          if (bulkEnabled && bulkItem && (event.metaKey || event.ctrlKey)) {
-            toggleBulkSelection(bulkItem)
+          if (!bulkSelectable && (event.metaKey || event.ctrlKey)) {
+            openInNewTab()
             return
           }
           if (bulkEnabled && event.shiftKey) {
@@ -107,16 +124,11 @@ export function KanbanThreadCard({
             void openDraftConversationOrCompose(thread)
             return
           }
-          if (starredColumn) {
+          if (starredFeed) {
             // Feed rows carry their full body: open the item in a reader tab.
             // Mail rows are ordinary threads and open like any other card.
-            if (isRssAccount(account, thread.account_id)) {
-              openMessageTab(thread)
-              kanban$.paneThreadId.set(thread.thread_id)
-              kanban$.paneColumnKey.set(kanbanBoardColumnKey(boardId, column))
-              ui$.mobilePane.set('conversation')
-              return
-            }
+            openInNewTab()
+            return
           }
           focusKanbanThreadFolder(thread.folder_id)
           // Leave any open compose/reader/thread tab first so the selectedThread
@@ -126,6 +138,11 @@ export function KanbanThreadCard({
           kanban$.paneThreadId.set(thread.thread_id)
           kanban$.paneColumnKey.set(kanbanBoardColumnKey(boardId, column))
           ui$.mobilePane.set('conversation')
+        }}
+        onOpenInNewTab={() => {
+          // A draft's first click already resumed it in the composer.
+          if (bulkSelectable || isDraftFolder(thread.folder_id, thread.account_id)) return
+          openInNewTab()
         }}
         onContextMenu={(event) => {
           if (bulkSelectable) {
@@ -147,10 +164,9 @@ export function KanbanDragPreview({ thread, column }: { thread: Message; column:
     <div className="w-[310px] max-w-[calc(100vw-32px)] cursor-grabbing opacity-95 shadow-2xl">
       <ThreadListItem
         thread={thread}
-        accounts={accounts}
-        selectedAccount={column.accountId}
-        selectedThread=""
-        showAccountBadge={column.accountId === 'unified'}
+        badgeAccount={
+          column.accountId === 'unified' ? accounts.find((item) => item.id === thread.account_id) : undefined
+        }
         className="rounded-lg border border-border bg-chats shadow-lg overflow-hidden"
         onSelect={() => undefined}
       />

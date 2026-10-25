@@ -2,17 +2,20 @@ import { useState } from 'react'
 import { Palette, Plus, X } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
-import { BUILTIN_THEMES, DEFAULT_LIGHT_ID, type Appearance, type CustomTheme, type ThemeDef } from '../../lib/themes'
+import { Dialog } from './Dialog'
+import { BUILTIN_THEMES, type Appearance, type CustomTheme, type ThemeDef } from '../../lib/themes'
+import { useChosenThemeIds } from '../../lib/useThemeChoice'
 import { confirmAction } from '../../states/ui'
-import { deleteCustomTheme, selectTheme, settings$ } from '../../states/settings'
+import { deleteCustomTheme, selectTheme, setThemeFollowSystem, settings$ } from '../../states/settings'
 import { IconButton } from '../button/IconButton'
-import { ThemeEditorDialog } from './ThemeEditorDialog'
+import { ToggleRow } from './AccountSettingsRows'
+import { ThemeEditorDialog, copyThemeSource } from './ThemeEditorDialog'
 import { ThemeSwatch } from './ThemeSwatch'
 
 // Theme picker dialog (Settings -> General -> Theme -> Change), following the
 // WallpaperDialog layout: light and dark sections of large swatches, with the
-// custom-theme editor reachable from a dashed tile in each section.
+// custom-theme editor reachable from a dashed tile in each section. While the
+// theme follows the system, each section holds its own pick.
 
 type EditorState = { appearance: Appearance; theme: CustomTheme | null }
 
@@ -20,7 +23,7 @@ function ThemeSection({
   label,
   themes,
   customThemes,
-  effectiveId,
+  chosenIds,
   onEdit,
   onDelete,
   newTileAppearance,
@@ -28,7 +31,7 @@ function ThemeSection({
   label: string
   themes: ThemeDef[]
   customThemes: CustomTheme[]
-  effectiveId: string
+  chosenIds: string[]
   onEdit: (state: EditorState) => void
   onDelete: (theme: CustomTheme) => void
   newTileAppearance: Appearance
@@ -45,8 +48,9 @@ function ThemeSection({
               key={item.id}
               theme={item}
               large
-              selected={item.id === effectiveId}
+              selected={chosenIds.includes(item.id)}
               onSelect={() => selectTheme(item)}
+              onShare={custom ? () => copyThemeSource(custom.source, t('theme.shareCopied')) : undefined}
               onEdit={custom ? () => onEdit({ appearance: custom.appearance, theme: custom }) : undefined}
               onDelete={custom ? () => onDelete(custom) : undefined}
             />
@@ -68,15 +72,11 @@ function ThemeSection({
 export function ThemeDialog({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation()
   const [editor, setEditor] = useState<EditorState | null>(null)
-  const selectedId = useValue(settings$.themeId)
+  const followSystem = useValue(settings$.themeFollowSystem)
   const customThemes = useValue(settings$.customThemes)
-
-  useEscapeKey(onClose)
+  const chosenIds = useChosenThemeIds()
 
   const themes = [...BUILTIN_THEMES, ...customThemes]
-  // A stale selection (deleted custom theme) highlights the default, matching
-  // what resolveThemeDef actually paints.
-  const effectiveId = themes.some((item) => item.id === selectedId) ? selectedId : DEFAULT_LIGHT_ID
 
   const onDelete = async (themeToDelete: CustomTheme) => {
     const confirmed = await confirmAction({
@@ -90,39 +90,51 @@ export function ThemeDialog({ onClose }: { onClose: () => void }) {
 
   const sectionProps = {
     customThemes,
-    effectiveId,
+    chosenIds,
     onEdit: (state: EditorState) => setEditor(state),
     onDelete: (theme: CustomTheme) => void onDelete(theme),
   }
 
   return (
     <>
-      <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 dark:bg-black/65 backdrop-blur-[3px] p-4 animate-fade-in">
-        <div className="w-full max-w-3xl h-[620px] max-h-[90vh] rounded-3xl border border-border bg-chats text-primary shadow-2xl animate-slide-up flex flex-col overflow-hidden">
-          <div className="flex items-center justify-between gap-3 border-b border-border/70 px-6 py-4 shrink-0">
-            <div className="flex items-center gap-2">
-              <Palette className="text-accent" size={16} />
-              <h3 className="text-[0.875rem] font-bold leading-tight">{t('common.theme')}</h3>
-            </div>
-            <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
+      <Dialog
+        onClose={onClose}
+        closeOnBackdrop={false}
+        aria-label={t('common.theme')}
+        backdropClassName="z-[70] bg-black/45 dark:bg-black/65"
+        className="max-w-3xl h-[620px] max-h-[90vh] flex flex-col overflow-hidden"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-6 py-4 shrink-0">
+          <div className="flex items-center gap-2">
+            <Palette className="text-accent" size={16} />
+            <h3 className="text-[0.875rem] font-bold leading-tight">{t('common.theme')}</h3>
           </div>
-
-          <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
-            <ThemeSection
-              label={t('theme.light')}
-              themes={themes.filter((item) => item.appearance === 'light')}
-              newTileAppearance="light"
-              {...sectionProps}
-            />
-            <ThemeSection
-              label={t('theme.dark')}
-              themes={themes.filter((item) => item.appearance === 'dark')}
-              newTileAppearance="dark"
-              {...sectionProps}
-            />
-          </div>
+          <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
         </div>
-      </div>
+
+        <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-6">
+          <div className="shrink-0 rounded-2xl bg-raised/80 border border-border/60 overflow-hidden">
+            <ToggleRow
+              title={t('theme.matchSystem')}
+              hint={t('theme.matchSystemHint')}
+              checked={followSystem}
+              onChange={() => setThemeFollowSystem(!followSystem)}
+            />
+          </div>
+          <ThemeSection
+            label={t('theme.light')}
+            themes={themes.filter((item) => item.appearance === 'light')}
+            newTileAppearance="light"
+            {...sectionProps}
+          />
+          <ThemeSection
+            label={t('theme.dark')}
+            themes={themes.filter((item) => item.appearance === 'dark')}
+            newTileAppearance="dark"
+            {...sectionProps}
+          />
+        </div>
+      </Dialog>
 
       {editor && (
         <ThemeEditorDialog appearance={editor.appearance} initial={editor.theme} onClose={() => setEditor(null)} />

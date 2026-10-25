@@ -12,8 +12,8 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
-import jp.nonbili.meron.shared.backgroundRefreshSummary
 import jp.nonbili.meron.shared.backgroundRefreshUsesRssProtocol
+import jp.nonbili.meron.shared.parseFolderListResponse
 import jp.nonbili.meron.shared.shouldBackgroundRefreshAccount
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -127,6 +127,10 @@ class AndroidBackgroundSyncWorker(
                 syncResponse.optJSONObject("result")?.optJSONObject("new_messages")?.let { detail ->
                     AndroidNotificationService.notifyNewMail(applicationContext, detail)
                 }
+                if (syncRequest.method == "mail.sync") {
+                    hasTransientNetworkError =
+                        syncNotifyFolders(account, id = index + 2L) || hasTransientNetworkError
+                }
             }
         }
 
@@ -134,14 +138,14 @@ class AndroidBackgroundSyncWorker(
             applicationContext,
             "background refresh done: refreshed=$refreshed skipped=$skipped failed=$failed hasTransient=$hasTransientNetworkError",
         )
-        val body = backgroundRefreshSummary(refreshed = refreshed, skipped = skipped, failed = failed)
+        AndroidUnreadWidget.refreshAsync(applicationContext)
         if (
             shouldNotifyRefreshComplete(
                 manualRun = inputData.getBoolean(KEY_MANUAL_RUN, false),
                 failed = failed,
             )
         ) {
-            AndroidNotificationService.notifyRefreshComplete(applicationContext, body)
+            AndroidNotificationService.notifyRefreshComplete(applicationContext, refreshed = refreshed, skipped = skipped, failed = failed)
         }
         return if (hasTransientNetworkError) {
             Log.i(TAG, "retrying background refresh due to transient network error")
@@ -150,7 +154,53 @@ class AndroidBackgroundSyncWorker(
             Result.success()
         }
     }
+
+    /**
+     * Sync the folders the user opted in to notifications, after the account's
+     * inbox sync refreshed the folder list. Failures are logged without failing
+     * the account, whose inbox did refresh. Returns whether one looked transient.
+     */
+    private fun syncNotifyFolders(
+        account: JSONObject,
+        id: Long,
+    ): Boolean {
+        val accountId = account.optString("id")
+        val listParams = JSONObject().put("account_id", accountId)
+        val folders =
+            parseFolderListResponse(MeronCoreNative.invokeJson(requestJson(id, "mail.folderList", listParams)))
+                .filter { it.notify && !it.name.equals("inbox", ignoreCase = true) }
+        var transient = false
+        for (folder in folders) {
+            val response =
+                JSONObject(MeronCoreNative.invokeJson(requestJson(id, "mail.sync", notifyFolderSyncParams(accountId, folder.name))))
+            if (response.has("error")) {
+                val errorMessage = response.optJSONObject("error")?.optString("message") ?: ""
+                logEvent(
+                    applicationContext,
+                    "mail.sync of an opted-in folder failed for account ${accountLabel(account)}: ${redactMessage(errorMessage)}",
+                    warning = true,
+                )
+                transient = transient || isTransientNetworkError(errorMessage)
+            } else {
+                response.optJSONObject("result")?.optJSONObject("new_messages")?.let { detail ->
+                    AndroidNotificationService.notifyNewMail(applicationContext, detail)
+                }
+            }
+        }
+        return transient
+    }
 }
+
+/** `mail.sync` params for one opted-in folder; the inbox sync already listed folders. */
+internal fun notifyFolderSyncParams(
+    accountId: String,
+    folder: String,
+): JSONObject =
+    JSONObject()
+        .put("account_id", accountId)
+        .put("folder_id", folder)
+        .put("limit", 50)
+        .put("folders", false)
 
 internal fun isTransientNetworkError(message: String): Boolean {
     val lower = message.lowercase()

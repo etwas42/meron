@@ -50,6 +50,7 @@ fn fetch_notification_bodies(
     data_dir: &str,
     engine: &std::sync::Arc<crate::engine::Engine>,
     account_id: &str,
+    folder: &str,
     headers: &[crate::imap::MessageHeader],
 ) {
     let uids: Vec<u32> = headers
@@ -61,7 +62,7 @@ fn fetch_notification_bodies(
     let result = crate::ffi::engine_block_on(async {
         tokio::time::timeout(
             std::time::Duration::from_secs(NOTIFY_PREVIEW_TIMEOUT_SECS),
-            crate::engine::fetch_bodies_for_uids(engine, account_id, "INBOX", &uids, media_root),
+            crate::engine::fetch_bodies_for_uids(engine, account_id, folder, &uids, media_root),
         )
         .await
         .map_err(|_| anyhow::anyhow!("timed out"))?
@@ -240,7 +241,18 @@ pub(crate) fn send_mobile_message(data_dir: &str, params: &Value) -> Result<Valu
         &message_id,
     ))?;
     let sent_bytes = raw.len();
-    match crate::ffi::engine_block_on(crate::engine::append_to_sent(&engine, &account_id, &raw)) {
+    finish_mobile_sent(&engine, &account_id, &raw);
+    Ok(json!({ "ok": true, "sent_bytes": sent_bytes }))
+}
+
+/// File the Sent copy of a message that just went out, shared by every
+/// mobile send path.
+fn finish_mobile_sent(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    account_id: &str,
+    raw: &[u8],
+) {
+    match crate::ffi::engine_block_on(crate::engine::append_to_sent(engine, account_id, raw)) {
         // Announced either way. The reload the send itself runs covers the
         // mailbox and the open thread, but not the Kanban board's columns, so a
         // copy already cached still leaves counts there a message short. One
@@ -248,11 +260,11 @@ pub(crate) fn send_mobile_message(data_dir: &str, params: &Value) -> Result<Valu
         // it is waited for first.
         Ok(copy) => {
             if copy.worth_awaiting() {
-                watch_for_sent_copy(&engine, &account_id, copy);
+                watch_for_sent_copy(engine, account_id, copy);
             } else {
                 crate::ffi::emit_event(
                     "mail.sentCopyCached",
-                    crate::engine::sent_copy_cached_detail(&account_id),
+                    crate::engine::sent_copy_cached_detail(account_id),
                 );
             }
         }
@@ -264,7 +276,30 @@ pub(crate) fn send_mobile_message(data_dir: &str, params: &Value) -> Result<Valu
             );
         }
     }
-    Ok(json!({ "ok": true, "sent_bytes": sent_bytes }))
+}
+
+/// Answer a calendar invitation from its card: see [`crate::calendar::respond`].
+pub(crate) fn respond_mobile_invite(data_dir: &str, params: &Value) -> Result<Value, String> {
+    let message = req_str(params, "message")?;
+    let thread_id = opt_str(params, "thread_id");
+    let response = req_str(params, "response")?;
+    let response = crate::calendar::Response::parse(&response)
+        .ok_or_else(|| format!("unknown invitation response: {response}"))?;
+    let engine = crate::ffi::engine_for(data_dir)?;
+    let responded = crate::ffi::engine_block_on(crate::calendar::respond(
+        &engine,
+        &message,
+        &thread_id,
+        response,
+        &std::path::PathBuf::from(data_dir).join("attachments"),
+    ))?;
+    finish_mobile_sent(&engine, &responded.account, &responded.raw);
+    crate::ffi::emit_event("calendar.changed", json!({ "method": "invite.respond" }));
+    Ok(json!({
+        "ok": true,
+        "response": response.as_str(),
+        "event_id": responded.event_id,
+    }))
 }
 
 pub(crate) fn save_mobile_draft(data_dir: &str, params: &Value) -> Result<Value, String> {
@@ -324,13 +359,24 @@ pub(crate) fn save_mobile_draft(data_dir: &str, params: &Value) -> Result<Value,
             }))?;
         // Read-only refresh, on its own session: the draft is already written
         // and must not be retried, and a draft we cannot parse must not make the
-        // save look like it failed.
-        let batch = crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
-            &account_id,
-            &drafts_folder,
-            DRAFT_SYNC_LIMIT,
-        ))?;
+        // save look like it failed — the caller would drop the id it was
+        // written under, leaving a copy nothing ever discards.
+        let saved = json!({ "ok": true, "draft_id": draft_id, "saved_bytes": saved_bytes });
+        let refresh = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_written_folder(
+                    &engine,
+                    &account_id,
+                    &drafts_folder,
+                    DRAFT_SYNC_LIMIT,
+                )
+                .await,
+            )
+        })?;
+        let Some(refresh) = refresh else {
+            return Ok(saved);
+        };
+        let batch = &refresh.batch;
         store::upsert_messages(&conn, &account_id, &drafts_folder, &batch.messages)
             .map_err(|err| err.to_string())?;
         let keep_uid = batch
@@ -357,7 +403,7 @@ pub(crate) fn save_mobile_draft(data_dir: &str, params: &Value) -> Result<Value,
             batch.uid_next,
         )
         .map_err(|err| err.to_string())?;
-        Ok(json!({ "ok": true, "draft_id": draft_id, "saved_bytes": saved_bytes }))
+        Ok(saved)
     })
 }
 
@@ -374,17 +420,36 @@ pub(crate) fn discard_mobile_draft(data_dir: &str, params: &Value) -> Result<Val
             return Err(format!("account needs reconnect: {account_id}"));
         }
         let local_draft_id = draft_id.clone();
+        // The LIST that finds the folder changes nothing and is where a dead
+        // pooled session gives out — likely right after a long send — so it
+        // preflights the delete that follows, as the desktop discard does.
+        let drafts_slot: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let preflight_slot = std::sync::Arc::clone(&drafts_slot);
         let (drafts, deleted) =
-            crate::ffi::engine_block_on(engine.with_write_session(&account_id, move |session| {
-                let draft_id = draft_id.clone();
-                Box::pin(async move {
-                    let drafts = imap::find_drafts_folder(session)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("no Drafts folder found"))?;
-                    let deleted = imap::discard_draft(session, &drafts, &draft_id).await?;
-                    anyhow::Ok((drafts, deleted))
-                })
-            }))?;
+            crate::ffi::engine_block_on(engine.with_preflighted_write_session(
+                &account_id,
+                move |session| {
+                    let slot = std::sync::Arc::clone(&preflight_slot);
+                    Box::pin(async move {
+                        let drafts = imap::find_drafts_folder(session)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("no Drafts folder found"))?;
+                        *slot.lock().unwrap() = Some(drafts);
+                        anyhow::Ok(())
+                    })
+                },
+                move |session| {
+                    let draft_id = draft_id.clone();
+                    let slot = std::sync::Arc::clone(&drafts_slot);
+                    Box::pin(async move {
+                        let drafts = { slot.lock().unwrap().clone() }
+                            .ok_or_else(|| anyhow::anyhow!("no Drafts folder found"))?;
+                        let deleted = imap::discard_draft(session, &drafts, &draft_id).await?;
+                        anyhow::Ok((drafts, deleted))
+                    })
+                },
+            ))?;
         store::delete_draft_copies(&conn, &account_id, &drafts, &local_draft_id, None)
             .map_err(|err| err.to_string())?;
         Ok(json!({ "ok": true, "deleted": deleted, "permanent": true }))
@@ -434,8 +499,6 @@ pub(crate) fn sync_mobile_mail(data_dir: &str, params: &Value) -> Result<Value, 
         return Err(format!("account needs reconnect: {account_id}"));
     }
     let creds_ms = started.elapsed().as_millis();
-    let is_inbox = folder.eq_ignore_ascii_case("INBOX");
-
     let folders_started = std::time::Instant::now();
     let folders_count = if sync_folders {
         crate::ffi::engine_block_on(crate::engine::sync_folders(&engine, &account_id))?.len()
@@ -451,19 +514,16 @@ pub(crate) fn sync_mobile_mail(data_dir: &str, params: &Value) -> Result<Value, 
         limit,
     ))?;
     let messages_ms = messages_started.elapsed().as_millis();
-    let new_messages = if is_inbox {
-        (!synced.arrivals.is_empty())
-            .then_some(synced.arrivals)
-            .and_then(|headers| {
-                // Fetch the arrivals' own bodies before building the detail: the
-                // notification shows a snippet of each, and the general prefetch in
-                // the sync tail runs too late (and may be deferred entirely).
-                fetch_notification_bodies(data_dir, &engine, &account_id, &headers);
-                crate::ffi::mobile_new_messages_detail(data_dir, &account_id, &headers)
-            })
-    } else {
-        None
-    };
+    // Arrivals are only reported for INBOX and folders opted in to notifications.
+    let new_messages = (!synced.arrivals.is_empty())
+        .then_some(synced.arrivals)
+        .and_then(|headers| {
+            // Fetch the arrivals' own bodies before building the detail: the
+            // notification shows a snippet of each, and the general prefetch in
+            // the sync tail runs too late (and may be deferred entirely).
+            fetch_notification_bodies(data_dir, &engine, &account_id, &folder, &headers);
+            crate::ffi::mobile_new_messages_detail(data_dir, &account_id, &folder, &headers)
+        });
     crate::mlog!(
         crate::log::Level::Info,
         "mail.sync",
@@ -492,6 +552,9 @@ pub(crate) fn list_mobile_folders(data_dir: &str, params: &Value) -> Result<Valu
             return Ok(json!({ "folders": folders }));
         }
         let folders = store::get_folders(&conn, &account_id).map_err(|err| err.to_string())?;
+        let live = store::notify_folder_plan(&conn, &account_id)
+            .map_err(|err| err.to_string())?
+            .live;
         let folders = folders
             .into_iter()
             .map(|folder| {
@@ -512,11 +575,39 @@ pub(crate) fn list_mobile_folders(data_dir: &str, params: &Value) -> Result<Valu
                     "role": role,
                     "delimiter": folder.delimiter.unwrap_or_default(),
                     "unread": folder.unread,
+                    "notify": folder.notify,
+                    // Opted in and holding one of the account's IDLE slots;
+                    // the host's live push watches these, core polls the rest.
+                    "notify_live": live.contains(&folder.name),
                 })
             })
             .collect::<Vec<_>>();
         Ok(json!({ "folders": folders }))
     })
+}
+
+/// Opt a folder in to (or out of) background sync and new-mail notifications.
+/// Answers with the refreshed folder list, like the other folder mutations.
+pub(crate) fn set_mobile_folder_notify(data_dir: &str, params: &Value) -> Result<Value, String> {
+    let account_id = req_str(params, "account_id")?;
+    let folder = canon_folder(&req_str(params, "folder_id")?);
+    let enabled = params
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "enabled is required".to_string())?;
+    with_mobile_db(data_dir, |conn| {
+        if is_rss_account(&conn, &account_id)? {
+            return Err("RSS accounts do not support folders".to_string());
+        }
+        if !store::set_folder_notify(&conn, &account_id, &folder, enabled)
+            .map_err(|err| err.to_string())?
+        {
+            return Err(format!("Folder not found: {folder}"));
+        }
+        Ok(json!({ "ok": true }))
+    })?;
+    crate::ffi::sync_foreground_notify_watch(data_dir, &account_id, &folder, enabled);
+    list_mobile_folders(data_dir, params)
 }
 
 pub(crate) fn create_mobile_folder(data_dir: &str, params: &Value) -> Result<Value, String> {
@@ -604,6 +695,13 @@ pub(crate) fn delete_mobile_folder(data_dir: &str, params: &Value) -> Result<Val
         for target in &removed {
             deleted +=
                 store::delete_folder(&conn, &account_id, target).map_err(|err| err.to_string())?;
+            // Nothing is left to watch; a watcher would only fail to SELECT
+            // the mailbox and reconnect forever.
+            crate::ffi::forget_deleted_folder_watch(&account_id, target);
+        }
+        // A deleted opted-in folder may have freed a live slot.
+        if !removed.is_empty() {
+            crate::ffi::start_live_notify_watches(data_dir, &account_id);
         }
         let mut response = list_mobile_folders(data_dir, params)?;
         response["ok"] = json!(warning.is_none());
@@ -622,6 +720,31 @@ pub(crate) fn list_mobile_threads(data_dir: &str, params: &Value) -> Result<Valu
     if account_id == "unified" {
         return list_mobile_unified_threads(data_dir, params);
     }
+    // The attachments toggle narrows a page after it is read, so a page can come
+    // back empty while older matches remain: read on through a few such pages
+    // (see `ThreadListQuery::next_attachment_cursor`).
+    let mut params = params.clone();
+    let mut hops = 0;
+    loop {
+        let page = list_mobile_account_threads(data_dir, &params, &account_id)?;
+        let request = thread_list::ThreadListQuery::from_params(&params, "folder_id");
+        match request.next_attachment_cursor(&page, hops) {
+            Some(cursor) => {
+                params["before_cursor"] = Value::String(cursor);
+                hops += 1;
+            }
+            None => return Ok(page),
+        }
+    }
+}
+
+/// One page of a single account's mailbox view.
+fn list_mobile_account_threads(
+    data_dir: &str,
+    params: &Value,
+    account_id: &str,
+) -> Result<Value, String> {
+    let account_id = account_id.to_string();
     let request = thread_list::ThreadListQuery::from_params(params, "folder_id");
     let folder_id = request.folder.clone();
     let limit = request.limit;
@@ -644,18 +767,19 @@ pub(crate) fn list_mobile_threads(data_dir: &str, params: &Value) -> Result<Valu
     // Mobile is cache-first: unlike desktop, starred reads the flags the last
     // sync stored so the list still answers offline, and a failed live search
     // falls back to the cached one.
+    let mut search_incomplete = false;
     let (messages, next_cursor) = match request.source() {
         thread_list::MailSource::Starred => (
             get_cached_mobile_starred(data_dir, &account_id, &folder_id, limit)?,
             None,
         ),
-        thread_list::MailSource::Recent { unread_only } => get_cached_mobile_mail_page(
+        thread_list::MailSource::Recent { filter } => get_cached_mobile_mail_page(
             data_dir,
             &account_id,
             &folder_id,
             limit,
             request.before_cursor,
-            unread_only,
+            filter,
         )?,
         thread_list::MailSource::Search => {
             // One folder list for both halves: the live search and the offline
@@ -663,32 +787,63 @@ pub(crate) fn list_mobile_threads(data_dir: &str, params: &Value) -> Result<Valu
             // would silently drop the Sent hits from the results.
             let folders = mobile_search_folders(data_dir, &account_id, &folder_id)?;
             // Mobile renders indexed local hits first, then repeats the first
-            // page with refresh=true off the UI thread. Snapshot-backed later
-            // pages still go through the engine, where they are local DB reads.
-            let live = refresh || request.search_before_cursor.as_ref().is_some();
-            let (messages, next_cursor) = if live {
+            // page with refresh=true off the UI thread. Later pages are local
+            // reads (the live snapshot, else cached keyset order), served
+            // straight from the store so they need neither the engine nor valid
+            // credentials — a paused account keeps paging its snapshot.
+            if let Some(cursor) = request.search_before_cursor.as_ref() {
+                let page = match continue_mobile_search(
+                    data_dir,
+                    &account_id,
+                    &folders,
+                    &request.query,
+                    limit,
+                    cursor,
+                )? {
+                    crate::engine::SearchContinuation::Page(page) => page,
+                    // The page reaches server hits the first page left for
+                    // later; fetching them needs the engine. Offline, show
+                    // what is here and say the list is incomplete.
+                    crate::engine::SearchContinuation::NeedsServer(partial) => {
+                        search_live_mobile_mail_messages(
+                            data_dir,
+                            &account_id,
+                            &folders,
+                            &request.query,
+                            limit,
+                            Some(cursor),
+                        )
+                        .unwrap_or(partial)
+                    }
+                };
+                search_incomplete = page.incomplete;
+                (page.messages, page.next_cursor)
+            } else if refresh {
                 match search_live_mobile_mail_messages(
                     data_dir,
                     &account_id,
                     &folders,
                     &request.query,
                     limit,
-                    request.search_before_cursor.as_ref(),
+                    None,
                 ) {
-                    Ok(page) => (page.messages, page.next_cursor),
+                    Ok(page) => {
+                        search_incomplete = page.incomplete;
+                        (page.messages, page.next_cursor)
+                    }
                     Err(err) => {
                         crate::mlog!(
                             crate::log::Level::Warn,
                             "mail.search",
                             "live search failed for account={account_id} folder={folder_id}: {err}"
                         );
+                        search_incomplete = true;
                         let messages = search_cached_mobile_mail_messages(
                             data_dir,
                             &account_id,
                             &folders,
                             &request.query,
                             limit,
-                            request.search_before_cursor.as_ref(),
                         )?;
                         let next_cursor = store::search_next_cursor(&messages, limit, 0);
                         (messages, next_cursor)
@@ -701,16 +856,14 @@ pub(crate) fn list_mobile_threads(data_dir: &str, params: &Value) -> Result<Valu
                     &folders,
                     &request.query,
                     limit,
-                    None,
                 )?;
                 let next_cursor = store::search_next_cursor(&messages, limit, 0);
                 (messages, next_cursor)
-            };
-            (messages, next_cursor)
+            }
         }
     };
     with_mobile_db(data_dir, |conn| {
-        thread_list::mail_page(
+        let mut page = thread_list::mail_page(
             &conn,
             &account_id,
             &folder_id,
@@ -719,11 +872,19 @@ pub(crate) fn list_mobile_threads(data_dir: &str, params: &Value) -> Result<Valu
             // A mobile mailbox view is always a thread list.
             true,
         )
-        .map_err(|err| format!("{err:#}"))
+        .map_err(|err| format!("{err:#}"))?;
+        if search_incomplete {
+            page.as_object_mut()
+                .unwrap()
+                .insert("search_incomplete".to_string(), Value::Bool(true));
+        }
+        request.retain_attachment_threads(&mut page);
+        Ok(page)
     })
 }
 
 fn list_mobile_unified_threads(data_dir: &str, params: &Value) -> Result<Value, String> {
+    let limit = thread_list::ThreadListQuery::from_params(params, "folder_id").limit;
     let account_cursors = params
         .get("before_cursor")
         .and_then(Value::as_str)
@@ -788,7 +949,11 @@ fn list_mobile_unified_threads(data_dir: &str, params: &Value) -> Result<Value, 
             .ok_or_else(|| "params must be an object".to_string())?;
         object.insert("account_id".to_string(), Value::String(account_id.clone()));
         object.insert("folder_id".to_string(), Value::String(folder));
-        match account_cursors.get(&account_id) {
+        let from = account_cursors
+            .get(&account_id)
+            .cloned()
+            .unwrap_or_default();
+        match &from.cursor {
             Some(cursor) => {
                 object.insert("before_cursor".to_string(), Value::String(cursor.clone()));
             }
@@ -796,9 +961,15 @@ fn list_mobile_unified_threads(data_dir: &str, params: &Value) -> Result<Value, 
                 object.remove("before_cursor");
             }
         }
-        pages.push((account_id, list_mobile_threads(data_dir, &account_params)));
+        object.insert("limit".to_string(), json!(from.fetch_limit(limit)));
+        let result = list_mobile_threads(data_dir, &account_params);
+        pages.push(crate::unified::AccountPage {
+            account_id,
+            from,
+            result,
+        });
     }
-    Ok(crate::unified::merge_pages(pages, "threads"))
+    Ok(crate::unified::merge_pages(pages, "threads", limit))
 }
 
 fn open_mobile_db(data_dir: &str) -> Result<rusqlite::Connection, String> {
@@ -820,18 +991,11 @@ fn get_cached_mobile_mail_page(
     folder_id: &str,
     limit: u32,
     before_cursor: Option<(i64, u32)>,
-    unread_only: bool,
+    filter: store::RecentFilter,
 ) -> Result<(Vec<MessageHeader>, Option<String>), String> {
     let conn = open_mobile_db(data_dir)?;
-    store::get_recent_page(
-        &conn,
-        account_id,
-        folder_id,
-        limit,
-        before_cursor,
-        unread_only,
-    )
-    .map_err(|err| err.to_string())
+    store::get_recent_page(&conn, account_id, folder_id, limit, before_cursor, filter)
+        .map_err(|err| err.to_string())
 }
 
 fn get_cached_mobile_starred(
@@ -861,11 +1025,23 @@ fn search_cached_mobile_mail_messages(
     folders: &[String],
     query: &str,
     limit: u32,
-    before_cursor: Option<&crate::thread_list::SearchCursor>,
 ) -> Result<Vec<MessageHeader>, String> {
     let conn = open_mobile_db(data_dir)?;
-    store::search_messages_in_folders(&conn, account_id, folders, query, limit, before_cursor)
+    store::search_messages_in_folders(&conn, account_id, folders, query, limit, None)
         .map_err(|err| err.to_string())
+}
+
+fn continue_mobile_search(
+    data_dir: &str,
+    account_id: &str,
+    folders: &[String],
+    query: &str,
+    limit: u32,
+    cursor: &crate::thread_list::SearchCursor,
+) -> Result<crate::engine::SearchContinuation, String> {
+    let conn = open_mobile_db(data_dir)?;
+    crate::engine::continue_search_page(&conn, account_id, folders, query, limit, cursor)
+        .map_err(|err| format!("{err:#}"))
 }
 
 fn search_live_mobile_mail_messages(
@@ -939,9 +1115,6 @@ pub(crate) fn read_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
                 .unwrap_or(false),
             before_cursor: before_cursor.as_deref(),
             media_root: std::path::PathBuf::from(data_dir).join("attachments"),
-            // The mobile WebView applies the remote-image policy at render
-            // time and wants the raw stored HTML.
-            bake_html_policy: false,
         },
         Some(on_bodies_fetched),
     ))
@@ -963,6 +1136,10 @@ pub(crate) fn list_mobile_starred_items(data_dir: &str, params: &Value) -> Resul
                 .get("filter")
                 .and_then(Value::as_str)
                 .unwrap_or("all"),
+            params
+                .get("attachments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             limit as usize,
             params.get("before_cursor").and_then(Value::as_str),
         ))
@@ -983,12 +1160,49 @@ pub(crate) fn delete_mobile_thread(data_dir: &str, params: &Value) -> Result<Val
         if account_needs_reconnect(&creds) {
             return Err(format!("account needs reconnect: {}", parsed.account));
         }
+        let cached_ids = store::cached_message_ids(&conn, &parsed.account, &parsed.folder, &uids)
+            .map_err(|err| err.to_string())?;
+        let moved_ids = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::moved_message_ids(
+                    &engine,
+                    &parsed.account,
+                    &parsed.folder,
+                    &uids,
+                    cached_ids,
+                )
+                .await,
+            )
+        })?;
         let delete_result = crate::ffi::engine_block_on(crate::engine::delete_to_trash(
             &engine,
             &parsed.account,
             &parsed.folder,
             &uids,
         ))?;
+        // Undo moves exactly these copies back out of Trash.
+        let trash_copies = match &delete_result {
+            Some(trashed) => {
+                let copies = crate::ffi::engine_block_on(async {
+                    anyhow::Ok(
+                        crate::engine::refresh_moved_copies(
+                            &engine,
+                            &parsed.account,
+                            &trashed.folder,
+                            uids.len(),
+                            trashed.uid_next_before,
+                            moved_ids.as_deref(),
+                        )
+                        .await,
+                    )
+                })?;
+                copies
+                    .store(&conn, &parsed.account, &trashed.folder)
+                    .map_err(|err| err.to_string())?;
+                copies.uids
+            }
+            None => Vec::new(),
+        };
         // Discarding a draft must also drop hidden local copies sharing its
         // Message-ID (stale autosaves the pane deduped away), or the thread
         // card keeps its has_draft badge until the next full sync.
@@ -1015,10 +1229,16 @@ pub(crate) fn delete_mobile_thread(data_dir: &str, params: &Value) -> Result<Val
                 None,
                 true,
             ),
-            Some(trash) => {
+            Some(crate::engine::Trashed { folder: trash, .. }) => {
                 let moved_thread_id = format_thread_id(&parsed.account, &trash, &parsed.thread_key);
                 crate::mail_model::mutation_result(
-                    json!({ "ok": true, "deleted": deleted, "trash": trash, "thread_id": moved_thread_id }),
+                    json!({
+                        "ok": true,
+                        "deleted": deleted,
+                        "trash": trash,
+                        "thread_id": moved_thread_id,
+                        "target_uids": trash_copies,
+                    }),
                     &conn,
                     &parsed.account,
                     &thread_id,
@@ -1061,41 +1281,50 @@ pub(crate) fn archive_mobile_thread(data_dir: &str, params: &Value) -> Result<Va
         if account_needs_reconnect(&creds) {
             return Err(format!("account needs reconnect: {}", parsed.account));
         }
+        let cached_ids = store::cached_message_ids(&conn, &parsed.account, &parsed.folder, &uids)
+            .map_err(|err| err.to_string())?;
+        let moved_ids = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::moved_message_ids(
+                    &engine,
+                    &parsed.account,
+                    &parsed.folder,
+                    &uids,
+                    cached_ids,
+                )
+                .await,
+            )
+        })?;
         let op_folder = parsed.folder.clone();
         let op_target = target_folder.clone();
         let op_uids = uids.clone();
-        crate::ffi::engine_block_on(engine.with_write_session(&parsed.account, move |session| {
-            let source = op_folder.clone();
-            let target = op_target.clone();
-            let uids = op_uids.clone();
-            Box::pin(async move { imap::move_to_folder(session, &source, &target, &uids).await })
-        }))?;
-        // Read-only refresh, on its own session: the MOVE has landed and must
-        // not be retried, and a message in the target folder that we cannot
-        // parse must not sink the whole move.
-        let target_batch = crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
+        let uid_next_before = crate::ffi::engine_block_on(engine.with_write_session(
             &parsed.account,
-            &target_folder,
-            50.max(uids.len() as u32),
+            move |session| {
+                let source = op_folder.clone();
+                let target = op_target.clone();
+                let uids = op_uids.clone();
+                Box::pin(
+                    async move { imap::move_to_folder(session, &source, &target, &uids).await },
+                )
+            },
         ))?;
-        store::ensure_folder(&conn, &parsed.account, &target_folder)
+        let copies = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_moved_copies(
+                    &engine,
+                    &parsed.account,
+                    &target_folder,
+                    uids.len(),
+                    uid_next_before,
+                    moved_ids.as_deref(),
+                )
+                .await,
+            )
+        })?;
+        copies
+            .store(&conn, &parsed.account, &target_folder)
             .map_err(|err| err.to_string())?;
-        store::upsert_messages(
-            &conn,
-            &parsed.account,
-            &target_folder,
-            &target_batch.messages,
-        )
-        .map_err(|err| err.to_string())?;
-        store::set_folder_state(
-            &conn,
-            &parsed.account,
-            &target_folder,
-            target_batch.uidvalidity,
-            target_batch.uid_next,
-        )
-        .map_err(|err| err.to_string())?;
         store::move_messages_by_uid(
             &conn,
             &parsed.account,
@@ -1114,6 +1343,7 @@ pub(crate) fn archive_mobile_thread(data_dir: &str, params: &Value) -> Result<Va
                 "moved": moved,
                 "folder": target_folder,
                 "thread_id": moved_thread_id,
+                "target_uids": copies.uids,
             }),
             &conn,
             &parsed.account,
@@ -1132,6 +1362,33 @@ pub(crate) fn move_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
     let thread_id = req_str(params, "thread_id")?;
     let target_folder = canon_folder(&req_str(params, "target_folder_id")?);
     let parsed = parse_thread_id(&thread_id).ok_or_else(|| "invalid thread_id".to_string())?;
+    let target_account = params
+        .get("target_account_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&parsed.account);
+    if target_account != parsed.account {
+        let engine = crate::ffi::engine_for(data_dir)?;
+        return with_mobile_db(data_dir, |conn| {
+            let uids = requested_mobile_uids(&conn, &parsed, params)?;
+            if !uids.is_empty() {
+                for account in [parsed.account.as_str(), target_account] {
+                    let creds = load_mobile_account_creds(&conn, account)?;
+                    if account_needs_reconnect(&creds) {
+                        return Err(format!("account needs reconnect: {account}"));
+                    }
+                }
+            }
+            crate::ffi::engine_block_on(crate::engine::move_between_accounts(
+                &engine,
+                &parsed.account,
+                &parsed.folder,
+                &thread_id,
+                target_account,
+                &target_folder,
+                &uids,
+            ))
+        });
+    }
     if parsed.folder == target_folder {
         return Ok(
             json!({ "ok": true, "moved": 0, "folder": target_folder, "thread_id": thread_id }),
@@ -1139,7 +1396,7 @@ pub(crate) fn move_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
     }
     let engine = crate::ffi::engine_for(data_dir)?;
     with_mobile_db(data_dir, |conn| {
-        let uids = cached_thread_uids(&conn, &parsed)?;
+        let uids = requested_mobile_uids(&conn, &parsed, params)?;
         if uids.is_empty() {
             return Ok(
                 json!({ "ok": true, "moved": 0, "folder": target_folder, "thread_id": thread_id }),
@@ -1149,41 +1406,50 @@ pub(crate) fn move_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
         if account_needs_reconnect(&creds) {
             return Err(format!("account needs reconnect: {}", parsed.account));
         }
+        let cached_ids = store::cached_message_ids(&conn, &parsed.account, &parsed.folder, &uids)
+            .map_err(|err| err.to_string())?;
+        let moved_ids = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::moved_message_ids(
+                    &engine,
+                    &parsed.account,
+                    &parsed.folder,
+                    &uids,
+                    cached_ids,
+                )
+                .await,
+            )
+        })?;
         let op_folder = parsed.folder.clone();
         let op_target = target_folder.clone();
         let op_uids = uids.clone();
-        crate::ffi::engine_block_on(engine.with_write_session(&parsed.account, move |session| {
-            let source = op_folder.clone();
-            let target = op_target.clone();
-            let uids = op_uids.clone();
-            Box::pin(async move { imap::move_to_folder(session, &source, &target, &uids).await })
-        }))?;
-        // Read-only refresh, on its own session: the MOVE has landed and must
-        // not be retried, and a message in the target folder that we cannot
-        // parse must not sink the whole move.
-        let target_batch = crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
+        let uid_next_before = crate::ffi::engine_block_on(engine.with_write_session(
             &parsed.account,
-            &target_folder,
-            50.max(uids.len() as u32),
+            move |session| {
+                let source = op_folder.clone();
+                let target = op_target.clone();
+                let uids = op_uids.clone();
+                Box::pin(
+                    async move { imap::move_to_folder(session, &source, &target, &uids).await },
+                )
+            },
         ))?;
-        store::ensure_folder(&conn, &parsed.account, &target_folder)
+        let copies = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_moved_copies(
+                    &engine,
+                    &parsed.account,
+                    &target_folder,
+                    uids.len(),
+                    uid_next_before,
+                    moved_ids.as_deref(),
+                )
+                .await,
+            )
+        })?;
+        copies
+            .store(&conn, &parsed.account, &target_folder)
             .map_err(|err| err.to_string())?;
-        store::upsert_messages(
-            &conn,
-            &parsed.account,
-            &target_folder,
-            &target_batch.messages,
-        )
-        .map_err(|err| err.to_string())?;
-        store::set_folder_state(
-            &conn,
-            &parsed.account,
-            &target_folder,
-            target_batch.uidvalidity,
-            target_batch.uid_next,
-        )
-        .map_err(|err| err.to_string())?;
         store::move_messages_by_uid(
             &conn,
             &parsed.account,
@@ -1201,6 +1467,7 @@ pub(crate) fn move_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
                 "moved": moved,
                 "folder": target_folder,
                 "thread_id": moved_thread_id,
+                "target_uids": copies.uids,
             }),
             &conn,
             &parsed.account,
@@ -1257,20 +1524,33 @@ pub(crate) fn copy_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
         crate::ffi::engine_block_on(engine.with_write_session(&target_account, move |session| {
             let target = target_folder_op.clone();
             let raw_messages = raw_messages.clone();
-            Box::pin(async move {
-                for message in &raw_messages {
-                    imap::append_copied_message(session, &target, message).await?;
-                }
-                anyhow::Ok(())
-            })
+            Box::pin(
+                async move { imap::append_copied_messages(session, &target, &raw_messages).await },
+            )
         }))?;
         // Read-only refresh, on its own session; see the move handlers above.
-        let batch = crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
-            &target_account,
-            &target_folder,
-            50.max(copied as u32),
-        ))?;
+        let copied_result = json!({
+            "ok": true,
+            "copied": copied,
+            "source_folder": parsed.folder,
+            "target_account": target_account,
+            "target_folder": target_folder,
+        });
+        let refresh = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_written_folder(
+                    &engine,
+                    &target_account,
+                    &target_folder,
+                    50.max(copied as u32),
+                )
+                .await,
+            )
+        })?;
+        let Some(refresh) = refresh else {
+            return Ok(copied_result);
+        };
+        let batch = &refresh.batch;
         store::ensure_folder(&conn, &target_account, &target_folder)
             .map_err(|err| err.to_string())?;
         store::upsert_messages(&conn, &target_account, &target_folder, &batch.messages)
@@ -1283,13 +1563,7 @@ pub(crate) fn copy_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
             batch.uid_next,
         )
         .map_err(|err| err.to_string())?;
-        Ok(json!({
-            "ok": true,
-            "copied": copied,
-            "source_folder": parsed.folder,
-            "target_account": target_account,
-            "target_folder": target_folder,
-        }))
+        Ok(copied_result)
     })
 }
 
@@ -1303,42 +1577,66 @@ pub(crate) fn mark_mobile_thread_read(data_dir: &str, params: &Value) -> Result<
         .ok_or_else(|| "invalid thread_id".to_string())?;
     let engine = crate::ffi::engine_for(data_dir)?;
     with_mobile_db(data_dir, |conn| {
-        let uids = if !seen && !has_requested_mobile_message_ids(params) && parsed.uid.is_none() {
-            // Marking a whole thread unread flags its newest message only.
-            store::newest_thread_uids(
+        let explicit_ids = has_requested_mobile_message_ids(params);
+        // Marking a whole thread read reaches every folder it spans and only the
+        // messages still unread; everything else acts on the requested folder.
+        let whole_thread_read = seen && !explicit_ids && parsed.uid.is_none();
+        let by_folder = if whole_thread_read {
+            store::thread_uids_by_folder(
                 &conn,
                 &parsed.account,
                 &parsed.folder,
                 &parsed.thread_key,
                 parsed.subject_filter.as_deref(),
+                true,
             )
             .map_err(|err| err.to_string())?
         } else {
-            requested_mobile_uids(&conn, &parsed, params)?
+            let uids = if !seen && !explicit_ids && parsed.uid.is_none() {
+                // Marking a whole thread unread flags its newest message only.
+                store::newest_thread_uids(
+                    &conn,
+                    &parsed.account,
+                    &parsed.folder,
+                    &parsed.thread_key,
+                    parsed.subject_filter.as_deref(),
+                )
+                .map_err(|err| err.to_string())?
+            } else {
+                requested_mobile_uids(&conn, &parsed, params)?
+            };
+            std::collections::BTreeMap::from([(parsed.folder.clone(), uids)])
         };
-        update_mobile_read_state(&conn, &parsed, params, &uids, seen)?;
-        if !uids.is_empty() {
+        // The server first, the store once it took the change — as markStarred
+        // and markAllRead do. A store marked ahead of a failed write keeps the
+        // messages read on the next reload although the server still has them
+        // unread, and leaves a retry nothing to send.
+        if by_folder.values().any(|uids| !uids.is_empty()) {
             let creds = load_mobile_account_creds(&conn, &parsed.account)?;
             if account_needs_reconnect(&creds) {
                 return Err(format!("account needs reconnect: {}", parsed.account));
             }
-            let folder = parsed.folder.clone();
-            crate::ffi::engine_block_on(engine.with_preflighted_write_session(
+            crate::ffi::engine_block_on(engine.store_seen_by_folder(
                 &parsed.account,
-                move |session| {
-                    let folder = folder.clone();
-                    Box::pin(async move { imap::prepare_flag_update(session, &folder).await })
-                },
-                move |session| {
-                    let uids = uids.clone();
-                    Box::pin(async move {
-                        imap::store_seen(session, &uids, seen).await?;
-                        anyhow::Ok(())
-                    })
-                },
+                &by_folder,
+                seen,
             ))?;
         }
-        crate::mail_model::mutation_result(
+        for (folder, uids) in by_folder
+            .iter()
+            .filter(|(folder, _)| **folder != parsed.folder)
+        {
+            for uid in uids {
+                store::update_message_seen(&conn, &parsed.account, folder, *uid, seen)
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        let own_uids = by_folder
+            .get(&parsed.folder)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        update_mobile_read_state(&conn, &parsed, params, own_uids, seen)?;
+        let mut result = crate::mail_model::mutation_result(
             json!({ "ok": true }),
             &conn,
             &parsed.account,
@@ -1349,7 +1647,15 @@ pub(crate) fn mark_mobile_thread_read(data_dir: &str, params: &Value) -> Result<
             None,
             false,
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+        crate::mail_model::add_folder_unreads(
+            &mut result,
+            &conn,
+            &parsed.account,
+            by_folder.keys(),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(result)
     })
 }
 
@@ -1455,7 +1761,7 @@ pub(crate) fn mark_mobile_folder_all_read(data_dir: &str, params: &Value) -> Res
                 return Err(format!("account needs reconnect: {account_id}"));
             }
             let select_folder = folder.clone();
-            crate::ffi::engine_block_on(engine.with_preflighted_write_session(
+            crate::ffi::engine_block_on(engine.with_flag_write_session(
                 &account_id,
                 move |session| {
                     let folder = select_folder.clone();

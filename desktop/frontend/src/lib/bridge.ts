@@ -8,3 +8,28 @@ export async function invoke<T>(command: string, payload: unknown = {}): Promise
   }
   return wailsApp.Invoke(command, payload)
 }
+
+/** Whether `error` is the Go bridge giving up on a slow core (`sidecar.go`),
+ *  as opposed to an answer from the core. */
+export function isSidecarTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /^sidecar \S+ timeout after /.test(message)
+}
+
+/**
+ * `invoke` for a read the app cannot start without, retried while the core is
+ * too busy to answer in time — at startup it may still be opening or migrating
+ * the store. Only timeouts are retried; the core's own errors are returned
+ * as-is. Callers must only pass requests that are safe to send twice, since a
+ * timed-out request may still be answered (and discarded) later.
+ */
+export async function invokeRetryingTimeout<T>(command: string, payload: unknown = {}, attempts = 6): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await invoke<T>(command, payload)
+    } catch (error) {
+      if (attempt >= attempts || !isSidecarTimeout(error)) throw error
+      console.warn(`${command} timed out (attempt ${attempt}/${attempts}); retrying`)
+    }
+  }
+}

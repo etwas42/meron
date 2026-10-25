@@ -44,17 +44,33 @@ object MobileCommand {
     const val FolderList = "mail.folderList"
     const val FolderCreate = "mail.folderCreate"
     const val FolderDelete = "mail.folderDelete"
+    const val FolderSetNotify = "mail.folderSetNotify"
     const val ContactSuggest = "mail.suggestContacts"
     const val ThreadList = "mail.threadList"
     const val StarredItems = "mail.starredItems"
     const val AllocateIdentity = "mail.allocateIdentity"
     const val ThreadRead = "mail.threadRead"
     const val AttachmentRead = "mail.attachmentRead"
+    const val AvatarResolve = "avatar.resolve"
     const val ChangelogFetch = "changelog.fetch"
+    const val SearchParse = "search.parse"
+    const val SearchBuild = "search.build"
     const val StorageUsage = "storage.usage"
     const val StorageClearCache = "storage.clearCache"
     const val Sync = "mail.sync"
     const val Send = "mail.send"
+
+    // Answer a calendar invitation; the desktop sidecar serves the same name.
+    const val InviteRespond = "invite.respond"
+
+    // Optional local calendar, served under the same names on desktop.
+    const val CalendarEvents = "calendar.events"
+    const val CalendarCreate = "calendar.create"
+    const val CalendarUpdate = "calendar.update"
+    const val CalendarDelete = "calendar.delete"
+    const val CalendarRestore = "calendar.restore"
+    const val InviteRemoveFromCalendar = "invite.removeFromCalendar"
+    const val InviteAddToCalendar = "invite.addToCalendar"
     const val SaveDraft = "mail.saveDraft"
     const val DiscardDraft = "mail.discardDraft"
     const val Archive = "mail.archive"
@@ -69,6 +85,49 @@ object MobileCommand {
     const val RssThread = "rss.thread"
     const val RssMarkRead = "rss.markRead"
     const val RssMarkStarred = "rss.markStarred"
+
+    // Optional Tasks surface. The desktop sidecar serves these under exactly the
+    // same names, so a change on one client is a change for both.
+    const val TaskLists = "tasks.lists"
+    const val TaskListCreate = "tasks.listCreate"
+    const val TaskListRename = "tasks.listRename"
+    const val TaskListDelete = "tasks.listDelete"
+    const val TaskItems = "tasks.items"
+    const val TaskForThread = "tasks.forThread"
+    const val TaskCreate = "tasks.create"
+    const val TaskUpdate = "tasks.update"
+    const val TaskSetDone = "tasks.setDone"
+    const val TaskDelete = "tasks.delete"
+    const val TaskReorder = "tasks.reorder"
+    const val TaskClearCompleted = "tasks.clearCompleted"
+    const val TaskRestore = "tasks.restore"
+}
+
+/**
+ * The search options form, as the core's `search.parse` reads a query and
+ * `search.build` writes it back. Dates are `yyyy-mm-dd`, or empty.
+ */
+data class SearchFields(
+    val from: String = "",
+    val to: String = "",
+    val subject: String = "",
+    val words: String = "",
+    val after: String = "",
+    val before: String = "",
+    val unread: Boolean = false,
+    val starred: Boolean = false,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "from" to from.jsonString(),
+            "to" to to.jsonString(),
+            "subject" to subject.jsonString(),
+            "words" to words.jsonString(),
+            "after" to after.jsonString(),
+            "before" to before.jsonString(),
+            "unread" to unread.toString(),
+            "starred" to starred.toString(),
+        )
 }
 
 data class AddRssAccountParams(
@@ -580,6 +639,19 @@ data class FolderDeleteParams(
         )
 }
 
+data class FolderSetNotifyParams(
+    val accountId: String,
+    val folderId: String,
+    val enabled: Boolean,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "account_id" to accountId.jsonString(),
+            "folder_id" to folderId.jsonString(),
+            "enabled" to enabled.toString(),
+        )
+}
+
 data class ContactSuggestParams(
     val accountId: String,
     val query: String = "",
@@ -598,6 +670,8 @@ data class ThreadListParams(
     val folderId: String = "inbox",
     val query: String = "",
     val filter: String = "all",
+    // Keep only threads with attachments; combines with `filter`.
+    val attachments: Boolean = false,
     val beforeCursor: String? = null,
     val refresh: Boolean = false,
     // Header rows to return, per account (the unified fan-out applies it to each
@@ -617,6 +691,7 @@ data class ThreadListParams(
             "folder_id" to folderId.jsonString(),
             "query" to query.jsonString(),
             "filter" to filter.jsonString(),
+            "attachments" to attachments.toString(),
             "before_cursor" to beforeCursor?.jsonString(),
             "refresh" to refresh.toString(),
             "limit" to limit?.toString(),
@@ -627,6 +702,7 @@ data class ThreadListParams(
 data class StarredItemsParams(
     val query: String = "",
     val filter: String = "all",
+    val attachments: Boolean = false,
     val limit: Int = 50,
     val beforeCursor: String? = null,
 ) {
@@ -634,6 +710,7 @@ data class StarredItemsParams(
         jsonObject(
             "query" to query.jsonString(),
             "filter" to filter.jsonString(),
+            "attachments" to attachments.toString(),
             "limit" to limit.toString(),
             "before_cursor" to beforeCursor?.jsonString(),
         )
@@ -888,6 +965,43 @@ fun MessageBody.toReplyMailParams(
     )
 }
 
+// A reply with the original quoted under it (see [replyQuotedPlainBody]): the
+// quote joins the plain body, and an HTML original's quote makes the reply's
+// HTML alternative, with the user's text converted above it and the inline
+// images the quote references attached. A body that already quotes the message
+// — a saved quoted reply, reopened — is not quoted twice: one that still ends in
+// the quote untouched keeps its HTML, and one whose quote the user edited (its
+// [marker], the attribution line, still there) goes out exactly as written.
+fun SendMailParams.withReplyQuote(
+    quoteText: String,
+    quoteHtml: String,
+    marker: String,
+    inlineImages: List<DraftAttachment> = emptyList(),
+): SendMailParams {
+    val quote = quoteText.trim()
+    if (quote.isBlank()) return this
+    val sent = body.trim()
+    val quoted = sent.endsWith(quote)
+    if (!quoted && marker.isNotBlank() && sent.contains(marker)) return this
+    val own = if (quoted) sent.removeSuffix(quote).trim() else sent
+    val html = if (quoteHtml.isBlank()) "" else plainTextToHtml(own) + quoteHtml
+    return copy(
+        body =
+            when {
+                quoted -> sent
+                own.isBlank() -> quote
+                else -> own + quoteText
+            },
+        html = html,
+        attachments =
+            if (html.isBlank()) {
+                attachments
+            } else {
+                attachments + inlineImages.map { MobileAttachmentInput(it.displayName, it.mimeType, it.dataBase64, it.inlineId) }
+            },
+    )
+}
+
 data class ThreadActionParams(
     val threadId: String,
     val folderId: String? = null,
@@ -906,11 +1020,13 @@ data class ThreadActionParams(
 data class MoveThreadParams(
     val threadId: String,
     val targetFolderId: String,
+    val targetAccountId: String? = null,
 ) {
     fun toJson(): String =
         jsonObject(
             "thread_id" to threadId.jsonString(),
             "target_folder_id" to targetFolderId.jsonString(),
+            "target_account_id" to targetAccountId?.jsonString(),
         )
 }
 
@@ -1033,6 +1149,8 @@ class MobileMailCommandClient(
 
     suspend fun setAccountSenderName(params: AccountNameParams): String = core.invoke(MobileCommand.AccountSetSenderName, params.toJson())
 
+    suspend fun resolveSenderImage(email: String): String = core.invoke(MobileCommand.AvatarResolve, jsonObject("email" to email.jsonString(), "size" to "96"))
+
     suspend fun setAccountAvatar(params: AccountAvatarParams): String = core.invoke(MobileCommand.AccountSetAvatar, params.toJson())
 
     suspend fun writeAccountAvatarFile(params: AccountMediaFileParams): String = core.invoke(MobileCommand.AccountWriteAvatarFile, params.toJson())
@@ -1095,6 +1213,8 @@ class MobileMailCommandClient(
 
     suspend fun deleteFolder(params: FolderDeleteParams): String = core.invoke(MobileCommand.FolderDelete, params.toJson())
 
+    suspend fun setFolderNotify(params: FolderSetNotifyParams): String = core.invoke(MobileCommand.FolderSetNotify, params.toJson())
+
     suspend fun suggestContacts(params: ContactSuggestParams): String = core.invoke(MobileCommand.ContactSuggest, params.toJson())
 
     suspend fun listThreads(params: ThreadListParams): String = core.invoke(MobileCommand.ThreadList, params.toJson())
@@ -1108,6 +1228,10 @@ class MobileMailCommandClient(
     suspend fun readAttachment(params: AttachmentReadParams): String = core.invoke(MobileCommand.AttachmentRead, params.toJson())
 
     suspend fun fetchChangelog(): String = core.invoke(MobileCommand.ChangelogFetch)
+
+    suspend fun parseSearch(query: String): String = core.invoke(MobileCommand.SearchParse, jsonObject("query" to query.jsonString()))
+
+    suspend fun buildSearch(fields: SearchFields): String = core.invoke(MobileCommand.SearchBuild, jsonObject("fields" to fields.toJson()))
 
     suspend fun storageUsage(): String = core.invoke(MobileCommand.StorageUsage)
 
@@ -1123,7 +1247,55 @@ class MobileMailCommandClient(
 
     suspend fun markRssStarred(params: RssMarkStarredParams): String = core.invoke(MobileCommand.RssMarkStarred, params.toJson())
 
+    suspend fun taskLists(): String = core.invoke(MobileCommand.TaskLists)
+
+    suspend fun createTaskList(params: TaskListCreateParams): String = core.invoke(MobileCommand.TaskListCreate, params.toJson())
+
+    suspend fun renameTaskList(params: TaskListRenameParams): String = core.invoke(MobileCommand.TaskListRename, params.toJson())
+
+    suspend fun deleteTaskList(params: TaskListDeleteParams): String = core.invoke(MobileCommand.TaskListDelete, params.toJson())
+
+    suspend fun taskItems(params: TaskItemsParams): String = core.invoke(MobileCommand.TaskItems, params.toJson())
+
+    suspend fun threadTasks(params: TaskForThreadParams): String = core.invoke(MobileCommand.TaskForThread, params.toJson())
+
+    suspend fun createTask(params: TaskCreateParams): String = core.invoke(MobileCommand.TaskCreate, params.toJson())
+
+    suspend fun updateTask(params: TaskUpdateParams): String = core.invoke(MobileCommand.TaskUpdate, params.toJson())
+
+    suspend fun setTaskDone(params: TaskSetDoneParams): String = core.invoke(MobileCommand.TaskSetDone, params.toJson())
+
+    suspend fun deleteTask(params: TaskDeleteParams): String = core.invoke(MobileCommand.TaskDelete, params.toJson())
+
+    suspend fun reorderTasks(params: TaskReorderParams): String = core.invoke(MobileCommand.TaskReorder, params.toJson())
+
+    suspend fun clearCompletedTasks(params: TaskClearCompletedParams): String = core.invoke(MobileCommand.TaskClearCompleted, params.toJson())
+
+    suspend fun restoreTasks(params: TaskRestoreParams): String = core.invoke(MobileCommand.TaskRestore, params.toJson())
+
     suspend fun send(params: SendMailParams): String = core.invoke(MobileCommand.Send, params.toJson())
+
+    suspend fun respondToInvite(params: InviteRespondParams): String = core.invoke(MobileCommand.InviteRespond, params.toJson())
+
+    suspend fun calendarEvents(params: CalendarRangeParams): String = core.invoke(MobileCommand.CalendarEvents, params.toJson())
+
+    suspend fun createCalendarEvent(params: CalendarEventParams): String = core.invoke(MobileCommand.CalendarCreate, params.toJson())
+
+    suspend fun updateCalendarEvent(params: CalendarEventParams): String = core.invoke(MobileCommand.CalendarUpdate, params.toJson())
+
+    suspend fun deleteCalendarEvent(eventId: String): String = core.invoke(MobileCommand.CalendarDelete, jsonObject("event_id" to eventId.jsonString()))
+
+    /** Take a cancelled invitation (by thread message `id`) out of the calendar. */
+    suspend fun removeInviteFromCalendar(message: String): String = core.invoke(MobileCommand.InviteRemoveFromCalendar, jsonObject("message" to message.jsonString()))
+
+    /** Put an answered invitation (by thread message `id`) back in the calendar. */
+    suspend fun addInviteToCalendar(
+        message: String,
+        threadId: String,
+    ): String = core.invoke(MobileCommand.InviteAddToCalendar, jsonObject("message" to message.jsonString(), "thread_id" to threadId.jsonString()))
+
+    /** Hand back what `calendar.delete` returned as `restore`, untouched. */
+    suspend fun restoreCalendarEvent(restore: String): String = core.invoke(MobileCommand.CalendarRestore, jsonObject("restore" to restore))
 
     suspend fun saveDraft(params: SaveDraftParams): String = core.invoke(MobileCommand.SaveDraft, params.toJson())
 
@@ -1440,6 +1612,203 @@ fun rssMarkStarredRequest(
     id: Long = 1,
     params: RssMarkStarredParams,
 ): CoreRequest = CoreRequest(id, MobileCommand.RssMarkStarred, params.toJson())
+
+// ---- Tasks ------------------------------------------------------------------
+
+data class TaskItemsParams(
+    val listId: String,
+    val includeCompleted: Boolean = false,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "list_id" to listId.jsonString(),
+            "include_completed" to includeCompleted.toString(),
+        )
+}
+
+data class TaskListCreateParams(
+    val title: String,
+) {
+    fun toJson(): String = jsonObject("title" to title.jsonString())
+}
+
+data class TaskListRenameParams(
+    val listId: String,
+    val title: String,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "list_id" to listId.jsonString(),
+            "title" to title.jsonString(),
+        )
+}
+
+data class TaskListDeleteParams(
+    val listId: String,
+) {
+    fun toJson(): String = jsonObject("list_id" to listId.jsonString())
+}
+
+/** Every task filed from a thread, done or not. */
+data class TaskForThreadParams(
+    val threadId: String,
+) {
+    fun toJson(): String = jsonObject("thread_id" to threadId.jsonString())
+}
+
+/**
+ * A new task. [listId] may be blank — the core then files it under the default
+ * list, which is what "add this message to Tasks" wants, since that action has
+ * no list picker to offer.
+ */
+data class TaskCreateParams(
+    val listId: String = "",
+    val title: String,
+    val notes: String = "",
+    val dueAt: Long = 0,
+    val account: String = "",
+    val threadId: String = "",
+    val messageId: String = "",
+) {
+    fun toJson(): String =
+        jsonObject(
+            "list_id" to listId.jsonString(),
+            "title" to title.jsonString(),
+            "notes" to notes.jsonString(),
+            "due_at" to dueAt.toString(),
+            "account" to account.jsonString(),
+            "thread_id" to threadId.jsonString(),
+            "message_id" to messageId.jsonString(),
+        )
+}
+
+/** A patch: a null field is left alone rather than cleared. */
+data class TaskUpdateParams(
+    val taskId: String,
+    val title: String? = null,
+    val notes: String? = null,
+    val dueAt: Long? = null,
+    val listId: String? = null,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "task_id" to taskId.jsonString(),
+            "title" to title?.jsonString(),
+            "notes" to notes?.jsonString(),
+            "due_at" to dueAt?.toString(),
+            "list_id" to listId?.jsonString(),
+        )
+}
+
+/** [message] is the thread message's `id` and [threadId] its conversation's,
+ * which the calendar event links back to; [response] is `accepted`,
+ * `tentative` or `declined`. */
+data class InviteRespondParams(
+    val message: String,
+    val response: String,
+    val threadId: String = "",
+) {
+    fun toJson(): String =
+        jsonObject(
+            "message" to message.jsonString(),
+            "thread_id" to threadId.jsonString(),
+            "response" to response.jsonString(),
+        )
+}
+
+/** A calendar range in epoch seconds, `[from, to)`. */
+data class CalendarRangeParams(
+    val from: Long,
+    val to: Long,
+    val includeTasks: Boolean,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "from" to from.toString(),
+            "to" to to.toString(),
+            "include_tasks" to includeTasks.toString(),
+        )
+}
+
+/**
+ * An event to create, or (with [eventId]) to change. Times are epoch seconds;
+ * an all-day event's are UTC midnights with [end] exclusive. [repeat] is
+ * `daily`, `weekly`, `monthly`, `yearly`, or empty for once.
+ */
+data class CalendarEventParams(
+    val eventId: String = "",
+    val title: String,
+    val notes: String = "",
+    val location: String = "",
+    val start: Long,
+    val end: Long,
+    val allDay: Boolean = false,
+    val repeat: String = "",
+    /** Editing a repeating event: the start of the occurrence the editor was
+     *  opened on, so the core moves the series by the change rather than
+     *  restarting it there. 0 for none. */
+    val occurrenceStart: Long = 0,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "event_id" to eventId.takeIf { it.isNotEmpty() }?.jsonString(),
+            "occurrence_start" to occurrenceStart.takeIf { it > 0 }?.toString(),
+            "title" to title.jsonString(),
+            "notes" to notes.jsonString(),
+            "location" to location.jsonString(),
+            "start" to start.toString(),
+            "end" to end.toString(),
+            "all_day" to allDay.toString(),
+            "repeat" to repeat.jsonString(),
+        )
+}
+
+data class TaskSetDoneParams(
+    val taskId: String,
+    val done: Boolean,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "task_id" to taskId.jsonString(),
+            "done" to done.toString(),
+        )
+}
+
+data class TaskDeleteParams(
+    val taskId: String,
+) {
+    fun toJson(): String = jsonObject("task_id" to taskId.jsonString())
+}
+
+data class TaskReorderParams(
+    val listId: String,
+    val taskIds: List<String>,
+) {
+    fun toJson(): String =
+        jsonObject(
+            "list_id" to listId.jsonString(),
+            "task_ids" to taskIds.jsonStringArray(),
+        )
+}
+
+/**
+ * Undo a delete, by handing back the `restore` blob the delete returned.
+ *
+ * [restore] is raw JSON, not a string value: the client never looks inside it,
+ * so it travels from the delete response to here untouched rather than being
+ * parsed into fields and rebuilt.
+ */
+data class TaskRestoreParams(
+    val restore: String,
+) {
+    fun toJson(): String = jsonObject("restore" to restore)
+}
+
+data class TaskClearCompletedParams(
+    val listId: String,
+) {
+    fun toJson(): String = jsonObject("list_id" to listId.jsonString())
+}
 
 private fun jsonObject(vararg fields: Pair<String, String?>): String =
     fields

@@ -507,10 +507,8 @@ fn recent_and_read_thread_build_bridge_messages() {
     let items = read_thread(&conn, &thread_id).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["subject"], "Hello RSS");
-    assert_eq!(
-        items[0]["body"],
-        "Hello world.\n\nSource: https://example.com/post"
-    );
+    assert_eq!(items[0]["body"], "Hello world.");
+    assert_eq!(items[0]["link"], "https://example.com/post");
     assert_eq!(items[0]["unread"], true);
 }
 
@@ -588,6 +586,37 @@ fn recent_filters_feeds_by_unread_and_starred() {
     let starred = recent(&conn, "rss-acct", "", "starred", 10).unwrap();
     assert_eq!(starred[0]["starred"], Value::Null);
     assert_eq!(starred[0]["has_starred_items"], true);
+}
+
+#[test]
+fn recent_reads_search_operators_against_feed_items() {
+    let conn = rss_conn_with_feed("rss-acct", "feed-1");
+    conn.execute(
+        "INSERT INTO subscriptions(id, account, url, title, feed_title, enabled)
+             VALUES('feed-2', 'rss-acct', 'https://example.com/two', 'Second Feed', 'Second Feed', 1)",
+        [],
+    )
+    .unwrap();
+    insert_item(&conn, "rss-acct", "feed-1", "launch-notes", 100);
+    insert_item(&conn, "rss-acct", "feed-2", "weekly-digest", 1_800_000_000);
+    store::update_rss_item_seen(&conn, "rss-acct", "feed-2", "weekly-digest", true).unwrap();
+    store::update_rss_item_starred(&conn, "rss-acct", "feed-2", "weekly-digest", true).unwrap();
+
+    let titles = |query: &str| {
+        recent(&conn, "rss-acct", query, "", 10)
+            .unwrap()
+            .iter()
+            .map(|thread| thread["subject"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(titles("launch"), ["Example Feed"]);
+    assert_eq!(titles("from:second"), ["Second Feed"]);
+    assert_eq!(titles("subject:digest"), ["Second Feed"]);
+    assert_eq!(titles("is:unread"), ["Example Feed"]);
+    assert_eq!(titles("is:starred"), ["Second Feed"]);
+    assert_eq!(titles("after:2020/01/01"), ["Second Feed"]);
+    assert_eq!(titles("before:2020/01/01 caption"), ["Example Feed"]);
+    assert!(titles("to:me@example.com").is_empty());
 }
 
 // ---- read_thread_page pagination ----------------------------------------

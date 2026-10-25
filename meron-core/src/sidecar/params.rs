@@ -52,7 +52,8 @@ pub(crate) fn req_u16(params: &Value, key: &str) -> anyhow::Result<u16> {
     params
         .get(key)
         .and_then(Value::as_u64)
-        .map(|n| n as u16)
+        // Clamp rather than wrap: a 70 000-row limit must not read as 4 464.
+        .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
         .ok_or_else(|| anyhow::anyhow!("missing number param: {key}"))
 }
 

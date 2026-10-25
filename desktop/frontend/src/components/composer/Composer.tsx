@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { EditorContent } from '@tiptap/react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
@@ -7,7 +8,10 @@ import { ComposerHeaderFields } from './ComposerHeaderFields'
 import { ComposerToolbar } from './ComposerToolbar'
 import { ComposerAttachments } from './ComposerAttachments'
 import { ComposerFooter } from './ComposerFooter'
+import { ComposerQuote } from './ComposerQuote'
 import { closeMessageTab } from '../../states/compose'
+import { DropOverlay } from '../chat/DropOverlay'
+import { routeComposerDrop, useFileDrop } from '../../lib/useFileDrop'
 
 export function Composer({ tabId }: { tabId: string }) {
   const { t } = useTranslation()
@@ -24,15 +28,48 @@ export function Composer({ tabId }: { tabId: string }) {
     canSend,
     update,
     toggleRich,
+    expandQuote,
+    removeQuote,
     pickAttachmentFiles,
     pickInlineImages,
+    addFiles,
     handlePaste,
     handleKeyDown,
     setLink,
     submit,
   } = useComposer(tabId)
 
+  // Two drop areas while files are dragged in: the message body, where images go
+  // inline (rich text only), and the rest of the composer, which attaches them.
+  // Files that can't be shown inline are attached wherever they land. The body's
+  // overlay is only drawn: the drop lands on the editor, which places images
+  // where they were dropped (useComposer's handleDrop). A drag that may be a
+  // link (Linux) lands on the fields themselves too.
+  const bodyRef = useRef<HTMLDivElement | null>(null)
+  const {
+    dragging: fileDragging,
+    mayHoldImages,
+    mayBeLink,
+    dropHandlers,
+  } = useFileDrop(
+    (files, { handledByChild, zone }) => {
+      const { inline, attach } = routeComposerDrop(files, {
+        inBody: zone === 'body',
+        rich: !!draft?.rich,
+        handledByChild,
+      })
+      if (inline.length > 0) addFiles(inline, { inline: true, afterSelection: true })
+      if (attach.length > 0) addFiles(attach)
+    },
+    {
+      zoneOf: (target) => (target instanceof Node && bodyRef.current?.contains(target) ? 'body' : 'composer'),
+      scope: tabId,
+    },
+  )
+
   if (!draft) return null
+
+  const showInlineDrop = fileDragging && draft.rich && mayHoldImages
 
   // In the full editor, bare Enter must always insert a newline (long-form /
   // rich body), so send is bound to Cmd/Ctrl+Enter regardless of the global
@@ -46,7 +83,11 @@ export function Composer({ tabId }: { tabId: string }) {
   }
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden bg-chat" onKeyDown={handleSendShortcut}>
+    <div
+      className="relative flex flex-1 flex-col overflow-hidden bg-chat"
+      onKeyDown={handleSendShortcut}
+      {...dropHandlers}
+    >
       <ComposerHeaderFields
         draft={draft}
         update={update}
@@ -66,22 +107,50 @@ export function Composer({ tabId }: { tabId: string }) {
       {draft.rich && editor && <ComposerToolbar editor={editor} onSetLink={setLink} />}
 
       {/* Body */}
-      <div className="flex-1 overflow-y-auto px-4 py-3" onKeyDown={handleKeyDown}>
-        {draft.rich ? (
-          <EditorContent editor={editor} />
-        ) : (
-          <textarea
-            ref={textRef}
-            autoFocus={focusBody}
-            value={draft.text}
-            onChange={(e) => update({ text: e.target.value })}
-            onPaste={handlePaste}
-            placeholder={t('composer.placeholders.message')}
-            spellCheck={spellCheck}
-            className="h-full min-h-[240px] w-full resize-none bg-transparent text-[0.875rem] leading-relaxed text-primary placeholder-secondary outline-none"
-          />
-        )}
+      <div ref={bodyRef} className="relative flex min-h-0 flex-1 flex-col">
+        {/* With a folded quote the body only grows with what is typed, so the
+            quote's dots sit right under the text rather than below an empty
+            box; clicking the space left below still writes into the body. */}
+        <div
+          className={`flex-1 overflow-y-auto px-4 py-3${draft.quote ? ' [&_.tiptap-body]:min-h-[4.5em]' : ''}`}
+          onKeyDown={handleKeyDown}
+          onMouseDown={(event) => {
+            if (!draft.quote || event.target !== event.currentTarget) return
+            event.preventDefault()
+            if (draft.rich) {
+              editor?.commands.focus('end')
+            } else {
+              const body = textRef.current
+              body?.focus()
+              body?.setSelectionRange(body.value.length, body.value.length)
+            }
+          }}
+        >
+          {draft.rich ? (
+            <EditorContent editor={editor} />
+          ) : (
+            <textarea
+              ref={textRef}
+              autoFocus={focusBody}
+              value={draft.text}
+              onChange={(e) => update({ text: e.target.value })}
+              onPaste={handlePaste}
+              placeholder={t('composer.placeholders.message')}
+              spellCheck={spellCheck}
+              rows={draft.quote ? Math.max(3, draft.text.split('\n').length + 1) : undefined}
+              className={`${draft.quote ? 'min-h-[4.5em]' : 'h-full min-h-[240px]'} w-full resize-none bg-transparent text-[calc(0.875rem*var(--me-message-scale))] leading-relaxed text-primary placeholder-secondary outline-none`}
+            />
+          )}
+          {draft.quote && <ComposerQuote onExpand={expandQuote} onRemove={removeQuote} />}
+        </div>
+        {showInlineDrop && <DropOverlay kind="inline" className="inset-2" passThrough />}
       </div>
+
+      {showInlineDrop && (
+        <div className="relative mx-2 mb-1 h-16 shrink-0">
+          <DropOverlay className="inset-0" />
+        </div>
+      )}
 
       <ComposerAttachments
         attachments={draft.attachments}
@@ -102,6 +171,7 @@ export function Composer({ tabId }: { tabId: string }) {
         onDiscard={() => void closeMessageTab(tabId)}
         onSubmit={submit}
       />
+      {fileDragging && !showInlineDrop && <DropOverlay passThrough={mayBeLink} />}
     </div>
   )
 }

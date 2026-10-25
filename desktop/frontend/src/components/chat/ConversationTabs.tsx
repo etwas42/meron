@@ -1,59 +1,277 @@
+import { useEffect, useRef, useState } from 'react'
 import { MessageSquare, SquarePen, X } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { closeMessageTab, activateConversationTab } from '../../states/compose'
+import { closeMessageTab, closeMessageTabs, activateConversationTab } from '../../states/compose'
 import { compose$ } from '../../states/composeState'
+import { closeCurrentConversation, kanban$ } from '../../states/kanban'
 import { ui$ } from '../../states/ui'
+import type { MessageTab } from '../../types'
+import { Avatar } from '../avatar/Avatar'
+import { FloatingContextMenu } from '../menu/FloatingContextMenu'
+import { MenuItem } from '../menu/MenuItem'
 
-// The tab strip above the conversation: a fixed "Conversation" tab plus open
-// thread, reader and compose tabs. Renders nothing when no tabs are open.
+// A wheel line or page in pixels, for devices that report deltas in those
+// units (deltaMode 1 and 2) rather than pixels.
+const WHEEL_LINE_PX = 40
+
+// The underline carries the accent; the label stays in the text colour so the
+// active tab doesn't compete with the subject heading below it.
+const ACTIVE_TAB = 'border-accent font-semibold text-primary'
+const INACTIVE_TAB = 'border-transparent font-medium text-secondary hover:text-primary'
+
+// Scrolls the strip, and only the strip, just enough to show the tab.
+function revealTab(strip: HTMLElement, tabId: string) {
+  const tab = strip.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(tabId)}"]`)
+  if (!tab) return
+  const stripRect = strip.getBoundingClientRect()
+  const tabRect = tab.getBoundingClientRect()
+  if (tabRect.left < stripRect.left) strip.scrollLeft -= stripRect.left - tabRect.left
+  else if (tabRect.right > stripRect.right) strip.scrollLeft += tabRect.right - stripRect.right
+}
+
+// The tab strip above the conversation: the "Current" tab (when a conversation
+// is open behind the tabs) plus open thread, reader and compose tabs. Renders
+// nothing when no tabs are open.
 export function ConversationTabs() {
   const { t } = useTranslation()
   const tabs = useValue(compose$.tabs)
   const activeTab = useValue(compose$.activeTab)
-  if (tabs.length === 0) return null
+  const conversationThread = useValue(compose$.conversationThread)
+  const activeBoardId = useValue(kanban$.activeBoardId)
+  const paneThreadId = useValue(kanban$.paneThreadId)
+  // The Current tab returns to the conversation the pane was showing before a
+  // tab took over it. With no such conversation there is nothing to return to:
+  // it would blank the pane, and in kanban view — where the pane only exists
+  // while a card or a tab is open — close it outright. So it is only offered
+  // once there is a conversation behind the tabs. Kanban owns its open
+  // conversation through paneThreadId; elsewhere it's the remembered thread.
+  const hasCurrentConversation = activeBoardId ? !!paneThreadId : !!conversationThread
+  const stripRef = useRef<HTMLDivElement>(null)
+
+  // Keep the active tab visible, e.g. a newly opened one past the strip's
+  // right edge. Size changes re-run this below.
+  useEffect(() => {
+    if (stripRef.current) revealTab(stripRef.current, activeTab)
+  }, [activeTab, tabs.length])
+
+  // The strip hides its scrollbar (it would sit on the active tab's
+  // underline), so a vertical wheel scrolls it sideways instead, and a fade on
+  // each edge with tabs past it hints there is more. The wheel listener is
+  // native: React's onWheel is passive and can't stop the page scrolling.
+  const hasTabs = tabs.length > 0
+  const [overflow, setOverflow] = useState({ left: false, right: false })
+  useEffect(() => {
+    const strip = stripRef.current
+    if (!strip) return
+    const updateOverflow = () => {
+      const left = strip.scrollLeft > 1
+      const right = strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 1
+      setOverflow((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
+    }
+    const onWheel = (event: WheelEvent) => {
+      if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
+      if (strip.scrollWidth <= strip.clientWidth) return
+      event.preventDefault()
+      const unit =
+        event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? strip.clientWidth
+          : event.deltaMode === WheelEvent.DOM_DELTA_LINE
+            ? WHEEL_LINE_PX
+            : 1
+      strip.scrollLeft += event.deltaY * unit
+    }
+    updateOverflow()
+    strip.addEventListener('wheel', onWheel, { passive: false })
+    strip.addEventListener('scroll', updateOverflow, { passive: true })
+    // Watch the tabs too: opening or closing one, or a compose tab's subject
+    // growing, changes the scroll width without resizing the strip. Either
+    // kind of change can push the active tab out of view.
+    const onResize = () => {
+      revealTab(strip, compose$.activeTab.peek())
+      updateOverflow()
+    }
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(onResize)
+    observer?.observe(strip)
+    for (const child of strip.children) observer?.observe(child)
+    return () => {
+      strip.removeEventListener('wheel', onWheel)
+      strip.removeEventListener('scroll', updateOverflow)
+      observer?.disconnect()
+    }
+  }, [hasTabs, tabs.length, hasCurrentConversation])
+
+  const [menu, setMenu] = useState<{ x: number; y: number; tabId: string } | null>(null)
+
+  if (!hasTabs) return null
 
   return (
-    <div className="flex h-10 shrink-0 items-stretch gap-1 overflow-x-auto border-b border-border bg-header px-2 select-none">
-      <button
-        onClick={() => activateConversationTab()}
-        className={`flex items-center gap-1.5 px-3 text-xs font-semibold border-b-2 transition-colors cursor-pointer ${
-          activeTab === '' ? 'border-accent text-accent' : 'border-transparent text-secondary hover:text-primary'
-        }`}
-        title={t('chat.currentConversation')}
-      >
-        <MessageSquare size={13} />
-        {t('chat.current')}
-      </button>
-      {tabs.map((tab) => (
-        <div
-          key={tab.id}
-          onClick={() => {
-            // Activate the tab before retargeting selectedThread so the Current
-            // tab's remembered thread (conversationThread) isn't overwritten.
-            compose$.activeTab.set(tab.id)
-            if (tab.kind === 'thread') ui$.selectedThread.set(tab.threadId)
-          }}
-          className={`group flex max-w-[200px] cursor-pointer items-center gap-1.5 px-3 text-xs font-semibold border-b-2 transition-colors ${
-            activeTab === tab.id ? 'border-accent text-accent' : 'border-transparent text-secondary hover:text-primary'
-          }`}
-          title={tab.subject}
-        >
-          {tab.kind === 'thread' && <MessageSquare size={12} className="shrink-0" />}
-          {tab.kind === 'compose' && <SquarePen size={12} className="shrink-0" />}
-          <span className="truncate">{tab.subject}</span>
-          <button
-            onClick={(event) => {
-              event.stopPropagation()
-              void closeMessageTab(tab.id)
+    <div className="relative shrink-0 border-b border-border/60 bg-header">
+      {overflow.left && (
+        <div className="pointer-events-none absolute inset-y-0 left-0 z-10 w-8 bg-linear-to-r from-header to-transparent" />
+      )}
+      {overflow.right && (
+        <div className="pointer-events-none absolute inset-y-0 right-0 z-10 w-8 bg-linear-to-l from-header to-transparent" />
+      )}
+      <div ref={stripRef} className="flex h-9 items-stretch gap-1 no-scrollbar overflow-x-auto px-2 select-none">
+        {hasCurrentConversation && (
+          <div
+            data-tab-id=""
+            onClick={() => activateConversationTab()}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              setMenu({ x: event.clientX, y: event.clientY, tabId: '' })
             }}
-            className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-secondary hover:bg-active hover:text-primary"
-            title={t('chat.closeTab')}
+            className={`group relative flex shrink-0 items-center gap-1.5 px-3 text-xs border-b-2 transition-colors cursor-pointer ${
+              activeTab === '' ? ACTIVE_TAB : INACTIVE_TAB
+            }`}
+            title={t('chat.currentConversation')}
           >
-            <X size={11} />
-          </button>
-        </div>
-      ))}
+            <button className="flex items-center gap-1.5 self-stretch cursor-pointer">
+              <MessageSquare size={13} />
+              {t('chat.current')}
+            </button>
+            <button
+              onClick={(event) => {
+                event.stopPropagation()
+                closeCurrentConversation()
+              }}
+              className={`absolute right-1 top-1/2 z-10 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full bg-header text-secondary shadow-[-4px_0_4px_var(--color-header)] hover:bg-active hover:text-primary ${
+                activeTab === ''
+                  ? ''
+                  : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100'
+              }`}
+              title={t('chat.closeTab')}
+              aria-label={t('chat.closeTab')}
+            >
+              <X size={11} />
+            </button>
+          </div>
+        )}
+        {tabs.map((tab) => (
+          <div
+            key={tab.id}
+            data-tab-id={tab.id}
+            onClick={() => {
+              // Activate the tab before retargeting selectedThread so the Current
+              // tab's remembered thread (conversationThread) isn't overwritten.
+              compose$.activeTab.set(tab.id)
+              if (tab.kind === 'thread') ui$.selectedThread.set(tab.threadId)
+            }}
+            className={`group relative flex max-w-[200px] cursor-pointer items-center gap-1.5 px-3 text-xs border-b-2 transition-colors ${
+              activeTab === tab.id ? ACTIVE_TAB : INACTIVE_TAB
+            }`}
+            onContextMenu={(event) => {
+              event.preventDefault()
+              setMenu({ x: event.clientX, y: event.clientY, tabId: tab.id })
+            }}
+            title={tab.subject}
+          >
+            {tab.kind === 'compose' ? (
+              <SquarePen size={12} className="shrink-0" />
+            ) : (
+              <Avatar
+                name={tab.from}
+                email={tab.fromAddr}
+                src={tab.feedIcon ? `/media/${tab.feedIcon}` : undefined}
+                size={18}
+              />
+            )}
+            <span className="truncate">{tab.subject}</span>
+            <button
+              onClick={(event) => {
+                event.stopPropagation()
+                void closeMessageTab(tab.id)
+              }}
+              // Overlay the label so revealing the × never consumes tab width.
+              className={`absolute right-1 top-1/2 z-10 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full bg-header text-secondary shadow-[-4px_0_4px_var(--color-header)] hover:bg-active hover:text-primary ${
+                activeTab === tab.id
+                  ? ''
+                  : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100'
+              }`}
+              title={t('chat.closeTab')}
+            >
+              <X size={11} />
+            </button>
+          </div>
+        ))}
+      </div>
+      {menu && (
+        <TabContextMenu {...menu} tabs={tabs} hasCurrent={hasCurrentConversation} onClose={() => setMenu(null)} />
+      )}
     </div>
+  )
+}
+
+// Right-click menu for a tab, the Current tab ('') included: it sits first in
+// the strip and closes like the conversation header's X. The bulk entries skip
+// compose tabs (see closeMessageTabs) and are disabled when that leaves
+// nothing to close.
+function TabContextMenu({
+  x,
+  y,
+  tabId,
+  tabs,
+  hasCurrent,
+  onClose,
+}: {
+  x: number
+  y: number
+  tabId: string
+  tabs: MessageTab[]
+  hasCurrent: boolean
+  onClose: () => void
+}) {
+  const { t } = useTranslation()
+  const entries = [...(hasCurrent ? [''] : []), ...tabs.map((tab) => tab.id)]
+  const index = entries.indexOf(tabId)
+  if (index === -1) return null
+  const closable = (ids: string[]) =>
+    ids.filter((id) => id === '' || tabs.find((tab) => tab.id === id)?.kind !== 'compose')
+  const close = (ids: string[]) => {
+    onClose()
+    // Tabs first: closing Current hands the pane to a tab still open.
+    closeMessageTabs(ids.filter((id) => id !== ''))
+    if (ids.includes('')) closeCurrentConversation()
+  }
+  const bulk = [
+    { label: t('chat.closeOtherTabs'), ids: closable(entries.filter((id) => id !== tabId)) },
+    { label: t('chat.closeTabsToLeft'), ids: closable(entries.slice(0, index)) },
+    { label: t('chat.closeTabsToRight'), ids: closable(entries.slice(index + 1)) },
+    { label: t('chat.closeAllTabs'), ids: closable(entries) },
+  ]
+
+  return (
+    <FloatingContextMenu
+      x={x}
+      y={y}
+      offset={4}
+      onClose={onClose}
+      overlay
+      className="fixed z-50 min-w-[176px]"
+      onContextMenu={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+    >
+      <MenuItem
+        label={t('chat.closeTab')}
+        onClick={() => {
+          if (tabId !== '') {
+            onClose()
+            void closeMessageTab(tabId)
+          } else close([''])
+        }}
+      />
+      {bulk.map((item) => (
+        <MenuItem
+          key={item.label}
+          label={item.label}
+          className="disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={item.ids.length === 0}
+          onClick={() => close(item.ids)}
+        />
+      ))}
+    </FloatingContextMenu>
   )
 }

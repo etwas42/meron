@@ -1,0 +1,6 @@
+- Add unread badge and mail list home-screen widgets on Android
+- Remember the last selected folder per account
+- Keep conversation scroll steady when long HTML messages scroll into view
+- Prevent stale reads from restoring removed threads
+- Keep archived threads in place and the open conversation selected
+- Fix unified inbox gaps and keep scroll depth on reload

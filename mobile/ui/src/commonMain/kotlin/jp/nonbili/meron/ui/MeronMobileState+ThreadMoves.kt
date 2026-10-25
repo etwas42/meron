@@ -17,13 +17,22 @@ import kotlinx.coroutines.withContext
 
 private fun List<FolderSummary>.hasOnlyBootstrapInbox(): Boolean = size == 1 && first().name.equals(INBOX_FOLDER, ignoreCase = true)
 
+// These moves remove rows on success. A read while the move was pending may
+// already have hidden the source row, so a failure needs a fresh cache read.
+private fun MeronMobileState.reloadFailedMoveSource(thread: ThreadSummary) {
+    if (selectedCoreAccountId == thread.accountId || selectedCoreAccountId == UNIFIED_ACCOUNT_ID) {
+        syncCoreThreads(syncFirst = false)
+    }
+    refreshKanbanColumnsForAccount(thread.accountId)
+}
+
 internal fun MeronMobileState.ensureThreadActionFolders(
     thread: ThreadSummary,
     includeAllMailAccounts: Boolean,
     onReady: () -> Unit,
 ) {
     if (threadIdIsRss(thread.id)) {
-        status = "RSS feeds move between RSS accounts from Kanban."
+        status = trs("mobile.status.rssMoveBetweenAccounts")
         return
     }
     if (!coreLoaded) {
@@ -37,11 +46,12 @@ internal fun MeronMobileState.ensureThreadActionFolders(
             coreAccounts.filter { it.id == thread.accountId && !accountSummaryIsRss(it) }
         }
     if (accounts.isEmpty()) {
-        status = "No mail folders available."
+        status = trs("mobile.status.noMailFolders")
         return
     }
-    status = "Loading folders..."
+    status = trs("folders.loading")
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -65,11 +75,11 @@ internal fun MeronMobileState.ensureThreadActionFolders(
                 }
             }
         }.onSuccess { loadedFolders ->
-            foldersByAccount = foldersByAccount + loadedFolders
-            status = "Loaded folders"
+            foldersByAccount = foldersByAccount + loadedFolders.mapValues { (_, folders) -> reconcileFolderUnread(folders, folderReadVersion) }
+            status = trs("mobile.status.foldersLoaded")
             onReady()
         }.onFailure {
-            status = "Load folders failed: ${it.message}"
+            status = trsError("mobile.status.loadFoldersFailed", it)
         }
     }
 }
@@ -77,14 +87,15 @@ internal fun MeronMobileState.ensureThreadActionFolders(
 internal fun MeronMobileState.moveThreadToFolder(
     thread: ThreadSummary,
     targetFolderId: String,
+    targetAccountId: String = thread.accountId,
     onMoved: () -> Unit = {},
 ) {
     if (threadIdIsRss(thread.id)) {
-        status = "RSS feeds move between RSS accounts from Kanban."
+        status = trs("mobile.status.rssMoveBetweenAccounts")
         return
     }
-    if (targetFolderId.equals(thread.folder, ignoreCase = true)) {
-        status = "Already in ${targetFolderId.replaceFirstChar { it.uppercase() }}."
+    if (targetAccountId == thread.accountId && kanbanFolderIdsEqual(targetFolderId, thread.folder)) {
+        status = trs("mobile.status.alreadyInFolder", mapOf("folder" to targetFolderId.replaceFirstChar { it.uppercase() }))
         return
     }
     if (!coreLoaded) {
@@ -95,6 +106,7 @@ internal fun MeronMobileState.moveThreadToFolder(
     val kanbanBefore = kanbanColumns
     val selectedBefore = selectedCoreThread
     val messagesBefore = messages
+    val removal = suppressRemovedThread(thread.id)
     // Remove the row optimistically, but keep an open conversation selected
     // until the move succeeds. Clearing it here makes the thread-route fallback
     // pop immediately, then the success callback pops the origin route too.
@@ -103,30 +115,37 @@ internal fun MeronMobileState.moveThreadToFolder(
         kanbanColumns.mapValues { (_, state) ->
             state.copy(threads = state.threads.filterNot { it.id == thread.id })
         }
-    status = "Moving..."
+    status = trs("mobile.status.moving")
     scope.launch {
         runCatching {
-            requireCoreOk(
-                withContext(ioDispatcher) {
-                    MobileMailCommandClient(core).move(
-                        MoveThreadParams(threadId = thread.id, targetFolderId = targetFolderId),
-                    )
-                },
+            requireTransferAffected(
+                requireCoreOk(
+                    withContext(ioDispatcher) {
+                        MobileMailCommandClient(core).move(
+                            MoveThreadParams(threadId = thread.id, targetFolderId = targetFolderId, targetAccountId = targetAccountId),
+                        )
+                    },
+                ),
+                "moved",
             )
-        }.onSuccess {
+        }.onSuccess { response ->
+            removal.complete()
+            releaseMovedThread(response)
             if (selectedCoreThread?.id == thread.id) {
                 selectedCoreThread = null
                 messages = emptyList()
             }
-            status = "Move complete"
+            status = trs("mobile.status.moveComplete")
+            rememberThreadTransfer(RecentThreadTransfer("move", thread.accountId, targetAccountId, targetFolderId))
             onMoved()
         }.onFailure {
+            removal.rollback()
             Log.w("Mail", "move thread failed", it)
-            coreThreads = threadsBefore
-            kanbanColumns = kanbanBefore
+            coreThreads = removal.filter(threadsBefore)
+            kanbanColumns = kanbanBefore.mapValues { (_, state) -> state.copy(threads = removal.filter(state.threads)) }
             selectedCoreThread = selectedBefore
             messages = messagesBefore
-            status = "Move failed: ${it.message}"
+            showTransferFailure("mail.toast.moveFailed", it)
         }
     }
 }
@@ -136,35 +155,41 @@ internal fun MeronMobileState.copyThreadToFolder(
     target: FolderSummary,
 ) {
     if (threadIdIsRss(thread.id)) {
-        status = "RSS feeds can't be copied to mail folders."
+        status = trs("mobile.status.rssCannotCopyToMail")
         return
     }
     val targetAccountId = target.accountId.ifBlank { thread.accountId }
     val targetAccount = coreAccounts.firstOrNull { it.id == targetAccountId }
     if (targetAccount == null || accountSummaryIsRss(targetAccount)) {
-        status = "Choose a mail account folder."
+        status = trs("mobile.status.chooseMailFolder")
         return
     }
     if (!coreLoaded) {
         status = coreUnavailableMessage
         return
     }
-    status = "Copying..."
+    status = trs("mobile.status.copying")
     scope.launch {
         runCatching {
             withContext(ioDispatcher) {
-                MobileMailCommandClient(core).copy(
-                    CopyThreadParams(
-                        threadId = thread.id,
-                        targetAccountId = targetAccountId,
-                        targetFolderId = target.name,
+                requireTransferAffected(
+                    requireCoreOk(
+                        MobileMailCommandClient(core).copy(
+                            CopyThreadParams(
+                                threadId = thread.id,
+                                targetAccountId = targetAccountId,
+                                targetFolderId = target.name,
+                            ),
+                        ),
                     ),
+                    "copied",
                 )
             }
         }.onSuccess {
-            status = "Copy complete"
+            rememberThreadTransfer(RecentThreadTransfer("copy", thread.accountId, targetAccountId, target.name))
+            status = trs("mobile.status.copyComplete")
         }.onFailure {
-            status = "Copy failed: ${it.message}"
+            showTransferFailure("mail.toast.copyFailed", it)
         }
     }
 }
@@ -176,24 +201,26 @@ internal fun MeronMobileState.createFolderAndMoveThread(
 ) {
     val trimmed = name.trim()
     if (threadIdIsRss(thread.id)) {
-        status = "RSS feeds move between RSS accounts from Kanban."
+        status = trs("mobile.status.rssMoveBetweenAccounts")
         return
     }
     if (trimmed.isBlank()) {
-        status = "Folder name is required."
+        status = trs("folders.nameRequired")
         return
     }
     val account = coreAccounts.firstOrNull { it.id == thread.accountId }
     if (account == null) {
-        status = "Account not found."
+        status = trs("mobile.status.accountNotFound")
         return
     }
     if (!coreLoaded) {
         status = coreUnavailableMessage
         return
     }
-    status = "Creating folder..."
+    status = trs("mobile.status.creatingFolder")
+    val removal = suppressRemovedThread(thread.id)
     scope.launch {
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -204,24 +231,31 @@ internal fun MeronMobileState.createFolderAndMoveThread(
                 val createdFolder = folders.folderCreatedAs(trimmed)
                 val created = createdFolder?.name ?: trimmed
                 if (created.equals(thread.folder, ignoreCase = true)) {
-                    throw IllegalStateException("Already in ${createdFolder?.displayName ?: trimmed}.")
+                    throw IllegalStateException(trs("mobile.status.alreadyInFolder", mapOf("folder" to (createdFolder?.displayName ?: trimmed))))
                 }
-                withManagedGoogleAuth(client, thread.accountId) {
-                    client.move(MoveThreadParams(threadId = thread.id, targetFolderId = created))
-                }
-                folders to created
+                val response =
+                    withManagedGoogleAuth(client, thread.accountId) {
+                        requireTransferAffected(requireCoreOk(client.move(MoveThreadParams(threadId = thread.id, targetFolderId = created))), "moved")
+                    }
+                folders to response
             }
-        }.onSuccess { (folders, _) ->
-            foldersByAccount = foldersByAccount + (account.id to folders)
+        }.onSuccess { (folders, response) ->
+            removal.complete()
+            releaseMovedThread(response)
+            foldersByAccount = foldersByAccount + (account.id to reconcileFolderUnread(folders, folderReadVersion))
+            val destination = folders.folderCreatedAs(trimmed)?.name ?: trimmed
+            rememberThreadTransfer(RecentThreadTransfer("move", thread.accountId, thread.accountId, destination))
             removeThreadEverywhere(thread.id)
             if (selectedCoreThread?.id == thread.id) {
                 selectedCoreThread = null
                 messages = emptyList()
             }
-            status = "Folder created and move complete"
+            status = trs("mobile.status.folderCreatedAndMoved")
             onMoved()
         }.onFailure {
-            status = "Create folder failed: ${it.message}"
+            removal.rollback()
+            reloadFailedMoveSource(thread)
+            showTransferFailure("mobile.status.createFolderFailed", it)
         }
     }
 }
@@ -231,53 +265,71 @@ internal fun MeronMobileState.moveThreadToColumn(
     target: KanbanColumnSpec,
 ) {
     if (target.accountId == UNIFIED_ACCOUNT_ID) {
-        status = "Move to an account folder column."
+        status = trs("mobile.status.moveToFolderColumn")
         return
     }
     val targetAccount = coreAccounts.firstOrNull { it.id == target.accountId }
     if (targetAccount == null) {
-        status = "Target account not found."
+        status = trs("mobile.status.targetAccountNotFound")
         return
     }
     if (threadIdIsRss(thread.id)) {
         if (!accountSummaryIsRss(targetAccount)) {
-            status = "RSS feeds can only move to RSS accounts."
+            status = trs("mobile.status.rssOnlyToRssAccounts")
             return
         }
+        val removal = suppressRemovedThread(thread.id)
         scope.launch {
             runCatching {
                 withContext(ioDispatcher) {
-                    MobileMailCommandClient(core).moveRssFeed(
-                        MoveRssFeedParams(threadId = thread.id, targetAccountId = target.accountId),
+                    requireCoreOk(
+                        MobileMailCommandClient(core).moveRssFeed(
+                            MoveRssFeedParams(threadId = thread.id, targetAccountId = target.accountId),
+                        ),
                     )
                 }
-            }.onSuccess {
+            }.onSuccess { response ->
+                removal.complete()
+                releaseMovedThread(response)
                 removeThreadEverywhere(thread.id)
                 loadKanbanColumn(target, refresh = false)
-                status = "Move complete"
+                status = trs("mobile.status.moveComplete")
             }.onFailure {
-                status = "Move failed: ${it.message}"
+                removal.rollback()
+                reloadFailedMoveSource(thread)
+                showTransferFailure("mail.toast.moveFailed", it)
             }
         }
         return
     }
     if (accountSummaryIsRss(targetAccount)) {
-        status = "Mail threads can't move into RSS feeds."
+        status = trs("mobile.status.mailCannotMoveToFeeds")
         return
     }
+    val removal = suppressRemovedThread(thread.id)
     scope.launch {
         runCatching {
             withContext(ioDispatcher) {
-                MobileMailCommandClient(core).move(
-                    MoveThreadParams(threadId = thread.id, targetFolderId = target.folderId),
+                requireTransferAffected(
+                    requireCoreOk(
+                        MobileMailCommandClient(core).move(
+                            MoveThreadParams(threadId = thread.id, targetFolderId = target.folderId, targetAccountId = target.accountId),
+                        ),
+                    ),
+                    "moved",
                 )
             }
-        }.onSuccess {
+        }.onSuccess { response ->
+            rememberThreadTransfer(RecentThreadTransfer("move", thread.accountId, target.accountId, target.folderId))
+            removal.complete()
+            releaseMovedThread(response)
             removeThreadEverywhere(thread.id)
             loadKanbanColumn(target, refresh = false)
-            status = "Move complete"
+            status = trs("mobile.status.moveComplete")
         }.onFailure {
-            status = "Move failed: ${it.message}"
+            removal.rollback()
+            reloadFailedMoveSource(thread)
+            showTransferFailure("mail.toast.moveFailed", it)
         }
     }
 }

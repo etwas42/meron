@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Image as ImageIcon, Minus, Plus, RotateCcw, X } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
 import { showToast } from '../../states/ui'
 import { Button } from '../button/Button'
 import { IconButton } from '../button/IconButton'
@@ -71,8 +71,6 @@ export function AvatarCropDialog({
     setOffset({ x: 0, y: 0 })
     return () => URL.revokeObjectURL(url)
   }, [file])
-
-  useEscapeKey(onCancel, !busy && !saving)
 
   const rendered = useMemo(() => {
     if (!imageSize) return null
@@ -165,104 +163,109 @@ export function AvatarCropDialog({
   const disabled = busy || saving || !imageSize
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 dark:bg-black/65 backdrop-blur-[3px] p-4">
-      <div className="w-full max-w-sm rounded-3xl border border-border bg-chats text-primary shadow-2xl animate-slide-up overflow-hidden">
-        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
-          <div className="min-w-0">
-            <h3 className="text-[0.875rem] font-bold leading-tight">{t('avatar.edit')}</h3>
-            <p className="mt-0.5 truncate text-[0.65625rem] font-medium text-secondary">{file.name}</p>
-          </div>
+    <Dialog
+      onClose={onCancel}
+      dismissible={!busy && !saving}
+      closeOnBackdrop={false}
+      aria-label={t('avatar.edit')}
+      backdropClassName="z-[70] bg-black/45 dark:bg-black/65"
+      className="max-w-sm overflow-hidden"
+    >
+      <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-4">
+        <div className="min-w-0">
+          <h3 className="text-[0.875rem] font-bold leading-tight">{t('avatar.edit')}</h3>
+          <p className="mt-0.5 truncate text-[0.65625rem] font-medium text-secondary">{file.name}</p>
+        </div>
+        <IconButton
+          icon={X}
+          iconSize={15}
+          label={t('buttons.cancel')}
+          size="sm"
+          onClick={onCancel}
+          disabled={busy || saving}
+        />
+      </div>
+
+      <div className="flex flex-col items-center gap-4 px-5 py-5">
+        <div
+          className="relative touch-none overflow-hidden rounded-3xl bg-app shadow-inner ring-1 ring-border"
+          style={{ width: CROP_SIZE, height: CROP_SIZE }}
+          onPointerDown={startDrag}
+          onPointerMove={moveDrag}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+        >
+          {!imageSize && (
+            <div className="absolute inset-0 flex items-center justify-center text-secondary">
+              <ImageIcon size={22} />
+            </div>
+          )}
+          {imageUrl && (
+            <img
+              ref={imageRef}
+              src={imageUrl}
+              alt=""
+              draggable={false}
+              onLoad={onImageLoad}
+              onError={() => showToast(t('avatar.loadFailed'), 'error')}
+              className="absolute left-1/2 top-1/2 max-w-none select-none"
+              style={{
+                width: rendered?.width,
+                height: rendered?.height,
+                transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`,
+              }}
+            />
+          )}
+          <div className="pointer-events-none absolute inset-0 rounded-3xl ring-2 ring-white/90 dark:ring-white/70" />
+        </div>
+
+        <div className="flex w-full items-center gap-3">
           <IconButton
-            icon={X}
-            iconSize={15}
-            label={t('buttons.cancel')}
+            icon={Minus}
+            iconSize={14}
+            label={t('avatar.zoomOut')}
             size="sm"
-            onClick={onCancel}
-            disabled={busy || saving}
+            onClick={() => nudgeZoom(-0.1)}
+            disabled={disabled || zoom <= 1}
+          />
+          <input
+            type="range"
+            min={1}
+            max={4}
+            step={0.01}
+            value={zoom}
+            onChange={(event) => setClampedZoom(Number(event.target.value))}
+            disabled={disabled}
+            aria-label={t('avatar.zoom')}
+            className="app-range flex-1"
+          />
+          <IconButton
+            icon={Plus}
+            iconSize={14}
+            label={t('avatar.zoomIn')}
+            size="sm"
+            onClick={() => nudgeZoom(0.1)}
+            disabled={disabled || zoom >= 4}
+          />
+          <IconButton
+            icon={RotateCcw}
+            iconSize={14}
+            label={t('avatar.resetCrop')}
+            size="sm"
+            onClick={resetCrop}
+            disabled={disabled}
           />
         </div>
-
-        <div className="flex flex-col items-center gap-4 px-5 py-5">
-          <div
-            className="relative touch-none overflow-hidden rounded-3xl bg-app shadow-inner ring-1 ring-border"
-            style={{ width: CROP_SIZE, height: CROP_SIZE }}
-            onPointerDown={startDrag}
-            onPointerMove={moveDrag}
-            onPointerUp={endDrag}
-            onPointerCancel={endDrag}
-          >
-            {!imageSize && (
-              <div className="absolute inset-0 flex items-center justify-center text-secondary">
-                <ImageIcon size={22} />
-              </div>
-            )}
-            {imageUrl && (
-              <img
-                ref={imageRef}
-                src={imageUrl}
-                alt=""
-                draggable={false}
-                onLoad={onImageLoad}
-                onError={() => showToast(t('avatar.loadFailed'), 'error')}
-                className="absolute left-1/2 top-1/2 max-w-none select-none"
-                style={{
-                  width: rendered?.width,
-                  height: rendered?.height,
-                  transform: `translate(-50%, -50%) translate(${offset.x}px, ${offset.y}px)`,
-                }}
-              />
-            )}
-            <div className="pointer-events-none absolute inset-0 rounded-3xl ring-2 ring-white/90 dark:ring-white/70" />
-          </div>
-
-          <div className="flex w-full items-center gap-3">
-            <IconButton
-              icon={Minus}
-              iconSize={14}
-              label={t('avatar.zoomOut')}
-              size="sm"
-              onClick={() => nudgeZoom(-0.1)}
-              disabled={disabled || zoom <= 1}
-            />
-            <input
-              type="range"
-              min={1}
-              max={4}
-              step={0.01}
-              value={zoom}
-              onChange={(event) => setClampedZoom(Number(event.target.value))}
-              disabled={disabled}
-              aria-label={t('avatar.zoom')}
-              className="app-range flex-1"
-            />
-            <IconButton
-              icon={Plus}
-              iconSize={14}
-              label={t('avatar.zoomIn')}
-              size="sm"
-              onClick={() => nudgeZoom(0.1)}
-              disabled={disabled || zoom >= 4}
-            />
-            <IconButton
-              icon={RotateCcw}
-              iconSize={14}
-              label={t('avatar.resetCrop')}
-              size="sm"
-              onClick={resetCrop}
-              disabled={disabled}
-            />
-          </div>
-        </div>
-
-        <div className="flex justify-end gap-2 border-t border-border/70 px-5 py-4">
-          <Button variant="secondary" size="sm" onClick={onCancel} disabled={busy || saving}>
-            {t('buttons.cancel')}
-          </Button>
-          <Button size="sm" onClick={() => void saveCrop()} disabled={disabled}>
-            {t('avatar.save')}
-          </Button>
-        </div>
       </div>
-    </div>
+
+      <div className="flex justify-end gap-2 border-t border-border/70 px-5 py-4">
+        <Button variant="secondary" size="sm" onClick={onCancel} disabled={busy || saving}>
+          {t('buttons.cancel')}
+        </Button>
+        <Button size="sm" onClick={() => void saveCrop()} disabled={disabled}>
+          {t('avatar.save')}
+        </Button>
+      </div>
+    </Dialog>
   )
 }

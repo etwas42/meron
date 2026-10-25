@@ -86,3 +86,16 @@ export function htmlToText(html: string): string {
   for (const child of Array.from(div.childNodes)) walk(child)
   return out.replace(/\n+$/g, '').trimStart()
 }
+
+/** [htmlToText] for a received mail's HTML, which must not load anything:
+ * parsed in an inert document, stripped of what fetches before the text is taken. */
+export function mailHtmlToText(source: string): string {
+  const html = new DOMParser().parseFromString(source, 'text/html')
+  html
+    .querySelectorAll('script, style, img, iframe, object, embed, link, video, audio, source')
+    .forEach((el) => el.remove())
+  html.querySelectorAll('*').forEach((el) => {
+    for (const attribute of Array.from(el.attributes)) el.removeAttribute(attribute.name)
+  })
+  return htmlToText(html.body.innerHTML)
+}

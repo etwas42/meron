@@ -121,6 +121,49 @@ pub struct BackupAccount {
     pub secrets: Option<Secrets>,
 }
 
+/// One task list and its items. Tasks are local-only — no server holds a copy —
+/// so unlike cached mail they cannot be re-fetched, which is why the config
+/// backup carries them in full rather than a pointer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BackupTaskList {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub tasks: Vec<BackupTask>,
+}
+
+/// One task, retaining its identity across exports and repeated imports.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BackupTask {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub due_at: i64,
+    #[serde(default)]
+    pub completed_at: i64,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub created_at: i64,
+    /// The thread this task came from, empty for a task typed from scratch.
+    /// Restored as-is: if the account it names isn't on this device the link is
+    /// simply dead, which is better than dropping the task.
+    #[serde(default)]
+    pub account: String,
+    #[serde(default)]
+    pub thread_id: String,
+    #[serde(default)]
+    pub message_id: String,
+}
+
 /// The decrypted body of a backup. Not `Debug`, for the same reason as
 /// [`BackupAccount`].
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -130,6 +173,15 @@ pub struct BackupData {
     /// The `settings` table, key -> parsed JSON value.
     #[serde(default)]
     pub settings: Map<String, Value>,
+    /// Absent in files written before Tasks existed, hence `default`. That is
+    /// also why [`FORMAT_VERSION`] does not move: an older build reading a
+    /// newer file ignores the field rather than failing on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_lists: Vec<BackupTaskList>,
+    /// Calendar events, local-only like tasks and carried the same way; absent
+    /// in files written before the calendar existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<store::CalendarEvent>,
 }
 
 /// What [`import`] changed, for the "restored N accounts" confirmation.
@@ -140,6 +192,9 @@ pub struct ImportSummary {
     pub feeds: u32,
     pub settings: u32,
     pub secrets: u32,
+    pub tasks: u32,
+    #[serde(default)]
+    pub events: u32,
 }
 
 impl ImportSummary {
@@ -150,6 +205,8 @@ impl ImportSummary {
             "feeds": self.feeds,
             "settings": self.settings,
             "secrets": self.secrets,
+            "tasks": self.tasks,
+            "events": self.events,
         })
     }
 }
@@ -208,7 +265,44 @@ pub fn collect(
         redact_settings(&mut settings);
     }
 
-    Ok(BackupData { accounts, settings })
+    Ok(BackupData {
+        accounts,
+        settings,
+        task_lists: collect_task_lists(conn)?,
+        events: store::all_events(conn)?,
+    })
+}
+
+/// Read every task list and its items. Tasks hold nothing secret — they are
+/// whatever the user typed — so unlike account config they are not redacted
+/// from a plaintext export.
+fn collect_task_lists(conn: &Connection) -> Result<Vec<BackupTaskList>> {
+    let lists = store::task_lists(conn)?;
+    let mut out = Vec::with_capacity(lists.len());
+    for list in lists {
+        let tasks = store::tasks_for_list(conn, &list.id, true)?
+            .into_iter()
+            .map(|task| BackupTask {
+                id: task.id,
+                title: task.title,
+                notes: task.notes,
+                due_at: task.due_at,
+                completed_at: task.completed_at,
+                sort_order: task.sort_order,
+                created_at: task.created_at,
+                account: task.account,
+                thread_id: task.thread_id,
+                message_id: task.message_id,
+            })
+            .collect();
+        out.push(BackupTaskList {
+            id: list.id,
+            title: list.title,
+            sort_order: list.sort_order,
+            tasks,
+        });
+    }
+    Ok(out)
 }
 
 fn collect_subscriptions(conn: &Connection, account: &str) -> Result<Vec<BackupSubscription>> {
@@ -541,6 +635,18 @@ pub fn apply(
         summary.settings += 1;
     }
 
+    for (index, list) in data.task_lists.iter().enumerate() {
+        summary.tasks += restore_task_list(&tx, list, index, now)?;
+    }
+
+    // By id, never over an event already here: importing the same file twice
+    // adds nothing, and an edit made since the export is kept.
+    for event in &data.events {
+        if !event.id.is_empty() && store::insert_event_if_absent(&tx, event)? {
+            summary.events += 1;
+        }
+    }
+
     tx.commit()?;
     Ok(summary)
 }
@@ -574,6 +680,69 @@ fn restore_subscription(
         ],
     )?;
     Ok(added as u32)
+}
+
+/// Preserve identities rather than merging unrelated rows with equal titles.
+/// Old backups lack IDs: derive repeatable IDs from their contents and position
+/// so even identical rows survive, and importing the same file is idempotent.
+fn restore_task_list(
+    conn: &Connection,
+    list: &BackupTaskList,
+    index: usize,
+    now: i64,
+) -> Result<u32> {
+    let list_id = if list.id.is_empty() {
+        legacy_task_id("tasklist", &serde_json::to_vec(&(index, list))?)
+    } else {
+        list.id.clone()
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO task_lists(id, title, sort_order, created_at, updated_at)
+         VALUES(?1, ?2, ?3, ?4, ?4)",
+        params![list_id, list.title.trim(), list.sort_order, now],
+    )?;
+
+    let mut restored = 0;
+    for (index, task) in list.tasks.iter().enumerate() {
+        let task_id = if task.id.is_empty() {
+            legacy_task_id("task", &serde_json::to_vec(&(&list_id, index, task))?)
+        } else {
+            task.id.clone()
+        };
+        let added = conn.execute(
+            "INSERT OR IGNORE INTO tasks(id, list_id, title, notes, due_at, completed_at, sort_order,
+                               account, thread_id, message_id, json, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, '{}', ?11, ?12)",
+            params![
+                task_id,
+                list_id,
+                task.title.trim(),
+                task.notes,
+                task.due_at.max(0),
+                task.completed_at.max(0),
+                task.sort_order,
+                task.account,
+                task.thread_id,
+                task.message_id,
+                if task.created_at > 0 {
+                    task.created_at
+                } else {
+                    now
+                },
+                now,
+            ],
+        )?;
+        restored += added as u32;
+    }
+    Ok(restored)
+}
+
+fn legacy_task_id(prefix: &str, bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    format!(
+        "{prefix}-legacy-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.as_ref())
+    )
 }
 
 fn json_column(value: &Value) -> String {

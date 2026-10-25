@@ -3,6 +3,7 @@ package jp.nonbili.meron.ui
 import androidx.compose.foundation.ComposeFoundationFlags
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.ColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.text.PlatformTextStyle
@@ -33,3 +34,8 @@ actual val avatarPlatformTextStyle: PlatformTextStyle? = null
 /** iOS derives the status bar style from the hosting view controller. */
 @Composable
 actual fun SyncSystemBarAppearance(dark: Boolean) = Unit
+
+actual val dynamicColorSupported: Boolean = false
+
+@Composable
+actual fun platformDynamicColorScheme(dark: Boolean): ColorScheme? = null

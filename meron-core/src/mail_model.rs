@@ -32,10 +32,12 @@ pub fn new_messages_detail(
     conn: &Connection,
     account_id: &str,
     account_name: &str,
+    folder: &str,
     muted: bool,
     headers: &[MessageHeader],
 ) -> Option<Value> {
     let latest = headers.first()?;
+    let is_inbox = folder.eq_ignore_ascii_case("INBOX");
     let messages: Vec<Value> = headers
         .iter()
         .take(NEW_MESSAGES_DETAIL_MAX)
@@ -44,7 +46,7 @@ pub fn new_messages_detail(
                 "uid": header.uid,
                 "from": display_from(header),
                 "subject": header.subject,
-                "preview": store::cached_body_preview(conn, account_id, "INBOX", header.uid)
+                "preview": store::cached_body_preview(conn, account_id, folder, header.uid)
                     .unwrap_or_default(),
                 "threadKey": store::card_thread_key(header),
                 "date": header.date,
@@ -54,7 +56,11 @@ pub fn new_messages_detail(
     Some(json!({
         "account": account_id,
         "accountName": account_name,
-        "folder": "inbox",
+        // The mailbox the arrivals landed in: "inbox", or the wire name of a
+        // folder the user opted in to notifications. `folderName` is its
+        // readable label, empty for the inbox (clients name that themselves).
+        "folder": if is_inbox { "inbox" } else { folder },
+        "folderName": if is_inbox { String::new() } else { crate::utf7::decode(folder) },
         "count": headers.len(),
         "muted": muted,
         "from": display_from(latest),
@@ -205,7 +211,14 @@ fn thread_cards_json_keyed(
     // And for who is in it: the page's newest header names one sender, but a
     // thread several people replied to should list them all.
     let mut senders: HashMap<(String, String), Vec<store::CardSender>> = HashMap::new();
+    // And which files it carries, which the page's headers cannot say.
+    let mut files: HashMap<(String, String), Vec<store::CardFile>> = HashMap::new();
     for (folder, keys) in keys_by_folder {
+        files.extend(
+            store::card_attachments(conn, account_id, folder, &keys)?
+                .into_iter()
+                .map(|(key, list)| ((folder.to_string(), key), list)),
+        );
         senders.extend(
             store::card_senders(conn, account_id, folder, &keys)?
                 .into_iter()
@@ -271,6 +284,10 @@ fn thread_cards_json_keyed(
                 .into_iter()
                 .map(|sender| json!({ "name": sender.name, "me": sender.me }))
                 .collect();
+            let files = files
+                .get(&(folder.to_string(), card.thread_key.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let folder_role = store::folder_role(conn, account_id, folder)?;
             let thread_id = format_thread_id(account_id, folder, &card.thread_key);
             let original_thread_id = card
@@ -298,7 +315,8 @@ fn thread_cards_json_keyed(
                 "message_count": message_count,
                 "starred": card.header.starred,
                 "has_draft": card.has_draft,
-                "has_attachments": false,
+                "has_attachments": !files.is_empty(),
+                "files": files,
                 "recipient_overflow": card.header.recipient_overflow,
                 "senders": senders,
                 "senders_truncated": senders_truncated,
@@ -456,11 +474,16 @@ pub fn starred_page(
     mut items: Vec<Value>,
     query: &str,
     filter: &str,
+    attachments_only: bool,
     limit: usize,
     before_cursor: Option<&str>,
 ) -> Value {
+    let flag = |item: &Value, key: &str| item.get(key).and_then(Value::as_bool).unwrap_or(false);
     if filter.eq_ignore_ascii_case("unread") {
-        items.retain(|item| item.get("unread").and_then(Value::as_bool).unwrap_or(false));
+        items.retain(|item| flag(item, "unread"));
+    }
+    if attachments_only {
+        items.retain(|item| flag(item, "has_attachments"));
     }
     let query = query.trim().to_lowercase();
     if !query.is_empty() {
@@ -556,6 +579,29 @@ pub fn mutation_result(
     result["folder_unreads"] = Value::Object(folder_unreads);
     result["folder_counts"] = Value::Array(folder_counts);
     Ok(result)
+}
+
+/// Add the unread counts of further mailboxes a mutation touched — a
+/// whole-thread flag change reaches every folder the thread spans — to a
+/// [`mutation_result`], so clients refresh those badges too.
+pub fn add_folder_unreads(
+    result: &mut Value,
+    conn: &Connection,
+    account_id: &str,
+    folders: impl IntoIterator<Item = impl AsRef<str>>,
+) -> anyhow::Result<()> {
+    for folder in folders {
+        let folder = folder.as_ref();
+        if result["folder_unreads"][account_id].get(folder).is_some() {
+            continue;
+        }
+        let unread = store::get_folder_unread(conn, account_id, folder)?;
+        result["folder_unreads"][account_id][folder] = json!(unread);
+        if let Some(counts) = result["folder_counts"].as_array_mut() {
+            counts.push(json!({ "account_id": account_id, "folder_id": folder, "unread": unread }));
+        }
+    }
+    Ok(())
 }
 
 fn encode_starred_cursor(date: i64, id: &str) -> String {
@@ -1083,11 +1129,11 @@ mod tests {
             json!({"id":"two","date":200,"subject":"Design review"}),
             json!({"id":"one","date":100,"subject":"Design notes"}),
         ];
-        let first = starred_page(items.clone(), "design", "all", 1, None);
+        let first = starred_page(items.clone(), "design", "all", false, 1, None);
         assert_eq!(first["items"][0]["id"], "two");
         let cursor = first["next_cursor"].as_str().unwrap();
         assert!(cursor.starts_with("starred:"));
-        let second = starred_page(items, "design", "all", 1, Some(cursor));
+        let second = starred_page(items, "design", "all", false, 1, Some(cursor));
         assert_eq!(second["items"][0]["id"], "one");
         assert!(second.get("next_cursor").is_none());
     }
@@ -1099,12 +1145,29 @@ mod tests {
             json!({"id":"unread-two","date":200,"unread":true}),
             json!({"id":"unread-one","date":100,"unread":true}),
         ];
-        let first = starred_page(items.clone(), "", "unread", 1, None);
+        let first = starred_page(items.clone(), "", "unread", false, 1, None);
         assert_eq!(first["items"][0]["id"], "unread-two");
         let cursor = first["next_cursor"].as_str().unwrap();
-        let second = starred_page(items, "", "unread", 1, Some(cursor));
+        let second = starred_page(items, "", "unread", false, 1, Some(cursor));
         assert_eq!(second["items"][0]["id"], "unread-one");
         assert!(second.get("next_cursor").is_none());
+    }
+
+    #[test]
+    fn starred_page_combines_unread_with_attachments() {
+        let items = vec![
+            json!({"id":"plain","date":300,"unread":true,"has_attachments":false}),
+            json!({"id":"files","date":200,"unread":true,"has_attachments":true}),
+            json!({"id":"read-files","date":100,"unread":false,"has_attachments":true}),
+        ];
+        let page = starred_page(items, "", "unread", true, 10, None);
+        let ids: Vec<&str> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["files"]);
     }
 
     #[test]

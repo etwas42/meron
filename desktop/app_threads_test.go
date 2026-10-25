@@ -105,12 +105,19 @@ func TestThreadsJSONKeepsSendersFromCoreThreads(t *testing.T) {
 					map[string]any{"name": "Dana", "me": false},
 				},
 				"senders_truncated": true,
+				"has_attachments":   true,
+				"files": []any{
+					map[string]any{"filename": "plan.pdf", "mime": "application/pdf"},
+				},
 			},
 		},
 	}
 	thread := threadsByID(t, threadsJSON("acc", "INBOX", raw))["t1"]
 	if len(thread.Senders) != 3 || thread.Senders[2].Name != "Dana" || !thread.SendersTruncated {
 		t.Errorf("senders dropped from core thread row: %#v", thread)
+	}
+	if !thread.HasAttachments || len(thread.Files) != 1 || thread.Files[0].Filename != "plan.pdf" {
+		t.Errorf("attachments dropped from core thread row: %#v", thread)
 	}
 }
 
@@ -133,9 +140,10 @@ func TestThreadsJSONSkipsKeylessCardsAndPassesCursor(t *testing.T) {
 			map[string]any{"subject": "Dropped"}, // no thread_key
 			map[string]any{"thread_key": "k2", "subject": "Kept"},
 		},
-		"next_cursor":   "cursor-token",
-		"folder_unread": float64(3),
-		"folder_synced": true,
+		"next_cursor":       "cursor-token",
+		"folder_unread":     float64(3),
+		"folder_synced":     true,
+		"search_incomplete": true,
 	}
 
 	out := threadsJSON("acc", "INBOX", raw)
@@ -151,6 +159,9 @@ func TestThreadsJSONSkipsKeylessCardsAndPassesCursor(t *testing.T) {
 	}
 	if got := out.(map[string]any)["folder_synced"]; got != true {
 		t.Errorf("folder_synced = %v, want true", got)
+	}
+	if got := out.(map[string]any)["search_incomplete"]; got != true {
+		t.Errorf("search_incomplete = %v, want true", got)
 	}
 }
 

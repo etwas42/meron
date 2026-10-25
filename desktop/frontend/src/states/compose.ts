@@ -4,7 +4,10 @@ import { invoke } from '../lib/bridge'
 import { CONVERSATION_PAGE_SIZE } from '../lib/pagination'
 import { ui$, showToast } from './ui'
 import { accounts$, isSendableAccount, accountIdentities } from './accounts'
-import { mail$, getActiveThread, normalizeMessageId } from './mail'
+import { getActiveThread, normalizeMessageId } from './mail'
+// From the leaf module: this one subscribes to it while loading, which can be
+// inside an import cycle through mail.ts.
+import { mail$ } from './mailState'
 import { isDraftFolder } from './mailFolders'
 import { discardSavedDraftCopy } from './mailMoves'
 import { LOCAL_SEND_PREFIX } from './pendingSends'
@@ -13,6 +16,7 @@ import { parseMailto } from '../lib/mailto'
 import {
   bodyWithSignature,
   bodyWithSwappedSignature,
+  type ComposeBody,
   resolveSignature,
   signatureForms,
   type Signature,
@@ -20,7 +24,7 @@ import {
   type SignatureTracking,
 } from '../lib/signature'
 import { settings$ } from './settings'
-import { revealRemote, thread$ } from './thread'
+import { resolveConversationMode, revealRemote, thread$ } from './thread'
 import { formatFullTimestamp } from '../components/chat/messageHelpers'
 import { closeComposeSession, forgetComposeSession, pruneComposeSessions } from './composeSessions'
 import {
@@ -47,6 +51,7 @@ import {
   quickReplyDraftSaveInFlight,
   quickReplyWithoutSignature,
   reserveOpeningDraft,
+  unconfirmedQuickReplyDraftId,
   seedQuickReplySignature,
 } from './quickReply'
 
@@ -106,6 +111,93 @@ function forwardedHtmlBody(message: Message): string {
     .join('')
   const body = message.body_html || textToHtml(message.body ?? '')
   return `<p><br></p><div class="meron-forwarded-message"><p>---------- Forwarded message ---------</p>${header}<br>${body}</div>`
+}
+
+/**
+ * The message a reply answers, quoted under it, when the user quotes replies
+ * (`settings.quoteReplies`): an "On …, Jane wrote:" line over the original,
+ * `> `-prefixed in plain text and in a `<blockquote type="cite">` in HTML —
+ * the Apple Mail and Thunderbird shape, which the conversation view folds in
+ * our own sent replies as it does in theirs. `rich` says whether the original
+ * was HTML. Undefined when quoting is off or the original has no body loaded.
+ */
+export function replyQuote(message: Message): ComposeBody | undefined {
+  if (!settings$.quoteReplies.peek()) return undefined
+  const body = message.body ?? ''
+  if (!message.body_html && !body.trim()) return undefined
+  const attribution = `On ${formatFullTimestamp(message.date)}, ${formatMessageFrom(message)} wrote:`
+  const quoted = body
+    .replace(/\s+$/, '')
+    .split('\n')
+    .map((line) => (line ? `> ${line}` : '>'))
+    .join('\n')
+  return {
+    rich: !!message.body_html,
+    html: `<p>${escapeHtml(attribution)}</p><blockquote type="cite">${message.body_html || textToHtml(body)}</blockquote>`,
+    text: `${attribution}\n${quoted}`,
+  }
+}
+
+/** Whether a body already quotes the message `quote` answers — a saved quoted
+ * reply carried back into a reply — by the attribution line it opens with. */
+export function bodyHasReplyQuote(body: string, quote: ComposeBody): boolean {
+  const attribution = quote.text.split('\n', 1)[0]
+  return !!attribution && body.includes(attribution)
+}
+
+/** What a draft sends and saves: its body, with a folded quote under it. */
+export function composedContent(draft: Pick<ComposeDraft, 'rich' | 'html' | 'text' | 'quote'>): string {
+  const own = draft.rich ? draft.html : draft.text
+  if (!draft.quote) return own
+  if (draft.rich) return `${own}${draft.quote.html}`
+  return own.trim() ? `${own.replace(/\s+$/, '')}\n\n${draft.quote.text}` : draft.quote.text
+}
+
+/**
+ * A reopened draft's body with the quote at its tail folded away again, as it
+ * was while the reply was being written. The core marks that tail when it reads
+ * the draft back: `data-meron-quote` on the HTML elements, `body_quote_start`
+ * in the plain body. A draft without one comes back whole.
+ */
+function foldDraftQuote(message: Message): ComposeBody & { quote?: ComposeDraft['quote'] } {
+  if (message.body_html) {
+    const doc = new DOMParser().parseFromString(message.body_html, 'text/html')
+    // The core marks only a quote that ends the message, so everything from the
+    // first marked element to the end of the document is the quote — at the top
+    // level, inside a wrapper the reply shares with it, or (Outlook) running on
+    // past that wrapper. The range splits whatever wrappers it crosses.
+    const first = doc.body.querySelector('[data-meron-quote]')
+    if (!first) return { rich: true, html: message.body_html, text: '' }
+    const from = (node: Node) => {
+      const siblings: Node[] = []
+      for (let at: Node | null = node; at; at = at.nextSibling) siblings.push(at)
+      return siblings
+    }
+    let tail = from(first)
+    for (let wrapper = first.parentNode; wrapper && wrapper !== doc.body; wrapper = wrapper.parentNode) {
+      const following = wrapper.nextSibling ? from(wrapper.nextSibling) : []
+      const part = wrapper.cloneNode(false)
+      for (const node of tail) part.appendChild(node)
+      tail = [part, ...following]
+    }
+    const folded = doc.createElement('div')
+    for (const node of tail) folded.appendChild(node)
+    for (const element of Array.from(folded.querySelectorAll('[data-meron-quote]'))) {
+      element.removeAttribute('data-meron-quote')
+    }
+    const html = folded.innerHTML.trim()
+    return { rich: true, html: doc.body.innerHTML, text: '', quote: { html, text: htmlToText(html) } }
+  }
+  const body = message.body ?? ''
+  const start = message.body_quote_start
+  if (start == null || start <= 0 || start >= body.length) return { rich: false, html: '', text: body }
+  const text = body.slice(start)
+  return {
+    rich: false,
+    html: '',
+    text: body.slice(0, start).replace(/\s+$/, ''),
+    quote: { html: `<blockquote type="cite">${textToHtml(text)}</blockquote>`, text },
+  }
 }
 
 // Return to the Current conversation tab, restoring the thread it was showing
@@ -180,25 +272,42 @@ compose$.tabs.onChange(({ value: tabs }) => {
   }
 })
 
-// Keep pending reader snapshots in sync when background body fetching completes.
+// Keep reader snapshots in sync with the loaded conversation: the body when
+// background fetching completes, and the read and star flags whenever they
+// change there, so the tab's menu still toggles the right way once that
+// conversation is no longer loaded.
 mail$.messages.onChange(({ value: messages }) => {
-  const loaded = new Map(messages.filter((message) => !message.body_missing).map((message) => [message.id, message]))
+  const byId = new Map(messages.map((message) => [message.id, message]))
   for (const [index, tab] of compose$.tabs.peek().entries()) {
-    if (tab.kind !== 'reader' || !tab.bodyMissing) continue
-    const message = loaded.get(tab.messageId)
+    if (tab.kind !== 'reader') continue
+    const message = byId.get(tab.messageId)
     if (!message) continue
-    compose$.tabs[index].assign({
-      body: message.body,
-      bodyHtml: message.body_html,
-      bodyMissing: false,
-      attachments: message.attachments,
-    })
+    if (tab.bodyMissing && !message.body_missing) {
+      compose$.tabs[index].assign({
+        body: message.body,
+        bodyHtml: message.body_html,
+        bodyMissing: false,
+        attachments: message.attachments,
+        // The bottom bar forwards from this: without the body it would send
+        // an empty forward with none of the attachments the reader now shows.
+        message,
+      })
+    } else if (tab.message && (tab.message.unread !== message.unread || tab.message.starred !== message.starred)) {
+      compose$.tabs[index].assign({ message: { ...tab.message, unread: message.unread, starred: message.starred } })
+    }
   }
 })
 
 // Open a single message in its own reader tab. The HTML is already on the
 // message (shipped with threadRead), so this is instant — no fetch. Re-opening
 // an already-open message just re-activates its tab.
+// What the tab strip's avatar needs, as ThreadListItem draws it: a feed item
+// shows its feed's icon rather than resolving the sender address.
+function tabAvatar(message: Message): Pick<MessageTab, 'fromAddr' | 'feedIcon'> {
+  if (message.feed_url) return { feedIcon: message.feed_icon }
+  return { fromAddr: message.from_addr }
+}
+
 export function openMessageTab(message: Message) {
   const existing = compose$.tabs.get().find((tab) => tab.messageId === message.id)
   if (existing) {
@@ -215,9 +324,9 @@ export function openMessageTab(message: Message) {
     // Carried so the tab can resolve this message's remote-content policy.
     accountId: message.account_id,
     revealRemote: !!thread$.revealedRemote.peek()[message.id],
-    // Snapshotted rather than re-derived: the tab keeps no Message, and the
-    // From address alone misses an alias or a send still in flight (the same
-    // rule useMessageView applies in the conversation).
+    // Snapshotted at open time: the From address alone misses an alias or a
+    // send still in flight (the same rule useMessageView applies in the
+    // conversation).
     outgoing:
       !!message.send_status ||
       message.outgoing === true ||
@@ -227,6 +336,7 @@ export function openMessageTab(message: Message) {
         )),
     subject: message.subject || '(no subject)',
     from: message.from_name || message.from_addr,
+    ...tabAvatar(message),
     fromRaw: message.from_name ? `${message.from_name} <${message.from_addr}>` : message.from_addr,
     to: message.to,
     cc: message.cc,
@@ -238,6 +348,7 @@ export function openMessageTab(message: Message) {
     bodyMissing: message.body_missing,
     attachments: message.attachments,
     viewMode: message.body_html && preferHtml ? 'html' : 'plain',
+    message,
   }
   compose$.tabs.push(tab)
   compose$.activeTab.set(tab.id)
@@ -258,6 +369,7 @@ export function openThreadTab(thread: Message) {
       folderId: thread.folder_id,
       subject: thread.subject || '(no subject)',
       from: thread.from_name || thread.from_addr,
+      ...tabAvatar(thread),
       body: '',
       viewMode: 'plain',
     }
@@ -277,8 +389,19 @@ export function newestMessage(messages: Message[]): Message | null {
   }, null)
 }
 
-export async function openThreadTabById(threadId: string) {
+/**
+ * Open a thread in its own tab from an id alone — a notification tap, a task's
+ * mail link. `notFoundMessage` is the toast for a thread the read cannot find
+ * (deleted, expunged), since each caller knows what the user was pointing at.
+ */
+export async function openThreadTabById(
+  threadId: string,
+  notFoundMessage = t('compose.toast.couldNotOpenNotificationThread'),
+) {
   if (!threadId) return
+  // The conversation shows in the mail pane, which the calendar replaces —
+  // even when its tab is the active one already, so no tab change says so.
+  ui$.calendarOpen.set(false)
   const id = `thread-${threadId}`
   const existing = compose$.tabs.get().find((tab) => tab.id === id)
   if (existing) {
@@ -295,7 +418,7 @@ export async function openThreadTabById(threadId: string) {
     })
     const message = newestMessage(result.messages ?? [])
     if (!message) {
-      showToast(t('compose.toast.couldNotOpenNotificationThread'), 'error')
+      showToast(notFoundMessage, 'error')
       return
     }
     openThreadTab(message)
@@ -307,7 +430,7 @@ export async function openThreadTabById(threadId: string) {
       mail$.messages.set(result.messages ?? [])
     }
   } catch (error) {
-    showToast(error instanceof Error ? error.message : t('compose.toast.couldNotOpenNotificationThread'), 'error')
+    showToast(error instanceof Error ? error.message : notFoundMessage, 'error')
   }
 }
 
@@ -346,6 +469,12 @@ type ComposeSeed = Partial<ComposeDraft> & {
   /** Where the signature lands; 'aboveQuote' for a seeded quote (forwards). */
   signaturePlacement?: SignaturePlacement
   /**
+   * The message a reply answers, quoted under the seeded body (see
+   * {@link replyQuote}) but folded away until the user unfolds it. An HTML
+   * original makes the draft rich.
+   */
+  quote?: ComposeBody
+  /**
    * Skip the signature. Set when the body is an existing message being re-opened
    * (a saved draft, "Edit as New Message") — it already carries whatever
    * signature it was written with, and a second copy is not wanted.
@@ -356,6 +485,8 @@ type ComposeSeed = Partial<ComposeDraft> & {
 export function openComposeTab(seed?: ComposeSeed): string | undefined {
   const sendable = accounts$.get().filter(isSendableAccount)
   if (sendable.length === 0) return undefined
+  // The composer opens in the mail pane, which the calendar replaces.
+  ui$.calendarOpen.set(false)
   const selected = ui$.selectedAccount.get()
   const accountId = seed?.accountId ?? sendable.find((acc) => acc.id === selected)?.id ?? sendable[0].id
   // Only a truly blank compose (no seeded body) should pick up the account's
@@ -366,11 +497,13 @@ export function openComposeTab(seed?: ComposeSeed): string | undefined {
 
   // The signature is inserted into the body up front so it is editable (and
   // visible) like the rest of the draft, rather than appearing at send time.
-  const seeded = {
-    rich: seed?.rich ?? (hasSeededBody ? false : (account?.conversation_html ?? true)),
-    html: seed?.html ?? '',
-    text: seed?.text ?? '',
-  }
+  const quote = seed?.quote
+  const rich = seed?.rich ?? (hasSeededBody ? false : (account?.conversation_html ?? true))
+  // An HTML original is quoted as HTML, so the reply goes rich with it.
+  const seeded =
+    quote?.rich && !rich
+      ? { rich: true, html: seed?.html || textToHtml(seed?.text ?? ''), text: '' }
+      : { rich, html: seed?.html ?? '', text: seed?.text ?? '' }
   // A body this app did not compose (a saved draft, "Edit as New Message") may
   // already carry a signature, so it stays unmanaged: `undefined`, not `null`.
   const placement = seed?.signaturePlacement ?? 'belowText'
@@ -400,6 +533,7 @@ export function openComposeTab(seed?: ComposeSeed): string | undefined {
     references: seed?.references ?? '',
     draftMessageId: seed?.draftMessageId ?? newDraftMessageId(),
     signature: tracking,
+    quote: quote ? { html: quote.html, text: quote.text } : undefined,
     sourceDraft: seed?.sourceDraft,
     attachments: seed?.attachments ?? [],
   }
@@ -436,8 +570,11 @@ export function openReplyInFullEditor(options?: { replyAll?: boolean }) {
   const replyAcc = accounts.find((acc) => acc.id === t.account_id)
   // Hand off any draft already saved for this quick reply so the full editor
   // continues editing the same server-side draft instead of creating a
-  // duplicate one.
-  const existingDraftId = compose$.quickReplyDraftSaved.peek() ? compose$.quickReplyDraftId.peek() : undefined
+  // duplicate one — or the id a failed save may have left a copy under, which
+  // the editor's next save then overwrites instead of stranding.
+  const existingDraftId =
+    (compose$.quickReplyDraftSaved.peek() ? compose$.quickReplyDraftId.peek() : unconfirmedQuickReplyDraftId()) ||
+    undefined
   // Nothing to hand over while the first autosave is still allocating its id, so
   // the tab starts a draft of its own — mark the copy that save lands as
   // abandoned rather than leaving it in Drafts with nothing pointing at it.
@@ -451,6 +588,8 @@ export function openReplyInFullEditor(options?: { replyAll?: boolean }) {
   // found the user has written into it: it stays in the body as theirs, and the
   // composer is told not to add a second.
   const carried = quickReplyWithoutSignature()
+  // A bar holding a saved quoted reply already carries its quote.
+  const quote = replyQuote(target)
   openComposeTab({
     accountId: t.account_id || undefined,
     fromEmail: resolveQuickReplyFrom(target, replyAcc),
@@ -466,6 +605,7 @@ export function openReplyInFullEditor(options?: { replyAll?: boolean }) {
     draftMessageId: existingDraftId,
     title: subject,
     threadId: t.thread_id,
+    quote: quote && !bodyHasReplyQuote(carried.text, quote) ? quote : undefined,
   })
   compose$.composerAttachments.set([])
   clearQuickReplyDraftOwnership()
@@ -539,7 +679,7 @@ export async function editAsNewMessage(message: Message) {
 }
 
 function composeFromDraftMessage(message: Message): ComposeSeed {
-  const rich = !!message.body_html
+  const body = foldDraftQuote(message)
   return {
     accountId: message.account_id || undefined,
     fromEmail: message.from_addr ?? '',
@@ -549,9 +689,10 @@ function composeFromDraftMessage(message: Message): ComposeSeed {
     replyTo: message.reply_to ?? '',
     showCcBcc: hasExtraComposeHeaders({ cc: message.cc ?? '', bcc: message.bcc ?? '' }),
     subject: message.subject ?? '',
-    rich,
-    html: rich ? (message.body_html ?? '') : '',
-    text: rich ? '' : (message.body ?? ''),
+    rich: body.rich,
+    html: body.html,
+    text: body.text,
+    quote: body.quote && { rich: body.rich, ...body.quote },
     inReplyTo: '',
     references: message.references ?? '',
     // Not an id already being expunged: that copy is going away, so this tab's
@@ -671,6 +812,7 @@ export async function openDraftConversationOrCompose(thread: Message) {
       if (ui$.selectedThread.peek() === thread.thread_id) {
         mail$.messages.set(messages)
         mail$.messagesCursor.set('')
+        mail$.messagesCursorThread.set(thread.thread_id)
         mail$.messagesLoadingMore.set(false)
         mail$.threadLoading.set(false)
       }
@@ -703,12 +845,18 @@ export async function openDraftConversationOrCompose(thread: Message) {
  * — the recipients are the point of the action, and only the full editor shows
  * them. The quick reply's own draft is left alone; this is a separate reply. */
 export function replyAllToMessage(message: Message) {
+  replyToMessage(message, true)
+}
+
+/** Reply (or reply-all) to one message in a compose tab, rather than to the
+ *  conversation's reply target in the quick reply bar. */
+export function replyToMessage(message: Message, replyAll = false) {
   const accounts = accounts$.get()
   if (accounts.filter(isSendableAccount).length === 0) {
     showToast(t('compose.toast.addMailAccountBeforeComposing'))
     return
   }
-  const { to, cc } = buildReplyRecipients(message, true)
+  const { to, cc } = buildReplyRecipients(message, replyAll)
   const { in_reply_to, references } = buildReplyThreading(message)
   const acc = accounts.find((a) => a.id === message.account_id)
   const subject = message.subject.startsWith('Re:') ? message.subject : `Re: ${message.subject}`
@@ -723,6 +871,7 @@ export function replyAllToMessage(message: Message) {
     title: subject,
     inReplyTo: in_reply_to,
     references,
+    quote: replyQuote(message),
   })
 }
 
@@ -807,7 +956,13 @@ export function finishClosingMessageTab(id: string) {
   compose$.tabs.set(next)
   if (compose$.activeTab.get() === id) {
     const target = popToPreviousTab(id, next)
-    const nextTab = target ? next.find((tab) => tab.id === target) : null
+    // Falling back to the Current tab needs a conversation to fall back to.
+    // With none — a tab opened from tasks or a notification over an empty pane
+    // — Current is not even offered in the strip (and in kanban view it would
+    // close the pane), so hand over to a tab that's still open instead.
+    const fallback = !target && !compose$.conversationThread.get() ? next[next.length - 1]?.id : ''
+    const resolved = fallback || target
+    const nextTab = resolved ? next.find((tab) => tab.id === resolved) : null
     if (!nextTab) {
       activateConversationTab()
     } else if (nextTab.kind === 'thread') {
@@ -860,6 +1015,21 @@ export async function closeMessageTab(id: string) {
   })
 }
 
+// Close several tabs at once (the tab strip's close others/left/right/all).
+// Compose tabs are skipped: closing one discards its draft, which a bulk close
+// must never do behind the user's back.
+export function closeMessageTabs(ids: string[]) {
+  const wanted = new Set(ids)
+  const closing = compose$.tabs
+    .get()
+    .filter((tab) => wanted.has(tab.id) && tab.kind !== 'compose')
+    .map((tab) => tab.id)
+  // Close the active tab last, so it falls back to a tab that stays open.
+  const active = compose$.activeTab.get()
+  for (const id of closing) if (id !== active) finishClosingMessageTab(id)
+  if (closing.includes(active)) finishClosingMessageTab(active)
+}
+
 // Reveal a message's remote content in the conversation and on any reader tab
 // already open for it. The tab needs its own copy because `resetThreadView`
 // clears the conversation's reveal map on the next thread switch while the tab
@@ -873,8 +1043,40 @@ export function revealMessageRemote(messageId: string) {
   )
 }
 
+/** Keeps a reader tab's copy of its message in step with a change made from
+ *  the tab, for when the thread it came from is no longer loaded. */
+export function patchTabMessage(id: string, patch: Partial<Message>) {
+  compose$.tabs.set(
+    compose$.tabs
+      .get()
+      .map((tab) => (tab.id === id && tab.message ? { ...tab, message: { ...tab.message, ...patch } } : tab)),
+  )
+}
+
 export function setTabViewMode(id: string, mode: 'html' | 'plain') {
   compose$.tabs.set(compose$.tabs.get().map((tab) => (tab.id === id ? { ...tab, viewMode: mode } : tab)))
+}
+
+/** Switches what's in front between HTML and plain text, for the shortcut:
+ *  a reader tab flips its own view, a conversation flips its account's
+ *  session override, as the header's "View as" menu does. A thread tab's
+ *  account comes from the tab. Returns false when there was nothing to switch. */
+export function toggleConversationMode(accountId: string | undefined): boolean {
+  const activeTabId = compose$.activeTab.peek()
+  const tab = activeTabId ? compose$.tabs.peek().find((candidate) => candidate.id === activeTabId) : undefined
+  if (tab?.kind === 'reader') {
+    // A message with no HTML part reads the same either way.
+    if (!tab.bodyHtml) return false
+    setTabViewMode(tab.id, tab.viewMode === 'html' ? 'plain' : 'html')
+    return true
+  }
+  if (tab?.kind === 'compose') return false
+  const id = tab?.kind === 'thread' && tab.accountId ? tab.accountId : accountId
+  const accounts = accounts$.peek()
+  if (!id || !accounts.some((account) => account.id === id)) return false
+  const current = resolveConversationMode(accounts, thread$.conversationModeOverrides.peek(), id)
+  thread$.conversationModeOverrides[id].set(current === 'html' ? 'plain' : 'html')
+  return true
 }
 
 // Send a composed message via the same mail.send path used by replies. When
@@ -973,6 +1175,7 @@ export function appendSentMessage(args: {
     })),
   }
   mail$.messages.push(sent)
+  thread$.pendingOwnSendId.set(sent.id)
 }
 
 // Save a composed draft message to the drafts folder on the server.
@@ -997,7 +1200,7 @@ export async function saveComposedDraft(args: {
     !args.draftMessageId || args.draftMessageId.startsWith('local-draft-')
       ? await allocateMessageIdentity(args.accountId, true)
       : args.draftMessageId
-  await invoke('mail.saveDraft', {
+  const request = invoke('mail.saveDraft', {
     account_id: args.accountId,
     from: args.from ?? '',
     to: args.to,
@@ -1017,5 +1220,22 @@ export async function saveComposedDraft(args: {
       inline_id: a.inlineId ?? '',
     })),
   })
+  try {
+    await request
+  } catch (error) {
+    // A failed save may still have written the draft (the host can give up
+    // waiting while the core carries on), so the id it was written under has to
+    // survive the failure: the next save then replaces that copy, and a send
+    // discards it, instead of it sitting in Drafts with nothing pointing at it.
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+      draftMessageId,
+    })
+  }
   return draftMessageId
+}
+
+/** The server draft id a failed [saveComposedDraft] was writing, if it had one. */
+export function draftIdOfFailedSave(error: unknown): string | undefined {
+  const id = (error as { draftMessageId?: unknown } | null)?.draftMessageId
+  return typeof id === 'string' && id ? id : undefined
 }

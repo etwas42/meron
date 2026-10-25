@@ -73,7 +73,7 @@ export function BlockedRemoteButton({
           onClick={(event) => event.stopPropagation()}
           overlay
           overlayClassName="fixed inset-0 z-[60]"
-          className="fixed z-[61] min-w-[180px] rounded-xl border border-border bg-header p-1 shadow-xl"
+          className="fixed z-[61] min-w-[180px] bg-header shadow-xl"
         >
           <MenuItem
             icon={<Image size={13} className="text-accent" />}

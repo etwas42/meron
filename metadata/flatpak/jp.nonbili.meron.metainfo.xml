@@ -63,6 +63,163 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.7" date="2026-10-22">
+      <description>
+        <ul>
+          <li>Add a local calendar of events, accepted invitations and due tasks</li>
+          <li>Show calendar invite cards with Accept/Maybe/Decline</li>
+          <li>Support saved search columns on the board, editable in place</li>
+          <li>Add search options form and search operators like from:, to:, subject:, is:unread</li>
+          <li>Save and copy inline images from the message menu and the gallery</li>
+          <li>Add recent thread move and copy shortcuts</li>
+          <li>Support cross-account thread moves</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.6" date="2026-10-17">
+      <description>
+        <ul>
+          <li>Add setting to quote the original in replies</li>
+          <li>Add "Add to Tasks" button to the thread header</li>
+          <li>Add Copy message text to the message menu</li>
+          <li>Show up to four digits in the unread badge</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.5" date="2026-10-15">
+      <description>
+        <ul>
+          <li>Redesign the reader tab, frost content under floating controls</li>
+          <li>Route Flatpak save and open dialogs through the file chooser portal</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.4" date="2026-10-14">
+      <description>
+        <ul>
+          <li>Attach files dropped onto a conversation or the composer</li>
+          <li>Save images and videos from the gallery and inline in a conversation</li>
+          <li>Toggle a conversation between HTML and plain text with H</li>
+          <li>Add Save as .eml to the conversation menu</li>
+          <li>Monochrome tray icon that follows the menu bar</li>
+          <li>Add expand all / collapse all, and thread menu on right-click</li>
+          <li>Float quick reply with single-row controls and shrink pinned header to one row</li>
+          <li>Darken message bodies to the surface they sit on, not black</li>
+          <li>Always scroll the conversation to a reply the reader just sent</li>
+          <li>Name folders by their last path segment in column titles</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.3" date="2026-10-09">
+      <description>
+        <ul>
+          <li>Per-folder background sync and notifications for custom folders</li>
+          <li>Show message bodies without a second download or HTML parse</li>
+          <li>Use macOS's own overlay scrollbars</li>
+          <li>Show an account's initials, not its Gravatar, when it has no picture</li>
+          <li>Fix kanban column reorder drag axis, highlight, keyboard and grab area</li>
+          <li>Flag accounts whose OAuth sign-in was refused as needing reconnect</li>
+          <li>Size the side rail in rem so its tiles keep their gap to the indicator</li>
+          <li>Show the decodable part of a truncated base64 body</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.2" date="2026-10-05">
+      <description>
+        <ul>
+          <li>Export threads, selections and folders as .eml</li>
+          <li>Option to show full message content in chat</li>
+          <li>Scale composer text with message text size</li>
+          <li>Slide tasks and details panels open and closed</li>
+          <li>Simplify task dragging and inline editing</li>
+          <li>Conceal startup window until the UI is rendered</li>
+          <li>Fold Outlook quotes</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.1" date="2026-10-03">
+      <description>
+        <ul>
+          <li>Move thread and kanban search into the title bar</li>
+          <li>Keep thread tabs across kanban switches and restyle tab bar</li>
+          <li>Render reader videos and add active conversation tab close button</li>
+          <li>Copy text via native clipboard from message iframes</li>
+          <li>Keep conversation controls above details pane</li>
+          <li>Keep archived threads in place and the open conversation selected</li>
+          <li>Keep thread hover highlight while context menu is open</li>
+          <li>Fix single-instance launch on Linux snap packages</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.4.0" date="2026-10-01">
+      <description>
+        <ul>
+          <li>Custom title bar</li>
+          <li>Theme polish with Meron Dark as default and tonal panes</li>
+          <li>Support Ctrl+Q to quit on Linux and Windows</li>
+          <li>Fix sliced thread prints on Linux</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.11" date="2026-09-30">
+      <description>
+        <ul>
+          <li>Render HTML content sent in plain text parts instead of showing raw tags</li>
+          <li>Fix dark mode message bodies on emails with a light background</li>
+          <li>Ship core binary inside the Windows package instead of extracting at runtime</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.10" date="2026-09-29">
+      <description>
+        <ul>
+          <li>Open threads in new tabs on double-click or Ctrl/Cmd+click with tab context menus</li>
+          <li>Add match-system theme following OS appearance and support dark message bodies</li>
+          <li>Share and import custom themes as a color string</li>
+          <li>Remember window size and maximized state, and add close-to-tray setting</li>
+          <li>Reorganize settings into General, Messages, and Composer sections</li>
+          <li>Slide Kanban conversation pane open and closed</li>
+          <li>Auto-fit chat bubbles and add bottom reader actions</li>
+          <li>Remove account avatars and board images from settings headers</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.9" date="2026-09-27">
+      <description>
+        <ul>
+          <li>Show attachment chips on thread cards and add attachments filter</li>
+          <li>Add per-column attachments filter to Kanban column menus</li>
+          <li>Show completed tasks in a collapsible section</li>
+          <li>Refine search queries, cap live fetches, and flag incomplete results</li>
+          <li>Share sender avatar resolution across desktop and Android</li>
+          <li>Add open and copy link actions to RSS feed items</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.8" date="2026-09-23">
+      <description>
+        <ul>
+          <li>Add local task lists and side panel with mail linking</li>
+          <li>Support images and HTML source editing in signatures</li>
+          <li>Fix undo after trash, move, and archive by restoring exact message copies</li>
+          <li>Fix draft cleanup after sending and prevent orphaned drafts</li>
+          <li>Fix mark all as read and chunk large IMAP operations</li>
+          <li>Update translations across locales</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.7" date="2026-09-18">
+      <description>
+        <ul>
+          <li>Support printing messages and threads</li>
+          <li>Move compose to side navigation</li>
+          <li>Make Meron Light the default theme</li>
+          <li>List all senders on thread cards</li>
+          <li>Refine unread badges across views</li>
+          <li>Refine palette search and quick settings</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.6" date="2026-09-13">
       <description>
         <ul>

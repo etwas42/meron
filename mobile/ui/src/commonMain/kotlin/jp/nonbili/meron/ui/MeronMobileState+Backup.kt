@@ -23,16 +23,6 @@ import kotlinx.coroutines.withContext
 internal enum class BackupPassphraseMode { Export, Restore }
 
 /**
- * Catalog lookup outside a composition. `tr` needs `LocalAppLocale`, which these
- * state functions have no access to, so resolve the tag from prefs the same way
- * the root composable does.
- */
-internal fun MeronMobileState.trs(
-    key: String,
-    args: Map<String, Any?> = emptyMap(),
-): String = localizedString(loadAppLanguageTag(prefs).ifBlank { "en" }, key, args)
-
-/**
  * Serialize a backup and hand it to the platform save-file picker.
  *
  * `passphrase` encrypts the document; `includeSecrets` additionally embeds
@@ -79,7 +69,7 @@ internal fun MeronMobileState.exportBackup(
                 launchBackupExport(backupFileName())
             }
         }.onFailure {
-            status = "${trs("settings.backup.exportFailed")}: ${it.message}"
+            status = trsError("settings.backup.exportFailed", it)
         }
         backupBusy = false
     }
@@ -160,10 +150,16 @@ internal fun MeronMobileState.importBackup(
                 // language: the host holds those as `remember` values in the
                 // Activity / view controller, so only they need a restart, and
                 // only then is it worth saying so.
-                val needsRestart =
-                    rehydrated.keys.any {
-                        it == settingKeyFor(APPEARANCE_MODE_PREF) || it == settingKeyFor(APP_LANGUAGE_PREF)
-                    }
+                val hostHeldKeys =
+                    listOf(
+                        APPEARANCE_MODE_PREF,
+                        THEME_FOLLOW_SYSTEM_PREF,
+                        LIGHT_THEME_PREF,
+                        DARK_THEME_PREF,
+                        CUSTOM_THEMES_PREF,
+                        APP_LANGUAGE_PREF,
+                    ).map { settingKeyFor(it) }
+                val needsRestart = rehydrated.keys.any { it in hostHeldKeys }
                 status =
                     when {
                         needsRestart -> {
@@ -192,7 +188,7 @@ internal fun MeronMobileState.importBackup(
                 backupPassphraseError = trs("settings.backup.wrongPassphrase")
             } else {
                 closeBackupPassphrase()
-                status = "${trs("settings.backup.restoreFailed")}: $message"
+                status = withReason(trs("settings.backup.restoreFailed"), message) { key, args -> trs(key, args) }
             }
         }
         if (generation == backupRestoreGeneration) backupBusy = false
@@ -293,8 +289,40 @@ internal fun MeronMobileState.applyHydratedSettings(changed: Map<String, Any>) {
                 showUnifiedInboxNav = loadAppBoolean(prefs, SHOW_UNIFIED_INBOX_PREF, true)
             }
 
+            settingKeyFor(TASKS_ENABLED_PREF) -> {
+                tasksEnabled = loadAppBoolean(prefs, TASKS_ENABLED_PREF, false)
+                // A restore that switches Tasks off must not strand the user on
+                // the screen the drawer has just stopped offering.
+                if (!tasksEnabled && screen == Screen.Tasks) screen = Screen.Mail
+            }
+
+            settingKeyFor(CALENDAR_ENABLED_PREF) -> {
+                calendarEnabled = loadAppBoolean(prefs, CALENDAR_ENABLED_PREF, false)
+                if (!calendarEnabled && screen == Screen.Calendar) screen = Screen.Mail
+            }
+
             settingKeyFor(SHOW_SENDER_IMAGES_PREF) -> {
                 showSenderImages = loadAppBoolean(prefs, SHOW_SENDER_IMAGES_PREF, false)
+            }
+
+            settingKeyFor(DARK_MAIL_BODIES_PREF) -> {
+                darkMailBodies = loadAppBoolean(prefs, DARK_MAIL_BODIES_PREF, false)
+            }
+
+            settingKeyFor(AUTO_FIT_MESSAGES_PREF) -> {
+                autoFitMessages = loadAppBoolean(prefs, AUTO_FIT_MESSAGES_PREF, false)
+            }
+
+            settingKeyFor(CHAT_FULL_MESSAGES_PREF) -> {
+                chatFullMessages = loadAppBoolean(prefs, CHAT_FULL_MESSAGES_PREF, false)
+            }
+
+            settingKeyFor(READER_BOTTOM_ACTIONS_PREF) -> {
+                readerBottomActions = loadAppBoolean(prefs, READER_BOTTOM_ACTIONS_PREF, false)
+            }
+
+            settingKeyFor(QUOTE_REPLIES_PREF) -> {
+                quoteReplies = loadAppBoolean(prefs, QUOTE_REPLIES_PREF, false)
             }
 
             settingKeyFor(LIVE_MAIL_PUSH_PREF) -> {

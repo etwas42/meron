@@ -13,6 +13,9 @@ import jp.nonbili.meron.shared.ComposeDraft
 import jp.nonbili.meron.shared.ContactSuggestParams
 import jp.nonbili.meron.shared.ContactSuggestion
 import jp.nonbili.meron.shared.DiscardDraftParams
+import jp.nonbili.meron.shared.DraftAttachment
+import jp.nonbili.meron.shared.FORWARD_QUOTE_MARKER
+import jp.nonbili.meron.shared.ForwardInlineImage
 import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.MobileMailCommandClient
 import jp.nonbili.meron.shared.SendIdentity
@@ -29,6 +32,7 @@ import jp.nonbili.meron.shared.folderIsDrafts
 import jp.nonbili.meron.shared.forwardHtmlForSend
 import jp.nonbili.meron.shared.forwardInlineImages
 import jp.nonbili.meron.shared.forwardableAttachments
+import jp.nonbili.meron.shared.hasReplyQuote
 import jp.nonbili.meron.shared.inlineImageToDraftAttachment
 import jp.nonbili.meron.shared.messageEditAsNewDraft
 import jp.nonbili.meron.shared.messageForwardDraft
@@ -37,9 +41,13 @@ import jp.nonbili.meron.shared.noSignatureMark
 import jp.nonbili.meron.shared.parseAllocatedMessageId
 import jp.nonbili.meron.shared.parseAttachmentDataResponse
 import jp.nonbili.meron.shared.parseContactSuggestResponse
+import jp.nonbili.meron.shared.plainTextToHtml
 import jp.nonbili.meron.shared.recipientTail
 import jp.nonbili.meron.shared.replaceRecipientTail
 import jp.nonbili.meron.shared.replyAllAddsRecipients
+import jp.nonbili.meron.shared.replyQuoteAttribution
+import jp.nonbili.meron.shared.replyQuotedHtmlBody
+import jp.nonbili.meron.shared.replyQuotedPlainBody
 import jp.nonbili.meron.shared.resolveSignatureHtml
 import jp.nonbili.meron.shared.signaturePlainText
 import jp.nonbili.meron.shared.threadIdIsRss
@@ -159,22 +167,28 @@ internal fun MeronMobileState.clearComposeDraftState() {
     composeReferences = ""
     composeForwardHtml = ""
     composeForwardInlineAttachments = emptyList()
+    composeQuoteMarker = FORWARD_QUOTE_MARKER
+    composeReplyQuote = ""
+    composeFoldedQuote = null
     composeSeed = ComposeSeed()
     recipientSuggestionField = ""
     recipientSuggestions = emptyList()
 }
 
 /**
- * The composer with the signature this app seeded taken back out. A signature
- * the user has typed into can no longer be identified (see
- * [bodyWithSwappedSignature]), which is the same answer as "this text is theirs
- * now". Mirrors the reply bar's [quickReplyIsBlank].
+ * The composer with the signature this app seeded taken back out, and a reply's
+ * seeded quote with it while the quote is untouched. A signature the user has
+ * typed into can no longer be identified (see [bodyWithSwappedSignature]), which
+ * is the same answer as "this text is theirs now". Mirrors the reply bar's
+ * [quickReplyIsBlank].
  */
 private fun MeronMobileState.composeBodyWithoutSignature(): String {
-    val mark = composeSignature ?: return body
-    if (mark.text.isBlank()) return body
-    val swapped = bodyWithSwappedSignature(body, mark, "")
-    return if (swapped.tracking == null) body else swapped.body
+    val quoteAt = if (composeReplyQuote.isBlank()) -1 else body.lastIndexOf(composeReplyQuote)
+    val written = if (quoteAt < 0) body else body.removeRange(quoteAt, quoteAt + composeReplyQuote.length)
+    val mark = composeSignature ?: return written
+    if (mark.text.isBlank()) return written
+    val swapped = bodyWithSwappedSignature(written, mark, "")
+    return if (swapped.tracking == null) written else swapped.body
 }
 
 /**
@@ -204,10 +218,26 @@ private fun recipientEntries(value: String): List<String> {
 }
 
 // The draft as the core should receive it: the plain body the composer edits,
-// plus — for a forward — the rebuilt HTML alternative and the inline images it
-// references.
+// plus — for a forward or a quoted reply — the rebuilt HTML alternative and the
+// inline images it references. A reply whose quote the user has edited goes out
+// plain: the cached HTML quote would no longer say what the plain one does.
 private fun MeronMobileState.currentComposeDraft(): ComposeDraft {
-    val html = forwardHtmlForSend(body.trim(), composeForwardHtml)
+    composeFoldedQuote?.let { quote ->
+        // A folded quote goes out under whatever the body holds.
+        val own = body.trim()
+        val html = if (quote.html.isBlank()) "" else plainTextToHtml(own) + quote.html
+        return ComposeDraft(
+            to = to.trim(),
+            cc = cc.trim(),
+            bcc = bcc.trim(),
+            subject = subject.trim(),
+            body = if (own.isBlank()) quote.text.trim() else own + quote.text,
+            attachments = if (html.isBlank()) attachments else attachments + quote.inlineAttachments,
+            html = html,
+        )
+    }
+    val quoteIntact = composeReplyQuote.isBlank() || body.trim().endsWith(composeReplyQuote)
+    val html = if (quoteIntact) forwardHtmlForSend(body.trim(), composeForwardHtml, composeQuoteMarker) else ""
     return ComposeDraft(
         to = to.trim(),
         cc = cc.trim(),
@@ -272,18 +302,18 @@ internal fun MeronMobileState.acceptRecipientSuggestion(
 internal fun MeronMobileState.sendMail() {
     if (composeSendInFlight) return
     if (composeSignaturePending || !appSignatureLoaded) {
-        status = "Waiting for signature before sending."
+        status = trs("mobile.status.waitingForSignatureSend")
         return
     }
     val identity = selectedComposeIdentity()
     val accountId = identity?.accountId ?: defaultSendAccountId()
     if (accountId.isBlank()) {
-        status = "Select or add an account before sending."
+        status = trs("mobile.status.selectAccountBeforeSending")
         return
     }
     val draft = currentComposeDraft()
     if (!draft.canSend) {
-        status = "Complete To, Subject, and Body or Attachments before sending."
+        status = trs("mobile.status.completeBeforeSending")
         return
     }
     composeSendInFlight = true
@@ -291,7 +321,7 @@ internal fun MeronMobileState.sendMail() {
     pendingCertificateRetry = null
     val generation = composeSessionGeneration
     val initialDraftOwners = composeDraftOwnerSnapshot()
-    status = "Sending..."
+    status = trs("composer.status.sending")
     scope.launch {
         composeSaveMutex.withLock {
             val draftOwners =
@@ -353,7 +383,7 @@ internal fun MeronMobileState.retryComposeSend(pending: PendingComposeSend) {
     if (composeSendInFlight) return
     pendingComposeSend = pending
     composeSendInFlight = true
-    status = "Sending..."
+    status = trs("composer.status.sending")
     scope.launch {
         composeSaveMutex.withLock {
             dispatchComposeSend(pending)
@@ -363,9 +393,11 @@ internal fun MeronMobileState.retryComposeSend(pending: PendingComposeSend) {
 
 private suspend fun MeronMobileState.finishComposeSend(pending: PendingComposeSend) {
     val discardOutcome = discardComposeDraftOwners(pending.draftOwners)
-    composeDraftCleanupOwners =
-        (composeDraftCleanupOwners + discardOutcome.failedOwners)
-            .distinctBy { it.accountId to it.draftId }
+    // The message went out, so a draft that survived its discard is stale. Left
+    // to the next save's cleanup it lingered for as long as no other draft was
+    // saved — and, in a thread, could hydrate the reply bar with the sent text.
+    composeDraftCleanupOwners = composeDraftCleanupOwners - discardOutcome.failedOwners.toSet()
+    discardOutcome.failedOwners.forEach { retrySentDraftDiscard(it) }
     if (pendingComposeSend == pending) pendingComposeSend = null
     if (pendingCertificateRetry == PendingCertificateRetry.Compose(pending)) pendingCertificateRetry = null
     composeSendInFlight = false
@@ -376,7 +408,7 @@ private suspend fun MeronMobileState.finishComposeSend(pending: PendingComposeSe
         if (screen == Screen.Compose) closeCompose()
     }
     errorBanner = null
-    status = "Message sent"
+    status = trs("mobile.status.messageSent")
     syncCoreThreads()
 }
 
@@ -385,9 +417,9 @@ private fun MeronMobileState.failComposeSend(
     error: Throwable,
 ) {
     composeSendInFlight = false
-    val message = error.message ?: "Send failed"
+    val message = error.message ?: trs("compose.toast.sendFailed")
     errorBanner = message
-    status = "Send failed: $message"
+    status = trsError("compose.toast.sendFailed", error)
     // Trusting the certificate has to resume the send, not fall back to a
     // sync: the message is still unsent and the composer may be closed by then.
     if (pending != null && untrustedCertificateProtocol(message) != null) {
@@ -488,14 +520,14 @@ private suspend fun MeronMobileState.saveComposeDraft(
         // A send is about to discard the draft; saving now could resurrect it.
         if (composeSendInFlight) return@withLock false
         if (composeSignaturePending || !appSignatureLoaded) {
-            if (showStatus) status = "Waiting for signature before saving."
+            if (showStatus) status = trs("mobile.status.waitingForSignatureSave")
             return@withLock false
         }
         val identityGeneration = composeIdentityGeneration
         val identity = selectedComposeIdentity()
         val accountId = identity?.accountId ?: defaultSendAccountId()
         if (accountId.isBlank()) {
-            if (showStatus) status = "Select or add an account before saving."
+            if (showStatus) status = trs("mobile.status.selectAccountBeforeSaving")
             return@withLock false
         }
         val draft = currentComposeDraft()
@@ -507,7 +539,7 @@ private suspend fun MeronMobileState.saveComposeDraft(
             // Same reason the save path rechecks below: a status line belongs to
             // whichever composer is open now.
             if (generation != composeSessionGeneration) return@withLock false
-            if (showStatus) status = if (discarded) "Draft discarded" else "Nothing to save."
+            if (showStatus) status = trs(if (discarded) "mail.toast.draftDiscarded" else "mobile.status.nothingToSave")
             return@withLock false
         }
         val draftId = composeDraftId.ifBlank { newDraftMessageId(accountId) }
@@ -515,7 +547,7 @@ private suspend fun MeronMobileState.saveComposeDraft(
         val draftThreadId = composeDraftThreadId().ifBlank { null }
         val inReplyTo = composeInReplyTo
         val references = composeReferences
-        if (showStatus) status = "Saving draft..."
+        if (showStatus) status = trs("composer.status.savingDraft")
         var resolvedDraftId = draftId
         var allocatedRemoteDraft = false
         val result =
@@ -565,7 +597,7 @@ private suspend fun MeronMobileState.saveComposeDraft(
                 composeDraftAccountId = accountId
                 discardComposeDraftOwners(cleanupOwners)
                 selectedCoreThread?.let { markThreadDraftEverywhere(it.id) }
-                if (showStatus) status = "Draft saved"
+                if (showStatus) status = trs("mobile.status.draftSaved")
                 syncCoreThreads(syncFirst = false)
                 runCatching { reloadCurrentThreadMessages() }
                 true
@@ -573,9 +605,9 @@ private suspend fun MeronMobileState.saveComposeDraft(
             onFailure = {
                 status =
                     if (showStatus) {
-                        "Draft save failed: ${it.message}"
+                        trsError("mobile.status.draftSaveFailed", it)
                     } else {
-                        "Draft autosave failed: ${it.message}"
+                        trsError("composer.status.draftAutosaveFailed", it)
                     }
                 false
             },
@@ -606,19 +638,25 @@ internal fun MeronMobileState.canReplyAllToThread(): Boolean {
 /** The same question for one message, for its own menu. */
 internal fun MeronMobileState.canReplyAllToMessage(message: MessageBody): Boolean = replyAllAddsRecipients(message)
 
-/** Reply-all to one message, rather than to the conversation's reply target:
- * the message menu acts on the message it belongs to. Opens the full composer —
- * the recipients are the point of the action, and only the composer shows them.
- * The reply bar and any draft it holds are left untouched. */
-internal fun MeronMobileState.replyAllToMessage(message: MessageBody) {
+internal fun MeronMobileState.replyAllToMessage(message: MessageBody) = replyToMessage(message, replyAll = true)
+
+/** Reply (or reply-all) to one message, rather than to the conversation's reply
+ * target: the message menu and the reader act on the message they belong to.
+ * Opens the full composer — for reply-all the recipients are the point of the
+ * action, and only the composer shows them. The reply bar and any draft it
+ * holds are left untouched. */
+internal fun MeronMobileState.replyToMessage(
+    message: MessageBody,
+    replyAll: Boolean,
+) {
     val thread = selectedCoreThread
     val accountId = thread?.accountId?.ifBlank { defaultSendAccountId() }.orEmpty()
     if (accountId.isBlank() || thread == null) {
-        status = "Open a mail thread before replying."
+        status = trs("mobile.status.openThreadBeforeReplying")
         return
     }
     if (threadIdIsRss(thread.id)) {
-        status = "RSS items do not support replies."
+        status = trs("mobile.status.rssNoReplies")
         return
     }
     val account = coreAccounts.firstOrNull { it.id == accountId }
@@ -630,10 +668,10 @@ internal fun MeronMobileState.replyAllToMessage(message: MessageBody) {
             accountId = accountId,
             body = "",
             from = replyFrom,
-            replyAll = true,
+            replyAll = replyAll,
         )
     val generation = ++composeSessionGeneration
-    val open: MeronMobileState.() -> Unit = open@{
+    val open: MeronMobileState.(ReplyQuote?) -> Unit = open@{ quote ->
         if (generation != composeSessionGeneration) return@open
         // A reply of its own, not a continuation of whatever the composer last
         // held: threading headers and leftover forward state go first.
@@ -643,6 +681,7 @@ internal fun MeronMobileState.replyAllToMessage(message: MessageBody) {
         bcc = params.bcc
         subject = params.subject
         body = seedBodyWithSignature(params.body, accountId)
+        composeFoldedQuote = quote
         composeFromAccountId = accountId
         composeFromEmail = replyFrom
         composeInReplyTo = params.inReplyTo
@@ -652,15 +691,107 @@ internal fun MeronMobileState.replyAllToMessage(message: MessageBody) {
         screen = Screen.Compose
         status = ""
     }
-    if (appSignatureLoaded) {
-        open()
+    if (appSignatureLoaded && !quoteReplies) {
+        open(null)
     } else {
         scope.launch {
             awaitAppSignatureLoaded()
-            open()
+            open(replyQuoteFor(message, accountId))
         }
     }
 }
+
+/**
+ * The original quoted under a reply (see `settings.composer.quoteReplies`): the
+ * plain text the composer edits, the HTML alternative with the inline images it
+ * references (both empty for a text-only original), and the attribution line
+ * that marks where the quote starts.
+ */
+internal data class ReplyQuote(
+    val text: String,
+    val html: String,
+    val marker: String,
+    val inlineAttachments: List<DraftAttachment>,
+)
+
+/** Whether [body] already ends in this quote, untouched, as a saved quoted
+ *  reply does until its quote is edited. */
+internal fun ReplyQuote.endsBody(body: String): Boolean = body.trim().endsWith(text.trim())
+
+/** Whether [body] already quotes the message, edited or not: its attribution
+ *  line is still there. Such a body is the user's as it stands. */
+internal fun ReplyQuote.inBody(body: String): Boolean = body.contains(marker)
+
+/** The quote for a reply to [message], or null when the user does not quote
+ *  replies or the message has no body to quote. Reads the original's inline
+ *  images, so it is a round trip for an HTML mail that has any. */
+internal suspend fun MeronMobileState.replyQuoteFor(
+    message: MessageBody,
+    accountId: String,
+): ReplyQuote? = if (quoteReplies) buildReplyQuote(message, accountId) else null
+
+/** [replyQuoteFor] whatever the setting says: a saved reply that already holds
+ *  its quote is rebuilt from it. */
+internal suspend fun MeronMobileState.buildReplyQuote(
+    message: MessageBody,
+    accountId: String,
+): ReplyQuote? {
+    if (!hasReplyQuote(message)) return null
+    val dateLabel = formatMessageFullTimestamp(message.dateEpochSeconds)
+    val images =
+        if (message.bodyHtml.isBlank()) {
+            emptyList()
+        } else {
+            runCatching {
+                withContext(ioDispatcher) { readQuoteInlineImages(MobileMailCommandClient(core), accountId, message) }
+            }.getOrDefault(emptyList())
+        }
+    return ReplyQuote(
+        text = replyQuotedPlainBody(message, dateLabel),
+        html = replyQuotedHtmlBody(message, dateLabel, images.map { it.first }),
+        marker = replyQuoteAttribution(message, dateLabel),
+        inlineAttachments = images.map { (image, data) -> inlineImageToDraftAttachment(image, data) },
+    )
+}
+
+/** Unfold the folded quote into the end of the body, where the user can trim it
+ *  like any other text; from then on it is part of the body. */
+internal fun MeronMobileState.expandComposeQuote() {
+    val quote = composeFoldedQuote ?: return
+    body = body.trimEnd('\n') + quote.text
+    applyReplyQuote(quote)
+    composeFoldedQuote = null
+}
+
+/** Drop the folded quote: the reply goes out without it. */
+internal fun MeronMobileState.removeComposeQuote() {
+    composeFoldedQuote = null
+}
+
+/** Carry a reply's quote, already in the body, into the composer: the HTML that
+ *  stands for it at send time while the plain quote stays untouched. */
+internal fun MeronMobileState.applyReplyQuote(quote: ReplyQuote?) {
+    composeForwardHtml = quote?.html.orEmpty()
+    composeForwardInlineAttachments = quote?.inlineAttachments.orEmpty()
+    composeQuoteMarker = quote?.marker ?: FORWARD_QUOTE_MARKER
+    composeReplyQuote = quote?.text?.trim().orEmpty()
+}
+
+// The inline images a quoted original's HTML shows, with their bytes. Images
+// whose bytes can't be read are left out of the quote's cid: rewrite rather than
+// being referenced with no part behind them.
+internal suspend fun MeronMobileState.readQuoteInlineImages(
+    client: MobileMailCommandClient,
+    accountId: String,
+    message: MessageBody,
+): List<Pair<ForwardInlineImage, String>> =
+    forwardInlineImages(message).mapNotNull { image ->
+        runCatching {
+            readAttachmentData(client, accountId, image.attachment.key)
+        }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?.let { image to it }
+    }
 
 internal fun MeronMobileState.discardComposeDraft() {
     ++composeSessionGeneration
@@ -677,7 +808,7 @@ internal fun MeronMobileState.discardComposeDraft() {
     val thread = selectedCoreThread
     val draftThread = thread?.takeIf { folderIsDrafts(it.folder) }
     if (!draftId.isNullOrBlank() && accountId.isBlank()) {
-        status = "Select or add an account before discarding."
+        status = trs("mobile.status.selectAccountBeforeDiscarding")
         return
     }
     val previousMessages = messages
@@ -691,12 +822,12 @@ internal fun MeronMobileState.discardComposeDraft() {
     }
     clearComposeDraftState()
     screen = returnScreen
-    status = "Discarding draft..."
+    status = trs("mobile.status.discardingDraft")
     scope.launch(start = CoroutineStart.UNDISPATCHED) {
         composeSaveMutex.withLock {
             val outcome = discardComposeDraftOwners(draftOwners)
             if (outcome.failedOwners.isEmpty()) {
-                status = "Draft discarded"
+                status = trs("mail.toast.draftDiscarded")
                 syncCoreThreads(syncFirst = true)
                 if (thread != null) {
                     refreshKanbanColumnsForMailEvent(accountId, thread.folder, refresh = true)
@@ -727,7 +858,7 @@ internal fun MeronMobileState.discardComposeDraft() {
                 if (openDraftFailed) {
                     optimisticallyClearedThreadId?.let { markThreadDraftEverywhere(it) }
                 }
-                status = "Draft discard failed: one or more drafts could not be discarded"
+                status = trs("mobile.status.draftDiscardFailed")
             }
         }
     }
@@ -835,21 +966,8 @@ internal fun MeronMobileState.openMessageCompose(
                         }
                     }
                 // Only a forward quotes the original's HTML, so only a forward
-                // needs its inline images re-attached. Images whose bytes can't
-                // be read are left out of the quote's cid: rewrite rather than
-                // being referenced with no part behind them.
-                val inlineImages =
-                    if (forward) {
-                        forwardInlineImages(message).mapNotNull { image ->
-                            runCatching {
-                                readAttachmentData(client, accountId, image.attachment.key)
-                            }.getOrNull()
-                                ?.takeIf { it.isNotBlank() }
-                                ?.let { image to it }
-                        }
-                    } else {
-                        emptyList()
-                    }
+                // needs its inline images re-attached.
+                val inlineImages = if (forward) readQuoteInlineImages(client, accountId, message) else emptyList()
                 val draft =
                     if (forward) {
                         messageForwardDraft(
@@ -898,10 +1016,10 @@ internal fun MeronMobileState.openMessageCompose(
             composeReturnScreen = Screen.Thread
             rememberComposeSeed()
             screen = Screen.Compose
-            status = if (forward) "Forward draft ready" else "Copied message into compose"
+            status = trs(if (forward) "mobile.status.forwardDraftReady" else "mobile.status.copiedIntoCompose")
         }.onFailure {
             if (generation != composeSessionGeneration) return@onFailure
-            status = if (forward) "Forward failed: ${it.message}" else "Edit as new failed: ${it.message}"
+            status = trsError(if (forward) "mobile.status.forwardFailed" else "mobile.status.editAsNewFailed", it)
         }
     }
 }
@@ -996,7 +1114,9 @@ internal fun MeronMobileState.closeCompose() {
 private fun MeronMobileState.showLocalDraftInOpenThread() {
     val thread = selectedCoreThread ?: return
     if (composeReturnScreen != Screen.Thread) return
-    val draft = ComposeDraft(to.trim(), cc.trim(), bcc.trim(), subject.trim(), body.trim(), attachments)
+    // As the draft was saved, folded quote and all, and answering the same
+    // parent: reopening it folds the quote away again (see openDraftCompose).
+    val draft = currentComposeDraft()
     if (composeIsBlank()) return
     val accountId = selectedComposeIdentity()?.accountId ?: thread.accountId.ifBlank { defaultSendAccountId() }
     if (accountId.isBlank()) return
@@ -1016,9 +1136,10 @@ private fun MeronMobileState.showLocalDraftInOpenThread() {
             dateEpochSeconds = currentTimeMillis() / 1000,
             fromAddr = selectedComposeIdentity()?.email.orEmpty(),
             messageId = draftId,
+            inReplyTo = composeInReplyTo,
             references = composeReferences,
             outgoing = true,
-            hasAttachments = draft.attachments.isNotEmpty(),
+            hasAttachments = attachments.isNotEmpty(),
         )
     messages =
         (
@@ -1135,9 +1256,11 @@ internal fun threadsWithDraftFlag(
     return if (changed) updated else threads
 }
 
-// Re-open account setup pre-filled so the user can fix credentials. OAuth
-// accounts re-run the browser sign-in; password accounts re-enter the
-// password (the IMAP/SMTP host fields keep their last values).
+// Let the user fix an account's credentials. OAuth accounts go straight to
+// the provider's sign-in for that address — the setup screen would only offer
+// the same button with nothing saying which account it is for. Password
+// accounts re-open account setup pre-filled, to re-enter the password (the
+// IMAP/SMTP host fields keep their last values).
 internal fun MeronMobileState.reconnectAccount(account: AccountSummary) {
     val isOAuth = account.authType == "oauth" || account.provider == "gmail" || account.provider == "outlook"
     when {
@@ -1152,6 +1275,9 @@ internal fun MeronMobileState.reconnectAccount(account: AccountSummary) {
             oauthAuthorizationCode = ""
             addSection = 0
             passwordServerSettingsOpen = false
+            errorBanner = null
+            if (oauthProvider == "gmail") connectGoogleDeviceAccount() else launchOAuthFlow()
+            return
         }
 
         else -> {

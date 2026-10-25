@@ -1,6 +1,7 @@
 package jp.nonbili.meron.ui
 
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.ColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.text.PlatformTextStyle
 
@@ -42,3 +43,10 @@ expect val avatarPlatformTextStyle: PlatformTextStyle?
  */
 @Composable
 expect fun SyncSystemBarAppearance(dark: Boolean)
+
+/** Whether the system can supply a wallpaper-derived palette (Material You, Android 12+). */
+expect val dynamicColorSupported: Boolean
+
+/** The system's dynamic Material scheme, or null when [dynamicColorSupported] is false. */
+@Composable
+expect fun platformDynamicColorScheme(dark: Boolean): ColorScheme?

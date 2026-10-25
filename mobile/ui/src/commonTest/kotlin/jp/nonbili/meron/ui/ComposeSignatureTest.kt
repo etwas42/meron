@@ -352,6 +352,104 @@ class ComposeSignatureTest {
         assertEquals("saved draft body", state.quickReplyBody)
     }
 
+    @Test
+    fun aQuotedReplyFoldsTheQuoteAwayUnderTheSignature() =
+        runBlocking {
+            val state = quickReplyState(this)
+            state.quoteReplies = true
+
+            state.replyToMessage(state.messages.single(), replyAll = false)
+            yield()
+
+            assertEquals("\n\nFrom A", state.body)
+            assertEquals("\n\n${attribution()}\n> Original message", state.composeFoldedQuote?.text)
+            assertTrue(state.composeIsBlank())
+
+            // Unfolded, it joins the body under the signature, and is still not
+            // the user's writing.
+            state.expandComposeQuote()
+            assertEquals("\n\nFrom A\n\n${attribution()}\n> Original message", state.body)
+            assertNull(state.composeFoldedQuote)
+            assertEquals(attribution(), state.composeQuoteMarker)
+            assertTrue(state.composeIsBlank())
+            state.body = "Sounds good${state.body}"
+            assertFalse(state.composeIsBlank())
+        }
+
+    @Test
+    fun removingAFoldedQuoteDropsIt() =
+        runBlocking {
+            val state = quickReplyState(this)
+            state.quoteReplies = true
+            state.replyToMessage(state.messages.single(), replyAll = false)
+            yield()
+
+            state.removeComposeQuote()
+
+            assertNull(state.composeFoldedQuote)
+            assertEquals("\n\nFrom A", state.body)
+        }
+
+    @Test
+    fun anUnquotedReplyStaysEmpty() {
+        val state = quickReplyState()
+
+        state.replyToMessage(state.messages.single(), replyAll = false)
+
+        assertEquals("\n\nFrom A", state.body)
+    }
+
+    @Test
+    fun escalatingAQuotedReplyQuotesUnderTheTextAndSignature() =
+        runBlocking {
+            val state = quickReplyState(this)
+            state.quoteReplies = true
+            state.seedQuickReplySignature()
+            state.quickReplyBody = "t2\n\nFrom A"
+
+            state.openQuickReplyInFullEditor()
+            yield()
+
+            assertEquals("t2\n\nFrom A", state.body)
+            assertEquals("\n\n${attribution()}\n> Original message", state.composeFoldedQuote?.text)
+            assertEquals("From A", state.composeSignature?.text)
+        }
+
+    @Test
+    fun escalatingABarThatAlreadyHoldsItsQuoteDoesNotQuoteAgain() =
+        runBlocking {
+            val state = quickReplyState(this)
+            state.quoteReplies = true
+            // A saved quoted reply, hydrated into the bar.
+            state.quickReplyBody = "t2\n\nFrom A\n\n${attribution()}\n> Original message"
+            state.quickReplySignature = null
+
+            state.openQuickReplyInFullEditor()
+            yield()
+
+            assertEquals("t2\n\nFrom A\n\n${attribution()}\n> Original message", state.body)
+            assertNull(state.composeSignature)
+            assertNull(state.composeFoldedQuote)
+        }
+
+    @Test
+    fun escalatingKeepsWhatWasTypedWhileTheQuoteLoaded() =
+        runBlocking {
+            val state = quickReplyState(this)
+            state.quoteReplies = true
+            state.seedQuickReplySignature()
+            state.quickReplyBody = "t2\n\nFrom A"
+
+            state.openQuickReplyInFullEditor()
+            // Still loading the quote: the bar takes another keystroke.
+            state.quickReplyBody = "t2 and more\n\nFrom A"
+            yield()
+
+            assertEquals("t2 and more\n\nFrom A", state.body)
+        }
+
+    private fun attribution() = "On ${formatMessageFullTimestamp(0)}, Them <them@example.com> wrote:"
+
     private fun quickReplyState(
         scope: CoroutineScope = CoroutineScope(EmptyCoroutineContext),
         accountId: String = "a",

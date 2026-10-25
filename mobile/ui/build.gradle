@@ -24,8 +24,8 @@ tasks.register("generateComposeStrings", Exec) {
 kotlin {
     android {
         namespace = "jp.nonbili.meron.ui"
-        compileSdk = 36
-        minSdk = 23
+        compileSdk = 37
+        minSdk = 24
         withHostTest {
             // android.util.Log (via Log.w on failure paths) is a throwing stub on the host.
             returnDefaultValues = true
@@ -57,10 +57,13 @@ kotlin {
                 implementation compose.materialIconsExtended
                 implementation compose.ui
                 implementation compose.components.resources
-                implementation "org.jetbrains.compose.ui:ui-backhandler:1.11.0"
+                implementation "org.jetbrains.compose.ui:ui-backhandler:1.12.1"
                 implementation "org.jetbrains.androidx.navigation:navigation-compose:2.9.2"
                 implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2"
                 implementation "org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0"
+                implementation "sh.calvin.reorderable:reorderable:3.1.0"
+                implementation "dev.chrisbanes.haze:haze:2.0.1"
+                implementation "dev.chrisbanes.haze:haze-blur:2.0.1"
             }
         }
         commonTest {

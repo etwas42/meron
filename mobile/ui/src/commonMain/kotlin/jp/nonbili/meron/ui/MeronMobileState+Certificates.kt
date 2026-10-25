@@ -61,7 +61,7 @@ internal fun MeronMobileState.showTypedServerCertificate(
         }.onSuccess { certificate: ServerCertificate? ->
             if (certificate == null) {
                 errorBanner = message
-                status = "Could not read the server's certificate"
+                status = trs("mobile.status.certificateReadFailed")
             } else {
                 certPrompt =
                     MobileCertPrompt(
@@ -75,7 +75,7 @@ internal fun MeronMobileState.showTypedServerCertificate(
             }
         }.onFailure {
             errorBanner = message
-            status = "Could not read the server's certificate: ${it.message}"
+            status = trsError("mobile.status.certificateReadFailed", it)
         }
         certPromptBusy = false
     }
@@ -131,7 +131,7 @@ internal fun MeronMobileState.showServerCertificate(
             }
         }.onSuccess { certificate: ServerCertificate? ->
             if (certificate == null) {
-                status = "Could not read the server's certificate"
+                status = trs("mobile.status.certificateReadFailed")
             } else {
                 certPrompt =
                     MobileCertPrompt(
@@ -144,7 +144,7 @@ internal fun MeronMobileState.showServerCertificate(
                     )
             }
         }.onFailure {
-            status = "Could not read the server's certificate: ${it.message}"
+            status = trsError("mobile.status.certificateReadFailed", it)
         }
         certPromptBusy = false
     }
@@ -165,7 +165,7 @@ internal fun MeronMobileState.trustPromptedCertificate() {
         certPrompt = null
         errorBanner = null
         if (pendingCertificateRetry == prompt.retry) pendingCertificateRetry = null
-        status = "Trusted ${prompt.host}"
+        status = trs("mobile.status.certificateTrusted", mapOf("host" to prompt.host))
         val smtp = prompt.protocol == CertificateProtocol.SMTP
         addPasswordAccount(
             addRetry.params.copy(
@@ -193,7 +193,7 @@ internal fun MeronMobileState.trustPromptedCertificate() {
             certPrompt = null
             syncError = null
             errorBanner = null
-            status = "Trusted ${prompt.host}"
+            status = trs("mobile.status.certificateTrusted", mapOf("host" to prompt.host))
             // Resume what the certificate blocked — an unsent message stays
             // unsent unless its send is the thing that runs again.
             if (pendingCertificateRetry == prompt.retry) pendingCertificateRetry = null
@@ -222,7 +222,7 @@ internal fun MeronMobileState.trustPromptedCertificate() {
                 }
             }
         }.onFailure {
-            status = "Could not save the certificate: ${it.message}"
+            status = trsError("mobile.status.certificateSaveFailed", it)
         }
         certPromptBusy = false
     }

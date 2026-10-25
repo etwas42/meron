@@ -1,8 +1,10 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef } from 'react'
 import type { CSSProperties, Ref } from 'react'
 import { clearMediaSession } from '../../lib/mediaSession'
-import { chordFromEvent } from '../../lib/shortcuts'
+import { chordFromEvent, shortcutForChord } from '../../lib/shortcuts'
 import { openExternal } from '../../lib/native'
+import { mediaKeyFromSrc } from './messageHelpers'
+import { trackInternalDrags } from '../../lib/useFileDrop'
 
 const EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:'])
 
@@ -24,7 +26,15 @@ interface HtmlFrameProps {
   // When set, right-clicks inside the frame are blocked from showing WebKit's
   // native menu and re-dispatched as a `contextmenu` event on the iframe
   // element, so a custom menu registered on a parent element fires instead.
-  forwardContextMenu?: boolean
+  // A cached picture's right-click carries its media key as `meronImageKey`,
+  // for the menu's save and copy actions. 'except-images' leaves any other picture's
+  // right-click to the native menu.
+  forwardContextMenu?: boolean | 'except-images'
+  // Call `onReady` as soon as the document is parsed instead of waiting for
+  // its `load` event, which waits for every picture: one slow image would
+  // otherwise hold back whatever `onReady` does. For handlers that cope with
+  // pictures arriving afterwards.
+  readyWhenParsed?: boolean
 }
 
 function anchorUrl(anchor: HTMLAnchorElement): string | null {
@@ -104,17 +114,30 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     onUserScrollIntent,
     onScroll,
     forwardContextMenu,
+    readyWhenParsed,
   }: HtmlFrameProps,
   forwardedRef: Ref<HTMLIFrameElement>,
 ) {
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
   const docRef = useRef<Document | null>(null)
   const winRef = useRef<Window | null>(null)
-  const srcDoc = useMemo(() => (prepareHtml ? prepareHtml(html) : html), [html, prepareHtml])
+  const { srcDoc, documentMarker } = useMemo(() => {
+    const marker = `meron-frame-${Math.random().toString(36).slice(2)}`
+    const prepared = prepareHtml ? prepareHtml(html) : html
+    // A leading comment identifies even an already-parsed document without
+    // parsing the sender's markup again or executing code inside the frame.
+    return { srcDoc: `<!--${marker}-->${prepared}`, documentMarker: marker }
+  }, [html, prepareHtml])
 
   useImperativeHandle(forwardedRef, () => iframeRef.current as HTMLIFrameElement, [])
 
   const cleanupReadyRef = useRef<(() => void) | undefined>(undefined)
+  // The parsed document `onReady` last ran for.
+  const readyDocRef = useRef<Document | null>(null)
+  // Whether that run already saw the document with its pictures loaded.
+  const readyLoadedRef = useRef(false)
+  const readyWhenParsedRef = useRef(readyWhenParsed)
+  readyWhenParsedRef.current = readyWhenParsed
   const activeScrollListenerRef = useRef<{ win: Window; listener: () => void } | null>(null)
 
   const onFrameClickRef = useRef(onFrameClick)
@@ -133,17 +156,27 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     forwardContextMenuRef.current = forwardContextMenu
   }, [onFrameClick, onReady, onLinkHover, onScroll, onUserScrollIntent, forwardContextMenu])
 
-  const wire = useCallback(() => {
+  const wire = useCallback((atLoad = false) => {
     const iframe = iframeRef.current
     if (!iframe) return
 
     const doc = iframe.contentDocument
     const win = iframe.contentWindow
     if (!doc || !win) return
+    // A body can exist while srcdoc is still parsing: ready only after that.
+    if (doc.readyState === 'loading') return
+    // Ready once per document, so neither a repeated setup nor a new srcDoc
+    // whose document has not replaced this one yet runs the hook again. The
+    // exception is `load` for a reader that did not ask for parsed readiness
+    // and was readied before its pictures were in: scroll restoration needs
+    // the final layout.
+    if (readyDocRef.current === doc && (!atLoad || readyWhenParsedRef.current || readyLoadedRef.current)) return
 
     docRef.current = doc
     winRef.current = win
-
+    // A link or image dragged out of the message is not a file drop; a file
+    // dragged in over it is one for the pane around this frame.
+    trackInternalDrags(doc, iframe)
     if (!doc.documentElement.dataset.meronFrameScrollIntentWired) {
       doc.documentElement.dataset.meronFrameScrollIntentWired = '1'
       doc.addEventListener('wheel', () => onUserScrollIntentRef.current?.(), { passive: true })
@@ -212,6 +245,9 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
         if (hasFrameSelection(doc)) return
 
         const target = event.target as Element | null
+        const img = target?.closest?.('img') as HTMLImageElement | null
+        const imageKey = img ? mediaKeyFromSrc(img.currentSrc || img.src) : null
+        if (forwardContextMenuRef.current === 'except-images' && img && !imageKey) return
         const anchor = target?.closest?.('a[href]') as HTMLAnchorElement | null
         let linkUrl: string | undefined = undefined
         if (anchor) {
@@ -243,6 +279,9 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
         if (linkUrl) {
           ;(customEvent as any).meronLinkUrl = linkUrl
         }
+        if (imageKey) {
+          ;(customEvent as any).meronImageKey = imageKey
+        }
         frame.dispatchEvent(customEvent)
       })
     }
@@ -252,15 +291,19 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
       doc.addEventListener('keydown', (event) => {
         // Forward the chords the app can act on: ⌘/Ctrl (or Alt) shortcuts such
         // as ⌘/Ctrl+F, which the parent's keydown listener never sees while
-        // focus is in the frame, plus bare Up/Down for list navigation.
+        // focus is in the frame, plus bare Up/Down for list navigation and the
+        // single-key shortcuts (H, R, …), so they keep working after a click
+        // into the message.
         const chord = chordFromEvent(event)
         if (!chord) return
         const isBareArrow =
           !chord.mod && !chord.alt && !chord.shift && (chord.key === 'ArrowDown' || chord.key === 'ArrowUp')
-        if (!chord.mod && !chord.alt && !isBareArrow) return
-        // Only the unmodified arrows must stand down for a field inside the
-        // message (they move the caret); ⌘/Ctrl chords still belong to the app.
-        if (isBareArrow && isEditableFrameTarget(event.target)) return
+        const isBare = !chord.mod && !chord.alt
+        if (isBare && !isBareArrow && !shortcutForChord(chord)) return
+        // Only the unmodified keys must stand down for a field inside the
+        // message (they type, or move the caret); ⌘/Ctrl chords still belong
+        // to the app.
+        if (isBare && isEditableFrameTarget(event.target)) return
 
         const forwarded = new CustomEvent('meron.frameKeyDown', {
           cancelable: true,
@@ -286,6 +329,8 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     }
 
     cleanupReadyRef.current = onReadyRef.current?.(doc, iframe) ?? undefined
+    readyDocRef.current = doc
+    readyLoadedRef.current = atLoad || doc.readyState === 'complete'
   }, [])
 
   // Listen to native load events which are guaranteed to fire when srcDoc loads
@@ -296,10 +341,11 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     // Wire immediately on mount (in case it already loaded)
     wire()
 
-    iframe.addEventListener('load', wire)
+    const onLoad = () => wire(true)
+    iframe.addEventListener('load', onLoad)
 
     return () => {
-      iframe.removeEventListener('load', wire)
+      iframe.removeEventListener('load', onLoad)
     }
   }, [wire])
 
@@ -307,6 +353,33 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
   useEffect(() => {
     wire()
   }, [wire, srcDoc])
+
+  // Discover the committed srcdoc document, then wait for its parsing event.
+  // Polling ends at navigation commit, so hanging images cannot keep it running.
+  useEffect(() => {
+    const iframe = iframeRef.current
+    if (!readyWhenParsed || !iframe) return
+    let watched: Document | null = null
+    let frame = 0
+    const parsed = () => wire()
+    const watch = () => {
+      const doc = iframe.contentDocument
+      // The old document can linger for several frames; the current marker
+      // also lets an already-parsed document settle immediately on remount.
+      if (!doc || doc.firstChild?.nodeValue !== documentMarker) {
+        frame = window.requestAnimationFrame(watch)
+        return
+      }
+      watched = doc
+      if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', parsed, { once: true })
+      else wire()
+    }
+    watch()
+    return () => {
+      window.cancelAnimationFrame(frame)
+      watched?.removeEventListener('DOMContentLoaded', parsed)
+    }
+  }, [wire, srcDoc, documentMarker, readyWhenParsed])
 
   // Stop in-frame media before the document is swapped for new HTML, otherwise
   // its orphaned pipeline keeps a "now playing" notification up.
@@ -324,6 +397,10 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
       clearMediaSession(winRef.current)
       cleanupReadyRef.current?.()
       cleanupReadyRef.current = undefined
+      // StrictMode replays setup on this same document after disposing its
+      // installed hook. Let setup reinstall it; a `load` with nothing to add
+      // still sees an active readyDocRef and is ignored.
+      readyDocRef.current = null
 
       if (activeScrollListenerRef.current) {
         const { win, listener } = activeScrollListenerRef.current

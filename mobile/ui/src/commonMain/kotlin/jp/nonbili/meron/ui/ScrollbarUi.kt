@@ -8,6 +8,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
@@ -43,7 +44,8 @@ fun Modifier.appScrollbar(
     endOffset: Dp = 0.dp,
 ): Modifier {
     val alpha = scrollbarAlpha(state.isScrollInProgress)
-    return drawScrollbar(alpha, color, orientation, endOffset) { metrics(state) }
+    val sizes = remember(state) { ItemSizes() }
+    return drawScrollbar(alpha, color, orientation, endOffset) { metrics(state, sizes) }
 }
 
 /** Scroll position hint for a plain scrollable column or row. */
@@ -128,25 +130,58 @@ private fun Modifier.drawScrollbar(
         )
     }
 
+/** Every item size a lazy list has measured so far, by index. Dropped when the
+ *  item count changes: an insertion shifts the indices under it. */
+private class ItemSizes {
+    var itemCount = -1
+    val byIndex = HashMap<Int, Int>()
+    var total = 0L
+
+    fun record(
+        index: Int,
+        size: Int,
+    ) {
+        total += size - (byIndex.put(index, size) ?: 0)
+    }
+}
+
 /**
  * Lazy lists only know the items they have measured, so the content length is
- * estimated from the average size of the visible ones. That is exact for the
- * uniform rows most of these lists use and close enough elsewhere.
+ * estimated: items seen so far count at the size they were measured at, and
+ * the rest at the average of those. Averaging only the visible items is exact
+ * for the uniform rows most of these lists use, but a conversation mixes
+ * one-line rows with mails thousands of pixels tall, and there the estimate
+ * swung with every row that entered or left the viewport, moving the thumb
+ * while the content barely moved.
  */
-private fun metrics(state: LazyListState): ScrollbarMetrics? {
+private fun metrics(
+    state: LazyListState,
+    sizes: ItemSizes,
+): ScrollbarMetrics? {
     val info = state.layoutInfo
     val visible = info.visibleItemsInfo
-    if (visible.isEmpty() || info.totalItemsCount == 0) return null
-    val average = visible.sumOf { it.size }.toFloat() / visible.size
+    val count = info.totalItemsCount
+    if (visible.isEmpty() || count == 0) return null
+    if (sizes.itemCount != count) {
+        sizes.itemCount = count
+        sizes.byIndex.clear()
+        sizes.total = 0L
+    }
+    visible.forEach { sizes.record(it.index, it.size) }
+    val known = sizes.byIndex.size
+    val average = sizes.total.toFloat() / known
     if (average <= 0f) return null
     // Several lists arrange their items with spacing, which sits between the
     // measured sizes; counting only the sizes would leave the thumb long enough
     // to hit the end before the list does.
     val spacing = info.mainAxisItemSpacing.toFloat()
-    val pitch = average + spacing
     val viewport = (info.viewportEndOffset - info.viewportStartOffset).toFloat()
     val content =
-        pitch * info.totalItemsCount - spacing + info.beforeContentPadding + info.afterContentPadding
-    val scrolled = state.firstVisibleItemIndex * pitch + state.firstVisibleItemScrollOffset
+        sizes.total + (count - known) * average + spacing * (count - 1) +
+            info.beforeContentPadding + info.afterContentPadding
+    val first = state.firstVisibleItemIndex
+    var before = 0f
+    for (index in 0 until first) before += sizes.byIndex[index]?.toFloat() ?: average
+    val scrolled = before + first * spacing + state.firstVisibleItemScrollOffset
     return ScrollbarMetrics(viewport, content, scrolled)
 }

@@ -31,6 +31,44 @@
             android:name=".AndroidNotificationActionReceiver"
             android:exported="false" />
 
+        <!-- Unread-mail home-screen widget. -->
+        <receiver
+            android:name=".AndroidUnreadWidgetProvider"
+            android:exported="false"
+            android:label="@string/mobile_android_widget_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/unread_widget_info" />
+        </receiver>
+
+        <!-- Unread-mail list home-screen widget. -->
+        <receiver
+            android:name=".AndroidUnreadListWidgetProvider"
+            android:exported="false"
+            android:label="@string/mobile_android_widget_list_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/unread_list_widget_info" />
+        </receiver>
+
+        <!-- Exported: the launcher starts it when a widget is placed or
+             reconfigured. -->
+        <activity
+            android:name=".AndroidUnreadWidgetConfigureActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
         <!-- specialUse instead of dataSync: Android 15 caps dataSync services
              at ~6h/day, but live mail push must hold IMAP IDLE connections
              open indefinitely while the user has it enabled. -->

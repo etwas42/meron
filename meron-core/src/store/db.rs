@@ -194,6 +194,38 @@ CREATE TABLE IF NOT EXISTS account_secrets (
 );
 ";
 
+/// Optional Tasks feature. Two tables rather than a JSON blob in `settings`:
+/// tasks are user-authored data that grows without bound and is queried by list
+/// and by linked thread, which a blob can serve neither cheaply nor safely.
+/// `json` is the usual catch-all, so subtasks or recurrence can arrive later
+/// without a migration.
+pub(super) const TASKS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS task_lists (
+  id         TEXT PRIMARY KEY,
+  title      TEXT NOT NULL DEFAULT '',
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id           TEXT PRIMARY KEY,
+  list_id      TEXT NOT NULL,
+  title        TEXT NOT NULL DEFAULT '',
+  notes        TEXT NOT NULL DEFAULT '',
+  due_at       INTEGER NOT NULL DEFAULT 0,   -- 0 = no due date
+  completed_at INTEGER NOT NULL DEFAULT 0,   -- 0 = not done
+  sort_order   INTEGER NOT NULL DEFAULT 0,
+  account      TEXT NOT NULL DEFAULT '',     -- mail link; empty for a plain task
+  thread_id    TEXT NOT NULL DEFAULT '',
+  message_id   TEXT NOT NULL DEFAULT '',
+  json         TEXT NOT NULL DEFAULT '{}',
+  created_at   INTEGER NOT NULL DEFAULT 0,
+  updated_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS tasks_list_idx ON tasks(list_id, sort_order);
+CREATE INDEX IF NOT EXISTS tasks_thread_idx ON tasks(thread_id);
+";
+
 const BODY_CACHE_VERSION: &str = "1";
 
 pub fn open() -> Result<Connection> {
@@ -490,6 +522,36 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<()> {
     if version < 9 {
         migrate_v9(&tx)?;
     }
+    if version < 10 {
+        migrate_v10(&tx)?;
+    }
+    if version < 11 {
+        migrate_v11(&tx)?;
+    }
+    if version < 12 {
+        migrate_v12(&tx)?;
+    }
+    if version < 13 {
+        migrate_v13(&tx)?;
+    }
+    if version < 14 {
+        migrate_v14(&tx)?;
+    }
+    if version < 15 {
+        migrate_v15(&tx)?;
+    }
+    if version < 16 {
+        migrate_v16(&tx)?;
+    }
+    if version < 17 {
+        migrate_v17(&tx)?;
+    }
+    if version < 18 {
+        migrate_v18(&tx)?;
+    }
+    if version < 19 {
+        migrate_v19(&tx)?;
+    }
 
     tx.commit()?;
     Ok(())
@@ -648,6 +710,313 @@ fn migrate_v9(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Tasks: lists and their items, for the optional Tasks surface. Local-only —
+/// nothing here is synced to a server, so the rows are also carried by the
+/// config backup.
+fn migrate_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(TASKS_DDL)?;
+    conn.execute_batch("PRAGMA user_version = 10;")?;
+    Ok(())
+}
+
+/// `messages.files`: the cached body's real attachments as a JSON array of
+/// `{filename, mime}`, NULL when it has none, so list cards can name them and
+/// the attachments filter can page without parsing every row's `json`. Written
+/// with header BODYSTRUCTURE metadata and refined by `save_cached_message`.
+///
+/// Rows cached before this are filled by [`super::backfill_files_batch`] after
+/// startup, not here: deriving them parses every row's `json` (HTML bodies
+/// included), which on a large cache holds the store long enough for the
+/// frontend's first requests to time out.
+fn migrate_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch("ALTER TABLE messages ADD COLUMN files TEXT;")?;
+    conn.execute_batch("PRAGMA user_version = 11;")?;
+    Ok(())
+}
+
+/// One row per live search: the identity a snapshot page is validated against.
+/// A first page fetches only the newest hits; the rest wait in
+/// `mail_search_pending`, one row per server hit with its Date header resolved
+/// up front, so batches are taken newest-first by date across every folder
+/// rather than by UID, which orders mailbox insertion and not send time.
+/// `cache_resume` is set when a batch cut off its cached-only hits: the keyset
+/// cursor of the last one it took, from which paging past the snapshot
+/// continues through the cache.
+const MAIL_SEARCH_SNAPSHOTS_DDL: &str = "
+CREATE TABLE IF NOT EXISTS mail_search_snapshots (
+  token        TEXT PRIMARY KEY,
+  account      TEXT NOT NULL,
+  query        TEXT NOT NULL,
+  scope        TEXT NOT NULL,
+  cache_resume TEXT,
+  created_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mail_search_snapshots_created_idx
+  ON mail_search_snapshots(account, created_at);
+CREATE TABLE IF NOT EXISTS mail_search_pending (
+  token   TEXT NOT NULL,
+  account TEXT NOT NULL,
+  folder  TEXT NOT NULL,
+  uid     INTEGER NOT NULL,
+  date    INTEGER NOT NULL,
+  PRIMARY KEY (token, folder, uid)
+);
+CREATE INDEX IF NOT EXISTS mail_search_pending_order_idx
+  ON mail_search_pending(token, date DESC, uid DESC, folder DESC);
+CREATE INDEX IF NOT EXISTS mail_search_pending_account_idx
+  ON mail_search_pending(account);
+";
+
+/// Resumable live searches; see `MAIL_SEARCH_SNAPSHOTS_DDL`. Hit rows saved by
+/// earlier versions have no snapshot row, so their cursors fall back to cached
+/// keyset paging, as an expired snapshot does.
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    conn.execute_batch(MAIL_SEARCH_SNAPSHOTS_DDL)?;
+    conn.execute_batch("PRAGMA user_version = 12;")?;
+    Ok(())
+}
+
+/// Unseen server UIDs that the last sync found outside the cached window, so a
+/// folder's unread total covers mail older than what the cache holds. A row is
+/// dropped once its message is cached there, whether inserted or moved in from
+/// another folder: the cached row
+/// then carries the unread state, and deleting or moving it later can't bring
+/// the stale row back into the count.
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS uncached_unseen (
+           account TEXT NOT NULL,
+           folder  TEXT NOT NULL,
+           uid     INTEGER NOT NULL,
+           PRIMARY KEY (account, folder, uid)
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS messages_uncached_unseen_ai AFTER INSERT ON messages
+         WHEN new.uid <> 0 BEGIN
+           DELETE FROM uncached_unseen
+            WHERE account = new.account AND folder = new.folder AND uid = new.uid;
+         END;
+         CREATE TRIGGER IF NOT EXISTS messages_uncached_unseen_au
+         AFTER UPDATE OF account, folder, uid ON messages
+         WHEN new.uid <> 0 BEGIN
+           DELETE FROM uncached_unseen
+            WHERE account = new.account AND folder = new.folder AND uid = new.uid;
+         END;",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 13;")?;
+    Ok(())
+}
+
+/// UIDs this process removed from a folder. A folder sync that fetched its
+/// snapshot before the removal must not write those rows back, or an archived
+/// thread reappears in the mailbox it just left.
+fn migrate_v14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS removed_message_uids (
+           account TEXT NOT NULL,
+           folder  TEXT NOT NULL,
+           uid     INTEGER NOT NULL,
+           epoch   INTEGER NOT NULL,
+           PRIMARY KEY (account, folder, uid)
+         ) WITHOUT ROWID;",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 14;")?;
+    Ok(())
+}
+
+/// Folder syncs with a snapshot in flight, shared by every connection so one
+/// engine does not prune removal markers another engine's sync still needs.
+fn migrate_v15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS active_message_syncs (
+           id    INTEGER PRIMARY KEY AUTOINCREMENT,
+           epoch INTEGER NOT NULL,
+           owner TEXT NOT NULL
+         );",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 15;")?;
+    Ok(())
+}
+
+/// Per-folder opt-in to live sync and new-mail notifications. INBOX is always
+/// watched and never consults the flag.
+fn migrate_v16(conn: &Connection) -> Result<()> {
+    conn.execute_batch("ALTER TABLE folders ADD COLUMN notify INTEGER NOT NULL DEFAULT 0;")?;
+    conn.execute_batch("PRAGMA user_version = 16;")?;
+    Ok(())
+}
+
+/// Recipient autocomplete's directory (migration v17): one row per account,
+/// address and display name seen as a mail message's sender, To or Cc,
+/// counting the messages it appears on. Keeping each name apart means a name
+/// leaves with the last message carrying it. Suggesting from the messages
+/// themselves meant reading and parsing every cached row's recipient lists per
+/// keystroke. Triggers on `messages` keep it in step with every write path;
+/// the update trigger only fires when the addresses could have changed, as an
+/// envelope upsert rewrites `json` on every resync.
+fn contacts_ddl() -> String {
+    let add = |row: &str| {
+        format!(
+            "INSERT INTO contacts(account, addr_key, name, addr, count)
+               SELECT {row}.account, lower(trim(addr)), trim(COALESCE(name, '')), max(trim(addr)), 1
+               FROM ({occurrences}) WHERE {row}.uid <> 0 AND trim(COALESCE(addr, '')) <> ''
+               GROUP BY lower(trim(addr)), trim(COALESCE(name, ''))
+             ON CONFLICT(account, addr_key, name) DO UPDATE SET count = count + 1;",
+            occurrences = contact_occurrences(row),
+        )
+    };
+    let remove = |row: &str| {
+        let keys = format!(
+            "SELECT lower(trim(addr)), trim(COALESCE(name, '')) FROM ({})
+               WHERE trim(COALESCE(addr, '')) <> ''",
+            contact_occurrences(row)
+        );
+        format!(
+            "UPDATE contacts SET count = count - 1
+               WHERE account = {row}.account AND {row}.uid <> 0 AND (addr_key, name) IN ({keys});
+             DELETE FROM contacts
+               WHERE account = {row}.account AND count <= 0 AND (addr_key, name) IN ({keys});"
+        )
+    };
+    let addressees = |row: &str| format!("json_extract({row}.json, '$.to', '$.cc')");
+    format!(
+        "CREATE TABLE IF NOT EXISTS contacts (
+           account  TEXT NOT NULL,
+           addr_key TEXT NOT NULL,   -- lower(trim(addr))
+           name     TEXT NOT NULL,   -- '' when the address came without one
+           addr     TEXT NOT NULL,
+           count    INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY (account, addr_key, name)
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS contacts_ai AFTER INSERT ON messages BEGIN
+           {add_new}
+         END;
+         CREATE TRIGGER IF NOT EXISTS contacts_ad AFTER DELETE ON messages BEGIN
+           {remove_old}
+         END;
+         CREATE TRIGGER IF NOT EXISTS contacts_au
+           AFTER UPDATE OF account, uid, from_name, from_addr, json ON messages
+           WHEN old.account IS NOT new.account
+             OR (old.uid <> 0) IS NOT (new.uid <> 0)
+             OR old.from_name IS NOT new.from_name
+             OR old.from_addr IS NOT new.from_addr
+             OR {old_addressees} IS NOT {new_addressees}
+         BEGIN
+           {remove_old}
+           {add_new}
+         END;",
+        add_new = add("new"),
+        remove_old = remove("old"),
+        old_addressees = addressees("old"),
+        new_addressees = addressees("new"),
+    )
+}
+
+/// `row`'s sender and its To and Cc entries, as `(name, addr)` rows.
+fn contact_occurrences(row: &str) -> String {
+    let list = |path: &str| {
+        format!(
+            "SELECT json_extract(value, '$.name'), json_extract(value, '$.addr')
+               FROM json_each({row}.json, '{path}') WHERE type = 'object'"
+        )
+    };
+    format!(
+        "SELECT {row}.from_name AS name, {row}.from_addr AS addr
+         UNION ALL {} UNION ALL {}",
+        list("$.to"),
+        list("$.cc"),
+    )
+}
+
+fn migrate_v17(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&contacts_ddl())?;
+    let list = |path: &str| {
+        format!(
+            "SELECT m.id, m.account, json_extract(e.value, '$.name'), json_extract(e.value, '$.addr')
+               FROM messages m, json_each(m.json, '{path}') e
+               WHERE m.uid <> 0 AND e.type = 'object'"
+        )
+    };
+    conn.execute_batch(&format!(
+        "INSERT INTO contacts(account, addr_key, name, addr, count)
+           SELECT account, addr_key, name, max(addr), count(*) FROM (
+             SELECT id, account, lower(trim(addr)) AS addr_key, trim(COALESCE(name, '')) AS name,
+                    max(trim(addr)) AS addr
+             FROM (
+               SELECT id, account, from_name AS name, from_addr AS addr FROM messages WHERE uid <> 0
+               UNION ALL {} UNION ALL {}
+             )
+             WHERE trim(COALESCE(addr, '')) <> ''
+             GROUP BY id, lower(trim(addr)), trim(COALESCE(name, ''))
+           )
+           WHERE true
+           GROUP BY account, addr_key, name;
+         PRAGMA user_version = 17;",
+        list("$.to"),
+        list("$.cc"),
+    ))?;
+    Ok(())
+}
+
+/// Calendar invitations the user answered from the card (migration v18), keyed
+/// by the event rather than the message so every copy of the invite — the
+/// original, an update, the one in another folder — shows the same answer.
+/// `sequence` is the revision answered: a later one asks again.
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS invite_responses (
+           account       TEXT NOT NULL,
+           uid           TEXT NOT NULL,     -- iCalendar UID
+           recurrence_id INTEGER NOT NULL DEFAULT 0,   -- 0 = the whole series
+           response      TEXT NOT NULL,     -- accepted | tentative | declined
+           sequence      INTEGER NOT NULL DEFAULT 0,
+           responded_at  INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY (account, uid, recurrence_id)
+         );
+         PRAGMA user_version = 18;",
+    )?;
+    Ok(())
+}
+
+/// The local calendar (migration v19): events the user made, and invitations
+/// they accepted. Like tasks, a table rather than a blob, queried by time.
+/// `recurring` rows are expanded on read from `rrule` (an event made here) or
+/// `ics` (an invitation, whose own rules and exceptions are kept whole), so a
+/// range query takes every recurring row that starts before its end.
+fn migrate_v19(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS events (
+           id          TEXT PRIMARY KEY,
+           title       TEXT NOT NULL DEFAULT '',
+           notes       TEXT NOT NULL DEFAULT '',
+           location    TEXT NOT NULL DEFAULT '',
+           start_at    INTEGER NOT NULL DEFAULT 0,   -- all-day: UTC midnight
+           end_at      INTEGER NOT NULL DEFAULT 0,   -- exclusive
+           all_day     INTEGER NOT NULL DEFAULT 0,
+           recurring   INTEGER NOT NULL DEFAULT 0,
+           rrule       TEXT NOT NULL DEFAULT '',     -- daily | weekly | monthly | yearly
+           tzid        TEXT NOT NULL DEFAULT '',     -- the zone a repeat keeps its time in
+           account     TEXT NOT NULL DEFAULT '',     -- mail link; empty for an event made here
+           thread_id   TEXT NOT NULL DEFAULT '',
+           message_id  TEXT NOT NULL DEFAULT '',
+           invite_uid  TEXT NOT NULL DEFAULT '',     -- iCalendar UID of an accepted invitation
+           recurrence_id INTEGER NOT NULL DEFAULT 0, -- an invitation to one occurrence alone; 0 = the event
+           response    TEXT NOT NULL DEFAULT '',     -- accepted | tentative
+           ics         TEXT NOT NULL DEFAULT '',
+           json        TEXT NOT NULL DEFAULT '{}',
+           created_at  INTEGER NOT NULL DEFAULT 0,
+           updated_at  INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS events_start_idx ON events(start_at);
+         -- A decline (or cancellation) of an occurrence that stands for every
+         -- later one too (RANGE=THISANDFUTURE).
+         ALTER TABLE invite_responses ADD COLUMN this_and_future INTEGER NOT NULL DEFAULT 0;
+         CREATE UNIQUE INDEX IF NOT EXISTS events_invite_idx
+           ON events(account, invite_uid, recurrence_id) WHERE invite_uid <> '';
+         PRAGMA user_version = 19;",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) fn migrate_to_v8(conn: &Connection) -> Result<()> {
     migrate_to_v5(conn)?;
@@ -679,7 +1048,7 @@ fn backfill_recipients(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+pub(super) fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT value FROM meta WHERE key = ?1",

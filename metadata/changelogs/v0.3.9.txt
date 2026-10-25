@@ -1,0 +1,6 @@
+- Show attachment chips on thread cards and add attachments filter
+- Add per-column attachments filter to Kanban column menus
+- Show completed tasks in a collapsible section
+- Refine search queries, cap live fetches, and flag incomplete results
+- Share sender avatar resolution across desktop and Android
+- Add open and copy link actions to RSS feed items

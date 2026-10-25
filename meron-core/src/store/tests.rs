@@ -7,6 +7,15 @@ use std::collections::BTreeMap;
 use crate::imap::Folder;
 use crate::parse::Message;
 
+const UNREAD: RecentFilter = RecentFilter {
+    unread_only: true,
+    attachments_only: false,
+};
+const ATTACHMENTS: RecentFilter = RecentFilter {
+    unread_only: false,
+    attachments_only: true,
+};
+
 fn test_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     db::run_migrations(&conn).unwrap();
@@ -221,6 +230,87 @@ fn folder_unread_counts_messages_without_requiring_a_folder_row() {
 
     assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 1);
     assert_eq!(get_folder_unread(&conn, "acct", "Archive").unwrap(), 0);
+}
+
+#[test]
+fn folder_unread_includes_unseen_server_mail_outside_the_cache() {
+    let conn = test_conn();
+    insert_message(&conn, 10, "Cached", "Ada", "ada@example.com", None);
+    // The server reports 10 (cached) and 3..=5 (older, not cached) unseen.
+    set_uncached_unseen(&conn, "acct", "INBOX", &[3, 4, 5, 10].into_iter().collect()).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 4);
+    ensure_folder(&conn, "acct", "INBOX").unwrap();
+    let folders = get_folders(&conn, "acct").unwrap();
+    assert_eq!(
+        folders.iter().find(|f| f.name == "INBOX").unwrap().unread,
+        4
+    );
+
+    // Paging an older message into the cache doesn't count it twice, and
+    // reading it there is reflected.
+    insert_message(&conn, 4, "Paged in", "Bea", "bea@example.com", None);
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 4);
+    update_message_seen(&conn, "acct", "INBOX", 4, true).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 3);
+
+    let mut unseen = get_unseen_uids(&conn, "acct", "INBOX").unwrap();
+    unseen.sort_unstable();
+    assert_eq!(unseen, vec![3, 5, 10]);
+    mark_folder_seen(&conn, "acct", "INBOX", true).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 0);
+}
+
+#[test]
+fn a_stale_unseen_snapshot_cannot_restore_an_archived_uid_to_unread_counts() {
+    let conn = test_conn();
+    insert_message(&conn, 7, "Archive me", "Ada", "ada@example.com", None);
+    let (sync, fetched_at) = begin_message_sync(&conn).unwrap();
+    let stale_unseen = [3, 7].into_iter().collect();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    release_removed_messages(&conn, "acct", "INBOX", &[7], fetched_at).unwrap();
+    set_uncached_unseen(&conn, "acct", "INBOX", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 1);
+    assert_eq!(get_unseen_uids(&conn, "acct", "INBOX").unwrap(), vec![3]);
+    // Removal markers are scoped to their source mailbox and account.
+    set_uncached_unseen(&conn, "acct", "Archive", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "Archive").unwrap(), 2);
+    set_uncached_unseen(&conn, "other", "INBOX", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "other", "INBOX").unwrap(), 2);
+    end_message_sync(&conn, sync).unwrap();
+    // A later valid unseen read still counts ordinary uncached mail.
+    set_uncached_unseen(&conn, "acct", "INBOX", &[3, 8].into_iter().collect()).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 2);
+}
+
+#[test]
+fn removing_a_paged_in_message_does_not_revive_its_uncached_unread() {
+    let conn = test_conn();
+    set_uncached_unseen(&conn, "acct", "INBOX", &[4].into_iter().collect()).unwrap();
+    insert_message(&conn, 4, "Paged in", "Bea", "bea@example.com", None);
+    update_message_seen(&conn, "acct", "INBOX", 4, true).unwrap();
+    conn.execute(
+        "DELETE FROM messages WHERE account = 'acct' AND folder = 'INBOX' AND uid = 4",
+        [],
+    )
+    .unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 0);
+}
+
+#[test]
+fn moving_a_cached_message_onto_an_uncached_unseen_uid_counts_it_once() {
+    let conn = test_conn();
+    insert_message(&conn, 4, "Moved", "Bea", "bea@example.com", None);
+    set_uncached_unseen(&conn, "acct", "Archive", &[4].into_iter().collect()).unwrap();
+    move_messages_by_uid(&conn, "acct", "INBOX", "Archive", &[4]).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "Archive").unwrap(), 1);
+}
+
+#[test]
+fn emptying_a_folder_clears_its_uncached_unread() {
+    let conn = test_conn();
+    set_uncached_unseen(&conn, "acct", "INBOX", &[3, 5].into_iter().collect()).unwrap();
+    delete_folder_messages(&conn, "acct", "INBOX").unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 0);
 }
 
 #[test]
@@ -472,6 +562,21 @@ fn search_messages_short_query_falls_back_to_like() {
 }
 
 #[test]
+fn search_messages_short_query_folds_non_ascii_case() {
+    // SQLite's lower() is ASCII-only; the short-query path must fold Cyrillic
+    // and accented capitals the way the trigram index does for longer queries.
+    let conn = test_conn();
+    insert_message(&conn, 1, "Ок, созвон", "Aki", "aki@example.com", None);
+    insert_message(&conn, 2, "ÉT report", "Aki", "aki@example.com", None);
+    insert_message(&conn, 3, "Other", "Aki", "aki@example.com", None);
+
+    let hit = search_messages(&conn, "acct", "INBOX", "ок", 10, None).unwrap();
+    assert_eq!(hit.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1]);
+    let hit = search_messages(&conn, "acct", "INBOX", "ét", 10, None).unwrap();
+    assert_eq!(hit.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
 fn search_messages_reindexes_on_body_update() {
     // The FTS triggers must follow a later body write, not just the initial insert.
     let conn = test_conn();
@@ -532,6 +637,72 @@ fn search_messages_matches_to_and_cc_recipients() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn search_messages_applies_gmail_style_operators() {
+    let conn = test_conn();
+    let message = |uid: u32, from: &str, to: &str, subject: &str, date: i64| MessageHeader {
+        uid,
+        subject: subject.to_string(),
+        from_name: String::new(),
+        from_addr: from.to_string(),
+        date,
+        seen: uid == 1,
+        starred: uid == 2,
+        to: vec![crate::imap::Recipient {
+            name: String::new(),
+            addr: to.to_string(),
+        }],
+        ..Default::default()
+    };
+    let day = |y, m, d| {
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .unwrap()
+            .timestamp()
+    };
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[
+            message(1, "a@b.c", "d@e.f", "Budget plan", day(2026, 1, 1)),
+            message(2, "a@b.c", "x@y.z", "Budget", day(2026, 2, 1)),
+            message(3, "zoe@b.c", "d@e.f", "Lunch plan", day(2026, 3, 1)),
+        ],
+    )
+    .unwrap();
+
+    let uids = |query: &str| {
+        search_messages(&conn, "acct", "INBOX", query, 10, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.uid)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(uids("from:a@b.c"), [2, 1]);
+    assert_eq!(uids("from:a@b.c to:d@e.f"), [1]);
+    // Free text still searches every column, ANDed with the operators.
+    assert_eq!(uids("to:d@e.f plan"), [3, 1]);
+    assert_eq!(uids("subject:budget is:unread"), [2]);
+    assert_eq!(uids("is:starred"), [2]);
+    assert_eq!(uids("after:2026/01/15 before:2026/03/01"), [2]);
+    assert_eq!(uids("after:2026/03/01"), [3]);
+    // Short values take the scan path and still respect their column.
+    assert_eq!(uids("from:zo"), [3]);
+    assert_eq!(uids("subject:lu"), [3]);
+    assert_eq!(uids("from:lu"), Vec::<u32>::new());
+    // A bare operator is plain text, not an empty filter.
+    assert_eq!(uids("from:"), Vec::<u32>::new());
+    // Alternatives: any of them matches, indexed or scanned.
+    assert_eq!(uids("from:{zoe@b.c x@y.z}"), [3]);
+    assert_eq!(uids("to:(x@y.z OR d@e.f) subject:plan"), [3, 1]);
+    assert_eq!(uids("subject:lunch OR subject:budget"), [3, 2, 1]);
+    assert_eq!(uids("from:zo,nobody@x.y"), [3]);
 }
 
 #[test]
@@ -695,7 +866,8 @@ fn search_snapshot_pages_in_resolved_date_order_when_uids_diverge() {
         vec![2, 1, 3]
     );
 
-    let token = save_search_snapshot(&conn, "acct", "deploy", &folders, &hits).unwrap();
+    let token = create_search_snapshot(&conn, "acct", "deploy", &folders, &[]).unwrap();
+    finish_search_batch(&conn, &token, "acct", &[], &hits, None).unwrap();
     let first = get_search_snapshot_page(&conn, "acct", "deploy", &folders, &token, 0, 1)
         .unwrap()
         .unwrap();
@@ -718,6 +890,112 @@ fn search_snapshot_pages_in_resolved_date_order_when_uids_diverge() {
         get_search_snapshot_page(&conn, "acct", "different", &folders, &token, 0, 1)
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn search_pending_is_taken_newest_first_by_date_across_folders() {
+    let conn = test_conn();
+    let hit = |folder: &str, uid: u32, date: i64| PendingSearchHit {
+        folder: folder.to_string(),
+        uid,
+        date,
+    };
+    let folders = ["INBOX".to_string(), "Sent".to_string()];
+    // UID 1 was imported late: the lowest UID carries the newest date.
+    let token = create_search_snapshot(
+        &conn,
+        "acct",
+        "deploy",
+        &folders,
+        &[
+            hit("INBOX", 3, 300),
+            hit("INBOX", 2, 200),
+            hit("INBOX", 1, 1000),
+            hit("Sent", 9, 250),
+        ],
+    )
+    .unwrap();
+
+    let (batch, next) = take_search_pending(&conn, &token, 2).unwrap();
+    assert_eq!(batch, vec![hit("INBOX", 1, 1000), hit("INBOX", 3, 300)]);
+    assert_eq!(next, Some(hit("Sent", 9, 250)));
+    let (batch, next) = take_search_pending(&conn, &token, 4).unwrap();
+    assert_eq!(batch.len(), 4);
+    assert_eq!(next, None);
+}
+
+#[test]
+fn search_batches_consume_pending_hits_and_append_in_order() {
+    let conn = test_conn();
+    for (uid, date) in [(5u32, 500i64), (4, 400), (3, 300)] {
+        conn.execute(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date)
+             VALUES('acct', 'INBOX', ?1, ?2, 'deploy notes', 'Ops', 'ops@example.com', ?3)",
+            params![uid.to_string(), uid, date],
+        )
+        .unwrap();
+    }
+    let folders = ["INBOX".to_string()];
+    let pending = [(5u32, 500i64), (4, 400), (3, 300)].map(|(uid, date)| PendingSearchHit {
+        folder: "INBOX".to_string(),
+        uid,
+        date,
+    });
+    let token = create_search_snapshot(&conn, "acct", "deploy", &folders, &pending).unwrap();
+    let header = |uid: u32, date: i64| MessageHeader {
+        uid,
+        date,
+        folder: "INBOX".to_string(),
+        ..Default::default()
+    };
+
+    let (batch, next) = take_search_pending(&conn, &token, 2).unwrap();
+    assert_eq!(
+        batch.iter().map(|hit| hit.uid).collect::<Vec<_>>(),
+        vec![5, 4]
+    );
+    assert_eq!(next.map(|hit| hit.uid), Some(3));
+    finish_search_batch(
+        &conn,
+        &token,
+        "acct",
+        &[("INBOX".to_string(), 5), ("INBOX".to_string(), 4)],
+        &[header(5, 500), header(4, 400)],
+        None,
+    )
+    .unwrap();
+    let page = get_search_snapshot_page(&conn, "acct", "deploy", &folders, &token, 0, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.messages.iter().map(|m| m.uid).collect::<Vec<_>>(),
+        vec![5, 4]
+    );
+    assert!(page.pending);
+
+    // The last batch appends after the first and leaves nothing pending; a hit
+    // already listed is not appended twice.
+    finish_search_batch(
+        &conn,
+        &token,
+        "acct",
+        &[("INBOX".to_string(), 3)],
+        &[header(4, 400), header(3, 300)],
+        None,
+    )
+    .unwrap();
+    let page = get_search_snapshot_page(&conn, "acct", "deploy", &folders, &token, 0, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        page.messages.iter().map(|m| m.uid).collect::<Vec<_>>(),
+        vec![5, 4, 3]
+    );
+    assert!(!page.pending);
+    assert_eq!(
+        take_search_pending(&conn, &token, 2).unwrap(),
+        (vec![], None)
     );
 }
 
@@ -905,7 +1183,7 @@ fn card_message_counts_span_the_folder_not_the_page() {
 
     // The unread view hands grouping only the two unread messages, so the cards
     // it produces tally one message each.
-    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 50, None, true).unwrap();
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 50, None, UNREAD).unwrap();
     let cards = group_thread_cards(page, "INBOX");
     let keys = cards
         .iter()
@@ -1028,11 +1306,12 @@ fn get_recent_page_can_return_only_unread_messages() {
     // insert_message stamps every row with the same date, so the date-ordered
     // list ties break on uid DESC and the cursor carries that shared date.
     const D: i64 = 1779580800;
-    let (all, all_cursor) = get_recent_page(&conn, "acct", "INBOX", 2, None, false).unwrap();
+    let (all, all_cursor) =
+        get_recent_page(&conn, "acct", "INBOX", 2, None, RecentFilter::default()).unwrap();
     assert_eq!(all.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![5, 4]);
     assert_eq!(all_cursor.as_deref(), Some(format!("date:{D}:4").as_str()));
 
-    let (unread, unread_cursor) = get_recent_page(&conn, "acct", "INBOX", 2, None, true).unwrap();
+    let (unread, unread_cursor) = get_recent_page(&conn, "acct", "INBOX", 2, None, UNREAD).unwrap();
     assert_eq!(unread.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![5, 3]);
     assert_eq!(
         unread_cursor.as_deref(),
@@ -1041,7 +1320,7 @@ fn get_recent_page_can_return_only_unread_messages() {
     assert!(unread.iter().all(|m| !m.seen));
 
     let (next_unread, next_cursor) =
-        get_recent_page(&conn, "acct", "INBOX", 2, Some((D, 3)), true).unwrap();
+        get_recent_page(&conn, "acct", "INBOX", 2, Some((D, 3)), UNREAD).unwrap();
     assert_eq!(
         next_unread.iter().map(|m| m.uid).collect::<Vec<_>>(),
         vec![2]
@@ -1181,6 +1460,182 @@ fn cached_body_preview_collapses_body_and_misses_without_a_cached_body() {
 }
 
 #[test]
+fn a_sync_snapshot_from_before_a_move_cannot_put_the_message_back() {
+    let conn = test_conn();
+    let message = MessageHeader {
+        uid: 7,
+        subject: "Archive me".into(),
+        from_addr: "a@example.com".into(),
+        thread_key: "topic".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[message.clone()]).unwrap();
+    // What a folder sync reads before it goes to the network.
+    let fetched_at = removed_message_epoch(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+
+    // The snapshot still contains the message, and it started before the move.
+    release_removed_messages(&conn, "acct", "INBOX", &[7], fetched_at).unwrap();
+    upsert_messages(&conn, "acct", "INBOX", &[message.clone()]).unwrap();
+    assert!(!has_message(&conn, "acct", "INBOX", 7).unwrap());
+
+    // A later sync really does see the UID in the folder again (moved back).
+    let later = removed_message_epoch(&conn).unwrap();
+    release_removed_messages(&conn, "acct", "INBOX", &[7], later).unwrap();
+    upsert_messages(&conn, "acct", "INBOX", &[message]).unwrap();
+    assert!(has_message(&conn, "acct", "INBOX", 7).unwrap());
+}
+
+#[test]
+fn a_late_body_fetch_cannot_reinsert_a_removed_message() {
+    let conn = test_conn();
+    let header = MessageHeader {
+        uid: 7,
+        subject: "Archive me".into(),
+        ..Default::default()
+    };
+    let body = Message {
+        subject: "Archive me".into(),
+        body: "Late body".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    let (body_fetch, _) = begin_message_sync(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    // An unrelated fresh sync must not clean up the marker while the body fetch
+    // still owns an older snapshot.
+    let (other_sync, _) = begin_message_sync(&conn).unwrap();
+    end_message_sync(&conn, other_sync).unwrap();
+    // fill_thread_gaps writes the header and the body in succession.
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    save_cached_message(&conn, "acct", "INBOX", 7, &body).unwrap();
+    assert!(!has_message(&conn, "acct", "INBOX", 7).unwrap());
+    assert!(
+        get_cached_message(&conn, "acct", "INBOX", 7)
+            .unwrap()
+            .is_none()
+    );
+    end_message_sync(&conn, body_fetch).unwrap();
+    // A later valid fetch can still cache a body normally.
+    upsert_messages(&conn, "acct", "INBOX", &[header]).unwrap();
+    save_cached_message(&conn, "acct", "INBOX", 7, &body).unwrap();
+    assert_eq!(
+        get_cached_message(&conn, "acct", "INBOX", 7)
+            .unwrap()
+            .unwrap()
+            .body,
+        "Late body"
+    );
+}
+
+#[test]
+fn removed_uid_markers_expire_after_the_oldest_sync_finishes() {
+    let conn = test_conn();
+    let count = || -> i64 {
+        conn.query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    let (first, _) = begin_message_sync(&conn).unwrap();
+    let (same_epoch, _) = begin_message_sync(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    let (later, _) = begin_message_sync(&conn).unwrap();
+    assert_eq!(count(), 1);
+    end_message_sync(&conn, first).unwrap();
+    assert_eq!(count(), 1, "another old snapshot still needs the marker");
+    end_message_sync(&conn, same_epoch).unwrap();
+    assert_eq!(count(), 0, "the newer sync cannot contain the old UID");
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[8]).unwrap();
+    assert_eq!(count(), 1);
+    end_message_sync(&conn, later).unwrap();
+    assert_eq!(count(), 0, "no active snapshots remain");
+}
+
+#[test]
+fn another_connection_cannot_prune_markers_an_active_sync_needs() {
+    let dir = std::env::temp_dir().join(format!("meron-store-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meron.db");
+    let syncing = db::open_at(&path).unwrap();
+    let archiving = db::open_at(&path).unwrap();
+    let count = || -> i64 {
+        syncing
+            .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let (stale, _) = begin_message_sync(&syncing).unwrap();
+    delete_messages_by_uid(&archiving, "acct", "INBOX", &[7]).unwrap();
+    let (other, _) = begin_message_sync(&archiving).unwrap();
+    end_message_sync(&archiving, other).unwrap();
+    assert_eq!(count(), 1, "the other connection's snapshot is still open");
+    end_message_sync(&syncing, stale).unwrap();
+    assert_eq!(count(), 0);
+
+    // A snapshot left behind by a dead process does not pin markers.
+    archiving
+        .execute(
+            "INSERT INTO active_message_syncs(epoch, owner) VALUES(0, 'dead')",
+            [],
+        )
+        .unwrap();
+    delete_messages_by_uid(&archiving, "acct", "INBOX", &[8]).unwrap();
+    let (id, _) = begin_message_sync(&syncing).unwrap();
+    assert_eq!(count(), 0);
+    end_message_sync(&syncing, id).unwrap();
+
+    drop(syncing);
+    drop(archiving);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn concurrent_sync_registration_waits_instead_of_failing() {
+    let dir = std::env::temp_dir().join(format!("meron-store-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meron.db");
+    db::open_at(&path).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let handles = (0..4u32)
+        .map(|worker| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let conn = db::open_at(&path).unwrap();
+                barrier.wait();
+                for round in 0..50 {
+                    let (id, _) = begin_message_sync(&conn).unwrap();
+                    delete_messages_by_uid(&conn, "acct", "INBOX", &[worker * 100 + round + 1])
+                        .unwrap();
+                    end_message_sync(&conn, id).unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_new_sync_purges_removal_markers_left_without_active_snapshots() {
+    let conn = test_conn();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7, 8, 9]).unwrap();
+    let (id, epoch) = begin_message_sync(&conn).unwrap();
+    assert!(epoch > 0);
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    end_message_sync(&conn, id).unwrap();
+}
+
+#[test]
 fn cached_archive_identity_suppresses_inbox_arrival_and_survives_deletion() {
     let conn = test_conn();
     let mut message = MessageHeader {
@@ -1196,6 +1651,87 @@ fn cached_archive_identity_suppresses_inbox_arrival_and_survives_deletion() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn folder_notify_opt_in_survives_folder_list_sync() {
+    let conn = test_conn();
+    let folder = Folder {
+        name: "Work".into(),
+        display_name: "Work".into(),
+        ..Default::default()
+    };
+    upsert_folders(&conn, "acct", std::slice::from_ref(&folder)).unwrap();
+    ensure_folder(&conn, "acct", "INBOX").unwrap();
+    assert!(folder_notifies(&conn, "acct", "inbox").unwrap());
+    assert!(!folder_notifies(&conn, "acct", "Work").unwrap());
+    assert!(!set_folder_notify(&conn, "acct", "Missing", true).unwrap());
+
+    assert!(set_folder_notify(&conn, "acct", "Work", true).unwrap());
+    // A later LIST sync rewrites the row's server-owned columns only.
+    upsert_folders(&conn, "acct", &[folder]).unwrap();
+    assert!(folder_notifies(&conn, "acct", "Work").unwrap());
+    assert_eq!(notify_folders(&conn, "acct").unwrap(), vec!["Work"]);
+    let listed = get_folders(&conn, "acct").unwrap();
+    assert!(listed.iter().any(|f| f.name == "Work" && f.notify));
+    assert!(listed.iter().any(|f| f.name == "INBOX" && !f.notify));
+
+    assert!(set_folder_notify(&conn, "acct", "Work", false).unwrap());
+    assert!(notify_folders(&conn, "acct").unwrap().is_empty());
+}
+
+#[test]
+fn notify_plan_gives_idle_slots_to_the_earliest_opt_ins() {
+    let conn = test_conn();
+    // Opted in out of name order: slots follow the opt-in order, not the name.
+    let names = ["Zeta", "Beta", "Mid", "Alpha", "Omega"];
+    for name in names {
+        ensure_folder(&conn, "acct", name).unwrap();
+        assert!(set_folder_notify(&conn, "acct", name, true).unwrap());
+    }
+    let plan = notify_folder_plan(&conn, "acct").unwrap();
+    assert_eq!(plan.live, vec!["Zeta", "Beta", "Mid"]);
+    assert_eq!(plan.polled, vec!["Alpha", "Omega"]);
+    assert!(folder_notifies_live(&conn, "acct", "Mid").unwrap());
+    assert!(!folder_notifies_live(&conn, "acct", "Alpha").unwrap());
+
+    // Enabling again keeps a folder's place; a later opt-in never demotes it.
+    assert!(set_folder_notify(&conn, "acct", "Zeta", true).unwrap());
+    assert_eq!(notify_folder_plan(&conn, "acct").unwrap(), plan);
+
+    // Freeing a slot promotes the longest-waiting polled folder.
+    assert!(set_folder_notify(&conn, "acct", "Beta", false).unwrap());
+    let plan = notify_folder_plan(&conn, "acct").unwrap();
+    assert_eq!(plan.live, vec!["Zeta", "Mid", "Alpha"]);
+    assert_eq!(plan.polled, vec!["Omega"]);
+    assert!(
+        get_folders(&conn, "acct")
+            .unwrap()
+            .iter()
+            .all(|f| f.notify == (f.name != "Beta"))
+    );
+}
+
+#[test]
+fn custom_folder_arrivals_skip_mail_already_seen_elsewhere() {
+    let conn = test_conn();
+    let filed = MessageHeader {
+        uid: 7,
+        message_id: "filed@example.com".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[filed.clone()]).unwrap();
+    // The user moved `filed` out of INBOX; a server rule delivered `direct`.
+    let batch = [
+        MessageHeader { uid: 20, ..filed },
+        MessageHeader {
+            uid: 21,
+            message_id: "direct@example.com".into(),
+            ..Default::default()
+        },
+    ];
+    let arrivals = classify_arrivals(&conn, "acct", "Work", 20, 22, &batch).unwrap();
+    assert_eq!(arrivals.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![21]);
 }
 
 #[test]
@@ -2172,6 +2708,41 @@ fn save_cached_message_preserves_envelope_recipients_in_json() {
 }
 
 #[test]
+fn save_cached_message_keeps_the_header_date_when_the_body_has_none() {
+    use crate::imap::MessageHeader;
+    let conn = test_conn();
+    let header = MessageHeader {
+        uid: 7,
+        subject: "No Date header".into(),
+        date: 1_790_645_280, // the sync's INTERNALDATE fallback
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[header]).unwrap();
+
+    let body = Message {
+        subject: "No Date header".into(),
+        body: "hello".into(),
+        ..Default::default()
+    };
+    save_cached_message(&conn, "acct", "INBOX", 7, &body).unwrap();
+    let message = get_cached_message(&conn, "acct", "INBOX", 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.date, 1_790_645_280);
+
+    // A body that does carry a date still wins.
+    let dated = Message {
+        date: 1_790_600_000,
+        ..body
+    };
+    save_cached_message(&conn, "acct", "INBOX", 7, &dated).unwrap();
+    let message = get_cached_message(&conn, "acct", "INBOX", 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.date, 1_790_600_000);
+}
+
+#[test]
 fn run_migrations_creates_schema_and_bumps_version() {
     let conn = Connection::open_in_memory().unwrap();
     db::run_migrations(&conn).unwrap();
@@ -2179,7 +2750,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 19);
 
     for table in [
         "accounts",
@@ -2187,12 +2758,18 @@ fn run_migrations_creates_schema_and_bumps_version() {
         "messages_fts",
         "messages_recipients_fts",
         "mail_search_hits",
+        "mail_search_snapshots",
+        "mail_search_pending",
         "folders",
         "folder_state",
         "subscriptions",
         "meta",
         "settings",
         "observed_mail_identities",
+        "task_lists",
+        "tasks",
+        "removed_message_uids",
+        "active_message_syncs",
     ] {
         let exists = conn
             .query_row(
@@ -2211,7 +2788,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 19);
 }
 
 #[test]
@@ -2239,7 +2816,7 @@ fn concurrent_first_open_runs_migrations_once() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 19);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2295,6 +2872,18 @@ fn delete_account_removes_account_scoped_state_only() {
             params![account, format!("token-{account}")],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO mail_search_snapshots(token, account, query, scope, created_at)
+             VALUES(?2, ?1, 'query', '[\"INBOX\"]', 1)",
+            params![account, format!("token-{account}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail_search_pending(token, account, folder, uid, date)
+             VALUES(?2, ?1, 'INBOX', 2, 1)",
+            params![account, format!("token-{account}")],
+        )
+        .unwrap();
     }
 
     delete_account(&conn, "acct").unwrap();
@@ -2308,6 +2897,8 @@ fn delete_account_removes_account_scoped_state_only() {
         ("account_secrets", "account_id"),
         ("observed_mail_identities", "account"),
         ("mail_search_hits", "account"),
+        ("mail_search_snapshots", "account"),
+        ("mail_search_pending", "account"),
     ] {
         let deleted_count: i64 = conn
             .query_row(
@@ -2672,6 +3263,49 @@ fn newest_thread_uids_stays_within_a_subject_branch() {
 }
 
 #[test]
+fn thread_uids_span_folders_and_can_skip_read_messages() {
+    let conn = test_conn();
+    conn.execute(
+        "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date, seen, thread_key)
+         VALUES('acct', 'INBOX', '1', 1, 'Topic', 'Them', 'them@example.com', 100, 0, 'topic-key'),
+               ('acct', 'INBOX', '2', 2, 'Topic', 'Them', 'them@example.com', 200, 1, 'topic-key'),
+               ('acct', 'Archive', '3', 7, 'Re: Topic', 'Them', 'them@example.com', 300, 0, 'topic-key'),
+               ('acct', 'Archive', '4', 8, 'Other', 'Them', 'them@example.com', 400, 0, 'other-key')",
+        params![],
+    )
+    .unwrap();
+
+    let by_folder = thread_uids_by_folder(&conn, "acct", "INBOX", "topic-key", None, true).unwrap();
+
+    assert_eq!(
+        by_folder.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("Archive".to_string(), vec![7]),
+            ("INBOX".to_string(), vec![1])
+        ]
+    );
+}
+
+#[test]
+fn thread_uids_keep_uid_keys_folder_local() {
+    let conn = test_conn();
+    conn.execute(
+        "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date, seen, thread_key)
+         VALUES('acct', 'INBOX', '1', 5, 'One', 'Them', 'them@example.com', 100, 0, ''),
+               ('acct', 'Archive', '2', 5, 'Two', 'Them', 'them@example.com', 200, 0, '')",
+        params![],
+    )
+    .unwrap();
+
+    let by_folder = thread_uids_by_folder(&conn, "acct", "INBOX", "uid:5", None, false).unwrap();
+
+    assert_eq!(
+        by_folder.into_iter().collect::<Vec<_>>(),
+        vec![("INBOX".to_string(), vec![5])]
+    );
+}
+
+#[test]
 fn newest_thread_uids_is_empty_for_an_unknown_thread() {
     let conn = test_conn();
 
@@ -3022,6 +3656,7 @@ fn collapse_thread_draft_headers_keeps_newest_draft_only() {
             special_use: Some("drafts".into()),
             role: "drafts".into(),
             unread: 0,
+            notify: false,
         }],
     )
     .unwrap();
@@ -3399,6 +4034,7 @@ fn proxy_test_creds(proxy: crate::proxy::ProxyChoice) -> crate::imap::Creds {
         proxy,
         cert_pin: None,
         smtp_cert_pin: None,
+        rejected_grant: None,
     }
 }
 
@@ -3413,6 +4049,43 @@ fn stored_creds(conn: &Connection, id: &str) -> crate::imap::Creds {
 
 fn stored_proxy(conn: &Connection, id: &str) -> crate::proxy::ProxyChoice {
     stored_creds(conn, id).proxy
+}
+
+/// A sign-in the provider refused has to stay refused across a restart, and
+/// saving the account again — which is what reconnecting does — has to lift it.
+#[test]
+fn rejected_sign_in_persists_until_the_account_is_saved_again() {
+    let conn = test_conn();
+    let creds = proxy_test_creds(crate::proxy::ProxyChoice::Global);
+    let meta = AccountMeta {
+        engine: "mail".to_string(),
+        provider: "custom".to_string(),
+        email: "user@example.com".to_string(),
+        display_name: String::new(),
+        avatar_url: String::new(),
+        sender_name: String::new(),
+    };
+    upsert_account(&conn, "acct", &meta, &creds).unwrap();
+    assert_eq!(stored_creds(&conn, "acct").rejected_grant, None);
+
+    let refused = crate::imap::grant_fingerprint("old-token");
+    set_account_rejected_grant(&conn, "acct", &refused).unwrap();
+    let mut stored = stored_creds(&conn, "acct");
+    assert_eq!(stored.rejected_grant.as_deref(), Some(refused.as_str()));
+    // Nothing else in the config moved.
+    assert_eq!(stored.host, creds.host);
+    assert_eq!(stored.token_expires_at, creds.token_expires_at);
+
+    // The verdict is on that token alone (secrets are applied after loading).
+    stored.refresh_token = Some("old-token".to_string());
+    assert!(stored.auth_rejected());
+    stored.refresh_token = Some("new-token".to_string());
+    assert!(!stored.auth_rejected());
+    stored.refresh_token = None;
+    assert!(!stored.auth_rejected());
+
+    upsert_account(&conn, "acct", &meta, &creds).unwrap();
+    assert_eq!(stored_creds(&conn, "acct").rejected_grant, None);
 }
 
 /// The pin an account carries for a server whose certificate webpki refuses
@@ -3847,4 +4520,776 @@ fn starred_mutation_skips_matching_flags_and_stars_only_source_messages_and_copi
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn tasks_tables_arrive_on_an_existing_install() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::migrate_to_v8(&conn).unwrap();
+    insert_message(&conn, 1, "existing", "", "", None);
+    let table_count = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(table_count("tasks"), 0, "not there before the migration");
+
+    db::run_migrations(&conn).unwrap();
+
+    assert_eq!(table_count("tasks"), 1);
+    assert_eq!(table_count("task_lists"), 1);
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 19);
+
+    // Cached mail is untouched, and the new tables are writable.
+    let messages: i64 = conn
+        .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(messages, 1);
+    insert_task_list(&conn, "list1", "My Tasks").unwrap();
+    insert_task(&conn, "task1", "list1", "Write it down", "", 0, "", "", "").unwrap();
+    assert_eq!(tasks_for_list(&conn, "list1", false).unwrap().len(), 1);
+}
+
+/// A cached body carrying `attachments` (and optionally HTML that shows some of
+/// them inline), saved the way the body fetch saves it.
+fn save_body_with_attachments(conn: &Connection, uid: u32, keys: &[&str], html: Option<&str>) {
+    let message = Message {
+        subject: "Hi".into(),
+        body: "body".into(),
+        body_html: html.map(str::to_string),
+        attachments: keys
+            .iter()
+            .map(|key| crate::parse::Attachment {
+                filename: key.rsplit('/').next().unwrap().into(),
+                mime: "application/octet-stream".into(),
+                size: 1,
+                key: Some(key.to_string()),
+                oversized: false,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    save_cached_message(conn, "acct", "INBOX", uid, &message).unwrap();
+}
+
+#[test]
+fn get_recent_page_can_return_only_messages_with_attachments() {
+    let conn = test_conn();
+    for uid in 1..=4 {
+        insert_message(&conn, uid, "Hi", "Aki", "aki@example.com", None);
+    }
+    save_body_with_attachments(&conn, 1, &["acct/INBOX/1/0.pdf"], None);
+    // Only a logo the HTML draws inline: not an attachment.
+    save_body_with_attachments(
+        &conn,
+        2,
+        &["acct/INBOX/2/0.png"],
+        Some("<img src=\"/media/acct/INBOX/2/0.png\">"),
+    );
+    save_body_with_attachments(&conn, 3, &["acct/INBOX/3/0.zip"], None);
+    // uid 4 keeps no cached body, so nothing is known about its parts.
+
+    let (page, cursor) = get_recent_page(&conn, "acct", "INBOX", 1, None, ATTACHMENTS).unwrap();
+    assert_eq!(page.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![3]);
+    let (rest, cursor) = get_recent_page(
+        &conn,
+        "acct",
+        "INBOX",
+        1,
+        parse_cursor(cursor.as_deref()),
+        ATTACHMENTS,
+    )
+    .unwrap();
+    assert_eq!(rest.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(cursor, None);
+
+    // The two narrowings combine: reading uid 3 drops it from "unread with
+    // attachments" but not from "with attachments".
+    conn.execute("UPDATE messages SET seen = 1 WHERE uid = 3", [])
+        .unwrap();
+    let both = RecentFilter {
+        unread_only: true,
+        attachments_only: true,
+    };
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 10, None, both).unwrap();
+    assert_eq!(page.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1]);
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 10, None, ATTACHMENTS).unwrap();
+    assert_eq!(page.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![3, 1]);
+
+    // Re-caching a body without the file clears the flag.
+    save_body_with_attachments(&conn, 3, &[], None);
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 10, None, ATTACHMENTS).unwrap();
+    assert_eq!(page.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![1]);
+}
+
+fn parse_cursor(cursor: Option<&str>) -> Option<(i64, u32)> {
+    let (date, uid) = cursor?.strip_prefix("date:")?.split_once(':')?;
+    Some((date.parse().ok()?, uid.parse().ok()?))
+}
+
+#[test]
+fn card_attachments_span_the_thread_not_the_page() {
+    let conn = test_conn();
+    for (uid, key) in [
+        (1, "a@example.com"),
+        (2, "a@example.com"),
+        (3, "b@example.com"),
+    ] {
+        conn.execute(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, date, thread_key)
+             VALUES('acct', 'INBOX', ?1, ?2, 'Hi', 1779580800, ?3)",
+            params![uid.to_string(), uid, key],
+        )
+        .unwrap();
+    }
+    // The file sits on the thread's first message; a page holding only the
+    // newest reply still marks the card.
+    save_body_with_attachments(&conn, 1, &["acct/INBOX/1/0.pdf"], None);
+
+    let header = |thread_key: &str| crate::imap::MessageHeader {
+        subject: "Hi".into(),
+        thread_key: thread_key.into(),
+        ..Default::default()
+    };
+    let (a, b) = (
+        card_thread_key(&header("a@example.com")),
+        card_thread_key(&header("b@example.com")),
+    );
+    let files = card_attachments(&conn, "acct", "INBOX", &[a.clone(), b]).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[&a],
+        vec![CardFile {
+            filename: "0.pdf".into(),
+            mime: "application/octet-stream".into()
+        }]
+    );
+}
+
+#[test]
+fn files_backfill_runs_in_batches_after_the_migration() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::migrate_to_v8(&conn).unwrap();
+    let insert = |uid: u32, json: Value| {
+        conn.execute(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, date, body, json)
+             VALUES('acct', 'INBOX', ?1, ?2, 'Hi', 1779580800, 'body', ?3)",
+            params![uid.to_string(), uid, json.to_string()],
+        )
+        .unwrap();
+    };
+    let file = |key: Option<&str>| json!({"filename": "f", "mime": "x/y", "size": 1, "key": key});
+    insert(
+        1,
+        json!({"attachments": [file(Some("acct/INBOX/1/0.pdf"))]}),
+    );
+    insert(
+        2,
+        json!({
+            "body_html": "<img src=\"/media/acct/INBOX/2/0.png\">",
+            "attachments": [file(Some("acct/INBOX/2/0.png"))],
+        }),
+    );
+    insert(3, json!({"attachments": [file(None)]}));
+    insert(4, json!({"attachments": []}));
+    insert(5, json!({}));
+
+    db::run_migrations(&conn).unwrap();
+    let filled = || -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM messages WHERE files IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    // The migration itself stays cheap: nothing is derived at startup.
+    assert_eq!(filled(), 0);
+
+    // Two rows per batch: three calls cover five rows, the fourth finds none.
+    let mut calls = 0;
+    while !backfill_files_batch(&conn, 2).unwrap() {
+        calls += 1;
+        assert!(calls < 10, "backfill never finished");
+    }
+    assert_eq!(calls, 3);
+    assert!(backfill_files_batch(&conn, 2).unwrap(), "stays done");
+
+    let mut stmt = conn
+        .prepare("SELECT uid, files FROM messages WHERE files IS NOT NULL ORDER BY uid")
+        .unwrap();
+    let flagged: Vec<(u32, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let file = json!([{"filename": "f", "mime": "x/y"}]);
+    assert_eq!(
+        flagged
+            .into_iter()
+            .map(|(uid, files)| (uid, serde_json::from_str::<Value>(&files).unwrap()))
+            .collect::<Vec<_>>(),
+        vec![(1, file.clone()), (3, file)]
+    );
+}
+
+#[test]
+fn attachments_filter_spans_the_thread_not_the_row() {
+    let conn = test_conn();
+    // A read message that carried the file, and an unread plain reply to it.
+    for (uid, seen) in [(1, 1), (2, 0)] {
+        conn.execute(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date, seen, thread_key)
+             VALUES('acct', 'INBOX', ?1, ?2, 'Hi', 'Aki', 'aki@example.com', ?3, ?4, 'root@example.com')",
+            params![uid.to_string(), uid, 1779580800 + uid as i64, seen],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE messages SET files = '[{\"filename\":\"plan.pdf\",\"mime\":\"application/pdf\"}]' WHERE uid = 1",
+        [],
+    )
+    .unwrap();
+
+    let both = RecentFilter {
+        unread_only: true,
+        attachments_only: true,
+    };
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 10, None, both).unwrap();
+    assert_eq!(page.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![2]);
+}
+
+#[test]
+fn card_attachments_prefer_the_cached_copy_of_a_folded_message() {
+    let conn = test_conn();
+    // One message filed twice: the Inbox copy (read first) has no cached body,
+    // the Sent copy does.
+    for (folder, files) in [
+        ("INBOX", None),
+        (
+            "Sent",
+            Some("[{\"filename\":\"plan.pdf\",\"mime\":\"application/pdf\"}]"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, date, thread_key, json, files)
+             VALUES('acct', ?1, '1', 1, 'Hi', 1779580800, 'root@example.com',
+                    '{\"message_id\":\"root@example.com\"}', ?2)",
+            params![folder, files],
+        )
+        .unwrap();
+    }
+    let key = card_thread_key(&crate::imap::MessageHeader {
+        subject: "Hi".into(),
+        thread_key: "root@example.com".into(),
+        ..Default::default()
+    });
+    let files = card_attachments(&conn, "acct", "INBOX", &[key.clone()]).unwrap();
+    assert_eq!(files[&key].len(), 1, "one message, listed once");
+    // Folding still counts the message once.
+    assert_eq!(
+        card_message_counts(&conn, "acct", "INBOX", &[key.clone()]).unwrap()[&key],
+        1
+    );
+}
+
+#[test]
+fn attachments_filter_finds_unopened_messages_from_header_metadata() {
+    let conn = test_conn();
+    let file = CardFile {
+        filename: "report.pdf".into(),
+        mime: "application/pdf".into(),
+    };
+    let mut header = MessageHeader {
+        uid: 1,
+        subject: "Report".into(),
+        thread_key: "uid:1".into(),
+        files: Some(vec![file.clone()]),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    let (page, _) = get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS).unwrap();
+    assert_eq!(page.len(), 1);
+    assert!(
+        get_cached_message(&conn, "acct", "INBOX", 1)
+            .unwrap()
+            .is_none()
+    );
+    let files = card_attachments(&conn, "acct", "INBOX", &["uid:1".into()]).unwrap();
+    assert_eq!(files["uid:1"], vec![file]);
+
+    // A header/flag update that lacks BODYSTRUCTURE must preserve metadata.
+    header.files = None;
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    assert_eq!(
+        get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
+    // A known empty structure clears the provisional names.
+    header.files = Some(vec![]);
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    assert!(
+        get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    // Cached bodies take precedence over provisional metadata on later syncs.
+    save_body_with_attachments(&conn, 1, &[], None);
+    header.files = Some(vec![CardFile {
+        filename: "logo.png".into(),
+        mime: "image/png".into(),
+    }]);
+    upsert_messages(&conn, "acct", "INBOX", &[header]).unwrap();
+    assert!(
+        get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS)
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
+#[test]
+fn attachment_metadata_catchup_is_bounded_and_skips_completed_rows() {
+    let conn = test_conn();
+    for uid in 1..=4 {
+        insert_message(&conn, uid, "Hi", "Aki", "aki@example.com", None);
+    }
+    save_body_with_attachments(&conn, 4, &[], None);
+    assert_eq!(
+        missing_attachment_metadata_uids(&conn, "acct", "INBOX", 2).unwrap(),
+        vec![3, 2]
+    );
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[MessageHeader {
+            uid: 3,
+            files: Some(vec![]),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        missing_attachment_metadata_uids(&conn, "acct", "INBOX", 2).unwrap(),
+        vec![2, 1]
+    );
+    assert!(
+        missing_attachment_metadata_uids(&conn, "other", "INBOX", 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        missing_attachment_metadata_uids(&conn, "acct", "Sent", 2)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn attachment_metadata_attempts_advance_past_missing_and_poison_rows() {
+    let conn = test_conn();
+    for uid in 1..=4 {
+        insert_message(&conn, uid, "Hi", "Aki", "aki@example.com", None);
+    }
+    let attempted = missing_attachment_metadata_uids(&conn, "acct", "INBOX", 2).unwrap();
+    assert_eq!(attempted, vec![4, 3]);
+    mark_attachment_metadata_attempted(&conn, "other", "INBOX", &attempted).unwrap();
+    assert_eq!(
+        missing_attachment_metadata_uids(&conn, "acct", "INBOX", 2).unwrap(),
+        attempted
+    );
+    // A malformed UID and a UID whose reply had no BODYSTRUCTURE both advance.
+    mark_attachment_metadata_attempted(&conn, "acct", "INBOX", &attempted).unwrap();
+    assert_eq!(
+        missing_attachment_metadata_uids(&conn, "acct", "INBOX", 2).unwrap(),
+        vec![2, 1]
+    );
+    // Attempted metadata remains unknown, rather than claiming no attachments.
+    let known: Option<bool> = conn
+        .query_row(
+            "SELECT json_extract(json, '$.attachment_metadata') FROM messages WHERE uid = 4",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(known, None);
+    // A future regular header refresh can still discover files for that UID.
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[MessageHeader {
+            uid: 4,
+            files: Some(vec![CardFile {
+                filename: "later.pdf".into(),
+                mime: "application/pdf".into(),
+            }]),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    assert_eq!(
+        get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS)
+            .unwrap()
+            .0
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn folded_attachment_metadata_prefers_cached_bodies_including_empty_lists() {
+    for cached_folder in ["INBOX", "Sent"] {
+        for real_files in [vec![], vec!["real.pdf"]] {
+            let conn = test_conn();
+            for folder in ["INBOX", "Sent"] {
+                upsert_messages(
+                    &conn,
+                    "acct",
+                    folder,
+                    &[MessageHeader {
+                        uid: 1,
+                        subject: "Hi".into(),
+                        thread_key: "root@example.com".into(),
+                        message_id: "root@example.com".into(),
+                        files: Some(vec![CardFile {
+                            filename: "provisional.png".into(),
+                            mime: "image/png".into(),
+                        }]),
+                        ..Default::default()
+                    }],
+                )
+                .unwrap();
+            }
+            let message = crate::parse::Message {
+                subject: "Hi".into(),
+                message_id: "root@example.com".into(),
+                body: "Hello".into(),
+                attachments: real_files
+                    .iter()
+                    .map(|name| crate::parse::Attachment {
+                        filename: (*name).into(),
+                        mime: "application/pdf".into(),
+                        size: 1,
+                        key: None,
+                        oversized: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            save_cached_message(&conn, "acct", cached_folder, 1, &message).unwrap();
+            let key = card_thread_key(&MessageHeader {
+                subject: "Hi".into(),
+                thread_key: "root@example.com".into(),
+                ..Default::default()
+            });
+            let files = card_attachments(&conn, "acct", "INBOX", &[key.clone()]).unwrap();
+            let names: Vec<_> = files
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .map(|file| file.filename.as_str())
+                .collect();
+            assert_eq!(names, real_files, "cached copy in {cached_folder} must win");
+            let (headers, cursor) =
+                get_recent_page(&conn, "acct", "INBOX", 50, None, ATTACHMENTS).unwrap();
+            let mut page =
+                crate::thread_list::mail_page(&conn, "acct", "INBOX", headers, cursor, true)
+                    .unwrap();
+            crate::thread_list::ThreadListQuery::from_params(
+                &json!({"attachments": true}),
+                "folder",
+            )
+            .retain_attachment_threads(&mut page);
+            assert_eq!(
+                page["threads"].as_array().unwrap().len(),
+                usize::from(!real_files.is_empty())
+            );
+            assert_eq!(
+                card_message_counts(&conn, "acct", "INBOX", &[key.clone()]).unwrap()[&key],
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn contacts_follow_every_message_write() {
+    use crate::imap::{MessageHeader, Recipient};
+    let conn = test_conn();
+    let to = |addr: &str| Recipient {
+        name: String::new(),
+        addr: addr.to_string(),
+    };
+    let message = |uid: u32, recipients: Vec<Recipient>| MessageHeader {
+        uid,
+        subject: "Hi".into(),
+        from_name: "Aki".into(),
+        from_addr: "Aki@example.com".into(),
+        to: recipients,
+        ..Default::default()
+    };
+    let contacts = |conn: &Connection| {
+        let mut stmt = conn
+            .prepare("SELECT addr_key, name, count FROM contacts ORDER BY addr_key")
+            .unwrap();
+        stmt.query_map([], |row| {
+            Ok(format!(
+                "{} {} {}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+    };
+
+    // An address listed twice on one message counts it once.
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[
+            message(1, vec![to("bea@example.com"), to("BEA@example.com")]),
+            message(2, vec![to("cleo@example.com")]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        contacts(&conn),
+        [
+            "aki@example.com Aki 2",
+            "bea@example.com  1",
+            "cleo@example.com  1"
+        ]
+    );
+
+    // A resync of the same envelope leaves the counts alone; a changed
+    // recipient list moves them.
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[message(2, vec![to("cleo@example.com")])],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE messages SET seen = 1, json = json_set(json, '$.x', 1)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(contacts(&conn).len(), 3);
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[message(2, vec![to("dan@example.com")])],
+    )
+    .unwrap();
+    assert_eq!(
+        contacts(&conn),
+        [
+            "aki@example.com Aki 2",
+            "bea@example.com  1",
+            "dan@example.com  1"
+        ]
+    );
+
+    // Deleting the last message an address is on drops it.
+    conn.execute("DELETE FROM messages WHERE uid = 1", [])
+        .unwrap();
+    assert_eq!(
+        contacts(&conn),
+        ["aki@example.com Aki 1", "dan@example.com  1"]
+    );
+
+    // Each name is kept apart, so one leaves with its last message.
+    let named = |uid: u32, name: &str| MessageHeader {
+        uid,
+        from_name: name.into(),
+        from_addr: "person@example.com".into(),
+        ..Default::default()
+    };
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[named(3, "Alice"), named(4, "Ally"), named(5, "Ally")],
+    )
+    .unwrap();
+    let person = |query: &str| {
+        suggest_contacts(&conn, "acct", query, 10)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect::<Vec<_>>()
+    };
+    // Matched by name, it shows the name that matched.
+    assert_eq!(person("alice"), ["Alice"]);
+    assert_eq!(person("person"), ["Ally"]);
+    conn.execute("DELETE FROM messages WHERE uid IN (4, 5)", [])
+        .unwrap();
+    assert_eq!(person("ally"), Vec::<String>::new());
+    assert_eq!(person("alice"), ["Alice"]);
+    conn.execute("DELETE FROM messages WHERE uid = 3", [])
+        .unwrap();
+
+    // A shared sender matched only by one of its names ranks, and shows, by
+    // that name; a word-start match outranks one inside a word.
+    let notification = |uid: u32, name: &str| MessageHeader {
+        uid,
+        from_name: name.into(),
+        from_addr: "notifications@github.com".into(),
+        ..Default::default()
+    };
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[
+            notification(10, "Flathub Bot"),
+            notification(11, "Flathub Bot"),
+            notification(12, "Flathub Bot"),
+            notification(13, "ISAN98"),
+            message(14, vec![to("isan98@proton.me")]),
+            message(15, vec![to("isan98@proton.me")]),
+            message(16, vec![to("louisa@example.com")]),
+            message(17, vec![to("louisa@example.com")]),
+            message(18, vec![to("louisa@example.com")]),
+        ],
+    )
+    .unwrap();
+    let isa = suggest_contacts(&conn, "acct", "isa", 10).unwrap();
+    assert_eq!(
+        isa.iter()
+            .map(|c| format!("{} {}", c.name, c.addr))
+            .collect::<Vec<_>>(),
+        [
+            " isan98@proton.me",
+            "ISAN98 notifications@github.com",
+            " louisa@example.com"
+        ]
+    );
+    conn.execute("DELETE FROM messages WHERE uid >= 10", [])
+        .unwrap();
+
+    // Non-ASCII capitals still make one address.
+    upsert_messages(
+        &conn,
+        "acct",
+        "INBOX",
+        &[
+            message(20, vec![to("Éva@example.com")]),
+            message(21, vec![to("éva@example.com")]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(suggest_contacts(&conn, "acct", "éva", 10).unwrap().len(), 1);
+    conn.execute("DELETE FROM messages WHERE uid >= 20", [])
+        .unwrap();
+
+    // Feed items aren't correspondents.
+    conn.execute(
+        "INSERT INTO messages(account, folder, msg_id, uid, from_addr)
+         VALUES('acct', 'feed', 'item', 0, 'feed@example.com')",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        contacts(&conn),
+        ["aki@example.com Aki 1", "dan@example.com  1"]
+    );
+}
+
+#[test]
+fn migration_backfills_contacts_from_cached_mail() {
+    let conn = Connection::open_in_memory().unwrap();
+    db::migrate_to_v8(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO messages(account, folder, msg_id, uid, from_name, from_addr, json)
+         VALUES('acct', 'INBOX', '1', 1, 'Aki', 'aki@example.com',
+                '{\"to\":[{\"name\":\"Bea\",\"addr\":\"bea@example.com\"}],
+                  \"cc\":[{\"name\":\"\",\"addr\":\"Aki@example.com\"}]}'),
+               ('acct', 'Sent', '2', 2, 'Me', 'me@example.com',
+                '{\"to\":[{\"name\":\"\",\"addr\":\"bea@example.com\"}]}'),
+               ('acct', 'feed', 'item', 0, 'Feed', 'feed@example.com', '{}')",
+        [],
+    )
+    .unwrap();
+    db::run_migrations(&conn).unwrap();
+
+    let top = suggest_contacts(&conn, "acct", "", 10).unwrap();
+    assert_eq!(
+        top.iter()
+            .map(|c| format!("{} {}", c.addr, c.name))
+            .collect::<Vec<_>>(),
+        // Aki sent message 1 and is Cc'd on it nameless: two names, counted
+        // once each.
+        [
+            "aki@example.com Aki",
+            "bea@example.com Bea",
+            "me@example.com Me"
+        ]
+    );
+}
+
+#[test]
+fn invite_responses_are_kept_per_event_and_dropped_with_the_account() {
+    let conn = test_conn();
+    assert_eq!(invite_response(&conn, "acct", "uid-1", 0).unwrap(), None);
+    record_invite_response(&conn, "acct", "uid-1", 0, "tentative", 1).unwrap();
+    record_invite_response(&conn, "acct", "uid-1", 0, "accepted", 2).unwrap();
+    // One occurrence of the series is a separate answer.
+    record_invite_response(&conn, "acct", "uid-1", 1_792_688_400, "declined", 2).unwrap();
+    let series = invite_response(&conn, "acct", "uid-1", 0).unwrap().unwrap();
+    assert_eq!((series.response.as_str(), series.sequence), ("accepted", 2));
+    let occurrence = invite_response(&conn, "acct", "uid-1", 1_792_688_400)
+        .unwrap()
+        .unwrap();
+    assert_eq!(occurrence.response, "declined");
+    assert_eq!(invite_response(&conn, "other", "uid-1", 0).unwrap(), None);
+
+    delete_account(&conn, "acct").unwrap();
+    assert_eq!(invite_response(&conn, "acct", "uid-1", 0).unwrap(), None);
+}
+
+#[test]
+fn a_cached_message_keeps_its_invite() {
+    let conn = test_conn();
+    let invite = crate::calendar::Invite {
+        method: "request".into(),
+        uid: "uid-1".into(),
+        summary: "Launch review".into(),
+        ics: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into(),
+        ..Default::default()
+    };
+    save_cached_message(
+        &conn,
+        "acct",
+        "INBOX",
+        9,
+        &Message {
+            body: "You are invited".into(),
+            invite: Some(invite.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cached = get_cached_message(&conn, "acct", "INBOX", 9)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.invite, Some(invite));
 }

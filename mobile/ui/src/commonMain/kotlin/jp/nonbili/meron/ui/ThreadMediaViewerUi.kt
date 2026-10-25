@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.KeyboardArrowLeft
@@ -150,10 +149,11 @@ internal fun AsyncAttachmentImage(
     contentDescription: String,
     modifier: Modifier,
     contentScale: ContentScale,
+    retryKey: Int = 0,
 ) {
     var bitmap by remember(attachment.key, attachment.url, ref) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(attachment.key, attachment.url, ref) {
-        bitmap = loadImageAttachment(attachment) ?: loadImageBitmapRef(ref)
+    LaunchedEffect(attachment.key, attachment.url, ref, retryKey) {
+        if (bitmap == null) bitmap = loadImageAttachment(attachment) ?: loadImageBitmapRef(ref)
     }
     val image = bitmap
     if (image != null) {
@@ -470,18 +470,25 @@ internal fun ImagePreviewDialog(
     )
 }
 
+internal val AttachmentImageGridGap = 6.dp
+
 @Composable
 internal fun AttachmentImageGrid(
     images: List<MessageAttachment>,
     loadImageAttachment: suspend (MessageAttachment) -> ImageBitmap? = { null },
     onOpen: (MessageAttachment) -> Unit,
+    // Fewer than three leaves a short grid without the empty tiles beside it, for
+    // a chat bubble that shrinks to its images.
+    columns: Int = 3,
+    modifier: Modifier = Modifier,
+    mediaMissing: Int = 0,
 ) {
-    val rows = remember(images) { images.chunked(3) }
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    val rows = remember(images, columns) { images.chunked(columns) }
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(AttachmentImageGridGap)) {
         rows.forEach { row ->
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(AttachmentImageGridGap),
             ) {
                 row.forEach { attachment ->
                     Surface(
@@ -492,15 +499,16 @@ internal fun AttachmentImageGrid(
                     ) {
                         AsyncAttachmentImage(
                             attachment = attachment,
+                            retryKey = mediaMissing,
                             ref = attachmentMediaRef(attachment),
                             loadImageAttachment = loadImageAttachment,
-                            contentDescription = attachment.filename.ifBlank { "Image" },
+                            contentDescription = attachment.filename.ifBlank { tr("mobile.status.imageTitle") },
                             modifier = Modifier.fillMaxSize(),
                             contentScale = ContentScale.Crop,
                         )
                     }
                 }
-                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
@@ -524,10 +532,10 @@ internal fun AttachmentRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(18.dp))
+            Icon(fileIconFor(attachment.filename, attachment.mimeType), contentDescription = null, modifier = Modifier.size(18.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    attachment.filename.ifBlank { "Attachment" },
+                    attachment.filename.ifBlank { tr("chat.attachment") },
                     fontSize = 12.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

@@ -36,7 +36,8 @@ func foldersJSON(accountID string, raw any) any {
 			}
 		}
 		unread := uint32(jsonNumber(folderObject["unread"]))
-		folders = append(folders, Folder{ID: name, AccountID: accountID, Name: label, Role: role, Delimiter: delimiter, Unread: unread})
+		notify, _ := folderObject["notify"].(bool)
+		folders = append(folders, Folder{ID: name, AccountID: accountID, Name: label, Role: role, Delimiter: delimiter, Unread: unread, Notify: notify})
 	}
 	return map[string]any{"folders": folders}
 }
@@ -135,6 +136,9 @@ func copyPageMetadata(object, out map[string]any) {
 	if folderSynced, ok := object["folder_synced"].(bool); ok {
 		out["folder_synced"] = folderSynced
 	}
+	if incomplete, ok := object["search_incomplete"].(bool); ok && incomplete {
+		out["search_incomplete"] = true
+	}
 	if folderUnreads, ok := object["folder_unreads"].(map[string]any); ok {
 		out["folder_unreads"] = folderUnreads
 	}
@@ -173,6 +177,7 @@ func messageJSON(accountID, threadID, folder string, raw any) any {
 		HasAttachments: len(attachmentList) > 0,
 		Attachments:    attachmentList,
 		Reply:          object["reply"],
+		Invite:         object["invite"],
 	}}}
 }
 

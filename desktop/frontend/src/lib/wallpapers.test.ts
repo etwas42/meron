@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { sanitizeChatWallpaper, wallpaperCss } from './wallpapers'
+import { boardWallpaper, sanitizeChatWallpaper, wallpaperCss } from './wallpapers'
 
 describe('sanitizeChatWallpaper', () => {
   it('accepts known presets and Meron-owned custom URLs', () => {
@@ -34,5 +34,13 @@ describe('wallpaperCss', () => {
     const css = wallpaperCss({ kind: 'custom', url: '/media/wallpapers/acct/one.png' })
     expect(css.className).toBe('me-wallpaper-custom')
     expect(css.style?.backgroundImage).toContain('/media/wallpapers/acct/one.png')
+  })
+})
+
+describe('boardWallpaper', () => {
+  it('treats Plain as no board background', () => {
+    expect(boardWallpaper({ kind: 'preset', presetId: 'plain' })).toBeNull()
+    expect(boardWallpaper(undefined)).toBeNull()
+    expect(boardWallpaper({ kind: 'preset', presetId: 'dots' })).toEqual({ kind: 'preset', presetId: 'dots' })
   })
 })

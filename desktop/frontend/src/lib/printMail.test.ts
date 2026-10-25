@@ -1,5 +1,13 @@
 import { beforeEach, afterEach, expect, spyOn, test } from 'bun:test'
-import { loadPrintThread, mailPrintHtml, mailPrintText, nativePrintHtml, printMail, printThread } from './printMail'
+import {
+  loadPrintThread,
+  mailPrintHtml,
+  mailPrintText,
+  nativePrintHtml,
+  printMail,
+  printThread,
+  referencesRemoteContent,
+} from './printMail'
 import type { Message, MessageTab } from '../types'
 import { CONVERSATION_PAGE_SIZE } from './pagination'
 import { thread$ } from '../states/thread'
@@ -243,13 +251,16 @@ test('thread printing fetches all pages, deduplicates, and prints oldest first',
   expect(sections[1]).toContain('Newest')
 })
 
-test('slow resources still print and beforeprint remeasures frame height', async () => {
+test('mixed-CSP threads fall back to frames and beforeprint remeasures their height', async () => {
   let finishLoading: (() => void) | undefined
   const timeout = spyOn(window, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
     if (delay === 15000) finishLoading = callback
     return 0
   }) as typeof window.setTimeout)
+  document.documentElement.classList.add('native-scrollbars')
+  let nativeScrollbarsWhilePrinting: boolean | undefined
   const print = spyOn(window, 'print').mockImplementation(() => {
+    nativeScrollbarsWhilePrinting = document.documentElement.classList.contains('native-scrollbars')
     const frame = document.querySelector<HTMLIFrameElement>('#meron-print-document iframe')!
     const body = frame.contentDocument!.body
     Object.defineProperty(body, 'scrollHeight', { configurable: true, value: 1200 })
@@ -260,14 +271,42 @@ test('slow resources still print and beforeprint remeasures frame height', async
     expect(frame.style.height).toBe('600px')
     window.dispatchEvent(new Event('afterprint'))
   })
+  // One message with revealed remote content gives the thread two print CSPs.
+  thread$.revealedRemote.set({ old: true })
+  ;(window as any).go = {
+    main: {
+      App: {
+        Invoke: async (command: string) => {
+          if (command === 'mail.print') throw new Error('mixed CSPs must not reach native printing')
+          return {
+            messages: [
+              {
+                ...message,
+                id: 'old',
+                date: 1,
+                body_html: '<p style="background: url(https://example.com/bg.png)">Remote allowed</p>',
+              },
+              { ...message, id: 'new', date: 2, body_html: '<p>Available body</p>' },
+            ],
+          }
+        },
+      },
+    },
+  }
   try {
-    const job = printMail({ ...message, body_html: '<p>Available body</p>' })
-    finishLoading!()
+    const job = printThread('t')
+    while (!finishLoading) await Promise.resolve()
+    finishLoading()
     await job
     expect(print).toHaveBeenCalledTimes(1)
+    // WebKitGTK prints iframes blank under its overlay scrollbars.
+    expect(nativeScrollbarsWhilePrinting).toBe(false)
+    expect(document.documentElement.classList.contains('native-scrollbars')).toBe(true)
   } finally {
+    document.documentElement.classList.remove('native-scrollbars')
     timeout.mockRestore()
     print.mockRestore()
+    thread$.revealedRemote.set({})
   }
 })
 
@@ -312,21 +351,45 @@ test('slow print preparation stays visible through native preparation and clears
   }
 })
 
-test('non-native printing calls window.print directly and cleans up afterprint', async () => {
+test('browser printing prints shadow-root markup from its own frame and cleans up afterprint', async () => {
   const originalTitle = document.title
   ;(window as any).go = { main: { App: { Invoke: async () => false } } }
-  const print = spyOn(window, 'print').mockImplementation(() => {
-    expect(document.title).toBe(message.subject)
-    expect(document.querySelector('#meron-print-document pre')?.textContent).toContain(message.body)
-    window.dispatchEvent(new Event('afterprint'))
+  const windowPrint = spyOn(window, 'print')
+  let printed: { title: string; nested: boolean; summary: string; body: string; head: string } | undefined
+  // Happy DOM frames have no print(); stub it on the paged frame as it is added.
+  const observer = new MutationObserver(() => {
+    const frame = document.querySelector<HTMLIFrameElement>('#meron-print-document > iframe')
+    if (!frame?.contentWindow || (frame.contentWindow as any).print) return
+    ;(frame.contentWindow as any).print = () => {
+      // Read before afterprint: cleanup removes the frame and its document.
+      const doc = frame.contentDocument!
+      printed = {
+        title: doc.title,
+        nested: !!doc.querySelector('iframe, template'),
+        summary: doc.querySelector('section > pre')?.textContent ?? '',
+        body: doc.querySelector('[data-print-body]')?.shadowRoot?.textContent ?? '',
+        head: doc.head.textContent ?? '',
+      }
+      frame.contentWindow!.dispatchEvent(new Event('afterprint'))
+    }
   })
+  observer.observe(document.body, { childList: true, subtree: true })
   try {
-    await printMail(message)
-    expect(print).toHaveBeenCalledTimes(1)
+    const job = printMail({ ...message, body_html: '<style>p { color: purple }</style><p>Formatted body</p>' })
+    document.querySelector('#meron-print-document iframe')!.dispatchEvent(new Event('load'))
+    await job
+    expect(windowPrint).not.toHaveBeenCalled()
+    expect(printed?.title).toBe(message.subject)
+    expect(printed?.nested).toBe(false)
+    expect(printed?.summary).toContain('Alice <alice@example.com>')
+    expect(printed?.body).toContain('Formatted body')
+    expect(printed?.head).not.toContain('purple')
+    expect(printed?.head).toContain('@page { margin: 15mm; }')
     expect(document.getElementById('meron-print-document')).toBeNull()
     expect(document.title).toBe(originalTitle)
   } finally {
-    print.mockRestore()
+    observer.disconnect()
+    windowPrint.mockRestore()
   }
 })
 
@@ -392,6 +455,85 @@ test('native printing falls back for mixed CSPs and rejects inaccessible frames'
     expect(() => nativePrintHtml(root)).toThrow('Print HTML unavailable')
   } finally {
     root.remove()
+  }
+})
+
+test('remote content detection ignores links and text but not resources', () => {
+  expect(referencesRemoteContent(undefined)).toBe(false)
+  expect(referencesRemoteContent('<p>See https://example.com</p><a href="https://example.com">link</a>')).toBe(false)
+  expect(referencesRemoteContent('<img src="/media/cat" alt="cat">')).toBe(false)
+  // GitHub notifications carry schema.org metadata that loads nothing.
+  expect(
+    referencesRemoteContent(
+      '<div itemscope itemtype="http://schema.org/EmailMessage"><link itemprop="url" href="https://github.com/x"><meta itemprop="name" content="https://x"></div>',
+    ),
+  ).toBe(false)
+  expect(referencesRemoteContent('<svg><image href="https://example.com/a.png"/></svg>')).toBe(true)
+  // Inline data loads nothing, even when its base64 contains "//".
+  expect(
+    referencesRemoteContent(
+      '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="1" height="1">',
+    ),
+  ).toBe(false)
+  expect(referencesRemoteContent('<div style="background: url(data:image/png;base64,AP///y)"></div>')).toBe(false)
+  expect(referencesRemoteContent('<img srcset="/media/a 1x, https://example.com/b.png 2x">')).toBe(true)
+  expect(referencesRemoteContent('<div style="background: url( //example.com/bg.png)"></div>')).toBe(true)
+  // CSS escapes can spell the scheme or slashes; browsers resolve them to remote URLs.
+  expect(referencesRemoteContent('<div style="background-image:url(\\68 ttps://example.com/bg.png)"></div>')).toBe(true)
+  expect(referencesRemoteContent('<style>p { background: url("\\2f\\2f example.com/bg.png") }</style>')).toBe(true)
+  expect(referencesRemoteContent('<style>p { background: url(h\\ttp://example.com/bg.png) }</style>')).toBe(true)
+  // A line continuation inside a string vanishes, joining the scheme back up.
+  for (const newline of ['\n', '\r\n', '\r', '\f']) {
+    expect(
+      referencesRemoteContent(`<style>p { background: url("ht\\${newline}tps://example.com/bg.png") }</style>`),
+    ).toBe(true)
+    expect(referencesRemoteContent(`<p style='background: url("ht\\${newline}tps://example.com/bg.png")'></p>`)).toBe(
+      true,
+    )
+  }
+  expect(referencesRemoteContent('<img src="https://example.com/cat.png" width="100" height="100">')).toBe(true)
+  expect(referencesRemoteContent('<img srcset="//example.com/cat.png 2x">')).toBe(true)
+  expect(referencesRemoteContent('<div style="background: url(http://example.com/bg.png)"></div>')).toBe(true)
+  expect(referencesRemoteContent('<style>@import "https://example.com/a.css";</style>')).toBe(true)
+})
+
+test('mixed remote policies print as one document when the allowed message loads nothing remote', async () => {
+  let printed = ''
+  thread$.revealedRemote.set({ old: true })
+  ;(window as any).go = {
+    main: {
+      App: {
+        Invoke: async (command: string, payload: any) => {
+          if (command === 'mail.print') {
+            printed = payload.html
+            return true
+          }
+          return {
+            messages: [
+              { ...message, id: 'old', date: 1, body_html: '<p>No remote <a href="https://example.com">link</a></p>' },
+              { ...message, id: 'new', date: 2, body_html: '<p>Blocked</p>' },
+            ],
+          }
+        },
+      },
+    },
+  }
+  try {
+    const job = printThread('t')
+    for (let frames: NodeListOf<HTMLIFrameElement>; ; await Promise.resolve()) {
+      frames = document.querySelectorAll('#meron-print-document iframe')
+      if (frames.length === 2) {
+        frames.forEach((frame) => frame.dispatchEvent(new Event('load')))
+        break
+      }
+    }
+    await job
+    const doc = new DOMParser().parseFromString(printed, 'text/html')
+    expect(doc.querySelectorAll('template[data-print-message]')).toHaveLength(2)
+    // Tightened to the stricter policy rather than broadened.
+    expect(doc.head.innerHTML).not.toContain('https:')
+  } finally {
+    thread$.revealedRemote.set({})
   }
 })
 

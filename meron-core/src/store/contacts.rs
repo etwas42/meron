@@ -3,8 +3,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-use super::*;
-
 /// A correspondent surfaced for recipient autocomplete.
 #[derive(serde::Serialize)]
 pub struct Contact {
@@ -14,13 +12,14 @@ pub struct Contact {
 
 /// Suggest contacts for recipient autocomplete, drawn from both the senders and
 /// the To/Cc recipients of cached messages. Results are distinct by address and
-/// ranked by how often the address appears. An empty `query` returns the top
-/// correspondents; otherwise we match the substring against address and display
-/// name. When `account` is empty we search across all accounts (unified compose).
+/// ranked by how many messages the address appears on. An empty `query` returns
+/// the top correspondents; otherwise we match the substring against address and
+/// display name. When `account` is empty we search across all accounts (unified
+/// compose).
 ///
-/// Recipient lists are stored as JSON, so aggregation happens in Rust rather than
-/// SQL: we pull the candidate rows (coarsely pre-filtered by LIKE) and fold them
-/// into a per-address tally.
+/// Reads the `contacts` directory the `messages` triggers keep (see
+/// `db::contacts_ddl`), matching in Rust so a name's non-ASCII case folds,
+/// which SQLite's `lower()` doesn't.
 pub fn suggest_contacts(
     conn: &Connection,
     account: &str,
@@ -30,90 +29,129 @@ pub fn suggest_contacts(
     use std::collections::HashMap;
 
     let q = query.trim().to_lowercase();
-    let like = format!("%{}%", escape_like(q.clone()));
     let account_filter = if account.is_empty() {
         "?1 = ''"
     } else {
         "account = ?1"
     };
-    // Pre-filter: keep rows where the query appears anywhere in the sender or the
-    // (JSON) recipient lists. With an empty query every row qualifies.
-    let sql = format!(
-        "SELECT from_name, from_addr, json_extract(json, '$.to'), json_extract(json, '$.cc')
-         FROM messages
-         WHERE {account_filter}
-           AND uid <> 0
-           AND (?2 = ''
-                OR lower(COALESCE(from_addr, '')) LIKE ?3 ESCAPE '\\'
-                OR lower(COALESCE(from_name, '')) LIKE ?3 ESCAPE '\\'
-                OR lower(COALESCE(json_extract(json, '$.to'), '')) LIKE ?3 ESCAPE '\\'
-                OR lower(COALESCE(json_extract(json, '$.cc'), '')) LIKE ?3 ESCAPE '\\')"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![account, q, like], |row| {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT addr_key, addr, name, count FROM contacts WHERE {account_filter}
+         ORDER BY addr_key, name"
+    ))?;
+    let rows = stmt.query_map(params![account], |row| {
         Ok((
-            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, u32>(3)?,
         ))
     })?;
 
-    // Tally per lowercased address: first display name seen wins (falling back to
-    // a later non-empty one), plus an occurrence count for ranking.
+    // One entry per address, across accounts and the names it came with.
     struct Tally {
-        name: String,
+        names: Vec<(String, u32)>,
         addr: String,
         count: u32,
     }
     let mut tallies: HashMap<String, Tally> = HashMap::new();
-    let mut bump = |name: String, addr: String| {
-        let addr = addr.trim();
-        if addr.is_empty() {
-            return;
-        }
-        let entry = tallies.entry(addr.to_lowercase()).or_insert_with(|| Tally {
-            name: String::new(),
-            addr: addr.to_string(),
+    for row in rows {
+        let (key, addr, name, count) = row?;
+        // Folded again: SQLite's `lower()` leaves non-ASCII capitals alone.
+        let entry = tallies.entry(key.to_lowercase()).or_insert_with(|| Tally {
+            names: Vec::new(),
+            addr: String::new(),
             count: 0,
         });
-        entry.count += 1;
-        if entry.name.is_empty() && !name.trim().is_empty() {
-            entry.name = name.trim().to_string();
+        entry.count += count;
+        // Casing differs between rows; take one regardless of their order.
+        if addr > entry.addr {
+            entry.addr = addr;
         }
-    };
-
-    for row in rows {
-        let (from_name, from_addr, to_json, cc_json) = row?;
-        bump(from_name, from_addr);
-        for json in [to_json, cc_json].into_iter().flatten() {
-            if let Ok(list) = serde_json::from_str::<Vec<crate::imap::Recipient>>(&json) {
-                for r in list {
-                    bump(r.name, r.addr);
-                }
+        if !name.is_empty() {
+            match entry.names.iter_mut().find(|(seen, _)| *seen == name) {
+                Some((_, seen)) => *seen += count,
+                None => entry.names.push((name, count)),
             }
         }
     }
 
-    // Keep only the addresses that actually match the query (the SQL pre-filter
-    // admits whole rows, so a sender match can drag in non-matching recipients).
-    let mut out: Vec<Tally> = tallies
+    // How well `text` holds the query: 0 at its start or a word's, 1 inside
+    // a word.
+    let rank = |text: &str| -> Option<u8> {
+        let text = text.to_lowercase();
+        let at = text.find(&q)?;
+        let word_start = !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        Some(if word_start { 0 } else { 1 })
+    };
+    // The most frequent of `names`; ties go to the alphabetically first, for a
+    // stable pick.
+    let top = |names: &[&(String, u32)]| {
+        names
+            .iter()
+            .rev()
+            .max_by_key(|(_, count)| *count)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_default()
+    };
+    struct Hit {
+        rank: u8,
+        count: u32,
+        name: String,
+        addr: String,
+    }
+    let mut hits: Vec<Hit> = tallies
         .into_values()
-        .filter(|t| {
-            q.is_empty() || t.addr.to_lowercase().contains(&q) || t.name.to_lowercase().contains(&q)
+        .filter_map(|t| {
+            let all: Vec<&(String, u32)> = t.names.iter().collect();
+            if q.is_empty() {
+                return Some(Hit {
+                    rank: 0,
+                    count: t.count,
+                    name: top(&all),
+                    addr: t.addr,
+                });
+            }
+            let named: Vec<(&(String, u32), u8)> = t
+                .names
+                .iter()
+                .filter_map(|entry| Some((entry, rank(&entry.0)?)))
+                .collect();
+            let name_rank = named.iter().map(|(_, rank)| *rank).min();
+            if let Some(addr_rank) = rank(&t.addr) {
+                return Some(Hit {
+                    rank: name_rank.map_or(addr_rank, |name_rank| name_rank.min(addr_rank)),
+                    count: t.count,
+                    name: top(&all),
+                    addr: t.addr,
+                });
+            }
+            // Matched by name alone: rank it, and show it, by the names that
+            // match. A shared sender (a notifications address carrying each
+            // actor's name) mustn't outrank a person on its other names' mail.
+            let matching: Vec<&(String, u32)> = named.iter().map(|(entry, _)| *entry).collect();
+            Some(Hit {
+                rank: name_rank?,
+                count: matching.iter().map(|(_, count)| count).sum(),
+                name: top(&matching),
+                addr: t.addr,
+            })
         })
         .collect();
-    out.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
+    hits.sort_by(|a, b| {
+        a.rank
+            .cmp(&b.rank)
+            .then_with(|| b.count.cmp(&a.count))
             .then_with(|| a.addr.to_lowercase().cmp(&b.addr.to_lowercase()))
     });
-    out.truncate(limit as usize);
-    Ok(out
+    hits.truncate(limit as usize);
+    Ok(hits
         .into_iter()
-        .map(|t| Contact {
-            name: t.name,
-            addr: t.addr,
+        .map(|hit| Contact {
+            name: hit.name,
+            addr: hit.addr,
         })
         .collect())
 }

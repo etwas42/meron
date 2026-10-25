@@ -21,7 +21,7 @@ export function buildGalleryItems(
     const { attachmentImages, videos } = getVisibleMedia(message, account, !!revealedRemote[message.id], allowedSenders)
     const caption = normalizeBodyText(message.body).replace(/\s+/g, ' ').trim()
     for (const image of attachmentImages) {
-      items.push({ type: 'image', src: mediaSrc(image), filename: image.filename, caption })
+      items.push({ type: 'image', src: mediaSrc(image), filename: image.filename, mime: image.mime, caption })
     }
     for (const video of videos) {
       items.push({
@@ -29,6 +29,7 @@ export function buildGalleryItems(
         src: mediaSrc(video),
         url: video.url ?? mediaSrc(video),
         filename: video.filename,
+        mime: video.mime,
         caption,
       })
     }

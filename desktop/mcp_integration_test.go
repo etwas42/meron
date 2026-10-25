@@ -14,10 +14,10 @@ import (
 // Exercise the public MCP transport against the real core and mail server.
 // Mutations are checked over independent IMAP connections, not the core cache.
 func TestIntegrationMCP(t *testing.T) {
-	server := startMaddy(t)
+	server := startMailServer(t)
 	sidecar, _ := startSidecar(t)
-	connectAccount(t, sidecar, server, "allowed", "alice@maddy.test")
-	connectAccount(t, sidecar, server, "excluded", "bob@maddy.test")
+	connectAccount(t, sidecar, server, "allowed", "alice@mail.test")
+	connectAccount(t, sidecar, server, "excluded", "bob@mail.test")
 	app := &App{sidecar: sidecar}
 	s := testMCPService(t, app, true)
 	s.config.Clients[0].Send = true
@@ -28,8 +28,8 @@ func TestIntegrationMCP(t *testing.T) {
 	appendMessage := func(t *testing.T, user, folder, subject string) uint32 {
 		t.Helper()
 		imapAppend(t, server.imapPort, user, testPassword, folder, rawMessage([]string{
-			"From: sender@maddy.test", "To: " + user,
-			"Subject: " + subject, fmt.Sprintf("Message-ID: <%s@maddy.test>", strings.ReplaceAll(subject, " ", "-")),
+			"From: sender@mail.test", "To: " + user,
+			"Subject: " + subject, fmt.Sprintf("Message-ID: <%s@mail.test>", strings.ReplaceAll(subject, " ", "-")),
 			"Content-Type: text/plain; charset=utf-8",
 		}, "Body for "+subject))
 		return mcpAssertServerCopies(t, server, user, folder, subject, 1)[0]
@@ -38,8 +38,8 @@ func TestIntegrationMCP(t *testing.T) {
 	t.Run("search read and account isolation", func(t *testing.T) {
 		session := connectTestMCP(t, s)
 		subject := "MCP visible message"
-		uid := appendMessage(t, "alice@maddy.test", "INBOX", subject)
-		appendMessage(t, "bob@maddy.test", "INBOX", "MCP private message")
+		uid := appendMessage(t, "alice@mail.test", "INBOX", subject)
+		appendMessage(t, "bob@mail.test", "INBOX", "MCP private message")
 		pollInbox(t, sidecar, "allowed", func(m map[string]any) bool { return str(m, "subject") == subject })
 		private := pollInbox(t, sidecar, "excluded", func(m map[string]any) bool { return str(m, "subject") == "MCP private message" })
 
@@ -71,44 +71,44 @@ func TestIntegrationMCP(t *testing.T) {
 				t.Fatalf("allowed access to excluded account: %s", tc.tool)
 			}
 		}
-		mcpAssertServerCopies(t, server, "bob@maddy.test", "INBOX", "MCP private message", 1)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "INBOX", subject, 1)
-		if flags := imapFlags(t, server.imapPort, "alice@maddy.test", testPassword, "INBOX", uid); strings.Contains(flags, `\Seen`) {
+		mcpAssertServerCopies(t, server, "bob@mail.test", "INBOX", "MCP private message", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", subject, 1)
+		if flags := imapFlags(t, server.imapPort, "alice@mail.test", testPassword, "INBOX", uid); strings.Contains(flags, `\Seen`) {
 			t.Fatalf("MCP read marked message seen: %s", flags)
 		}
 	})
 
 	t.Run("draft create update and trash", func(t *testing.T) {
 		session := connectTestMCP(t, s)
-		args := map[string]any{"account_id": "allowed", "to": "bob@maddy.test", "subject": "MCP original draft", "body": "Original draft body"}
+		args := map[string]any{"account_id": "allowed", "to": "bob@mail.test", "subject": "MCP original draft", "body": "Original draft body"}
 		created := operationResult(t, callMCP(t, session, "create_draft", args))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Drafts", "MCP original draft", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Drafts", "MCP original draft", 1)
 		args["draft_id"] = created["draft_id"]
 		args["subject"] = "MCP updated draft"
 		args["body"] = "Updated draft body"
 		operationResult(t, callMCP(t, session, "update_draft", args))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Drafts", "MCP original draft", 0)
-		uids := mcpAssertServerCopies(t, server, "alice@maddy.test", "Drafts", "MCP updated draft", 1)
-		client := dialIMAP(t, server.imapPort, "alice@maddy.test", testPassword)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Drafts", "MCP original draft", 0)
+		uids := mcpAssertServerCopies(t, server, "alice@mail.test", "Drafts", "MCP updated draft", 1)
+		client := dialIMAP(t, server.imapPort, "alice@mail.test", testPassword)
 		client.selectFolder("Drafts")
 		body := strings.Join(client.do("UID FETCH %d (BODY.PEEK[TEXT])", uids[0]), "\n")
 		client.close()
 		if !strings.Contains(body, "Updated draft body") || strings.Contains(body, "Original draft body") {
 			t.Fatalf("server draft body = %s", body)
 		}
-		mcpAssertServerCopies(t, server, "bob@maddy.test", "INBOX", "MCP original draft", 0)
-		mcpAssertServerCopies(t, server, "bob@maddy.test", "INBOX", "MCP updated draft", 0)
+		mcpAssertServerCopies(t, server, "bob@mail.test", "INBOX", "MCP original draft", 0)
+		mcpAssertServerCopies(t, server, "bob@mail.test", "INBOX", "MCP updated draft", 0)
 		operationResult(t, callMCP(t, session, "organize_messages", map[string]any{"account_id": "allowed", "folder_id": "Drafts", "uids": uids, "action": "trash"}))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Drafts", "MCP updated draft", 0)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP updated draft", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Drafts", "MCP updated draft", 0)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP updated draft", 1)
 	})
 
 	t.Run("approved send and retry", func(t *testing.T) {
 		session := connectTestMCP(t, s)
-		args := map[string]any{"account_id": "allowed", "to": "bob@maddy.test", "subject": "MCP approved send", "body": "Approved body", "request_id": "send-integration"}
+		args := map[string]any{"account_id": "allowed", "to": "bob@mail.test", "subject": "MCP approved send", "body": "Approved body", "request_id": "send-integration"}
 		queued := operationResult(t, callMCP(t, session, "send_message", args))
 		id := mcpRequireStatus(t, queued, "pending_approval")
-		mcpAssertServerCopies(t, server, "bob@maddy.test", "INBOX", "MCP approved send", 0)
+		mcpAssertServerCopies(t, server, "bob@mail.test", "INBOX", "MCP approved send", 0)
 		mcpRequireStatus(t, resolveMCP(t, app, id, true), "completed")
 		pollInbox(t, sidecar, "excluded", func(m map[string]any) bool { return str(m, "subject") == "MCP approved send" })
 		retry := operationResult(t, callMCP(t, session, "send_message", args))
@@ -117,28 +117,81 @@ func TestIntegrationMCP(t *testing.T) {
 		}
 		mcpRequireStatus(t, resolveMCP(t, app, id, true), "completed")
 		mcpRequireStatus(t, operationResult(t, callMCP(t, session, "operation_status", map[string]any{"operation_id": id})), "completed")
-		mcpAssertServerCopies(t, server, "bob@maddy.test", "INBOX", "MCP approved send", 1)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Sent", "MCP approved send", 1)
+		mcpAssertServerCopies(t, server, "bob@mail.test", "INBOX", "MCP approved send", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Sent", "MCP approved send", 1)
 	})
 
 	t.Run("trash moves only selected inbox messages", func(t *testing.T) {
 		session := connectTestMCP(t, s)
-		uid := appendMessage(t, "alice@maddy.test", "INBOX", "MCP trash target")
-		appendMessage(t, "alice@maddy.test", "INBOX", "MCP trash neighbor")
+		uid := appendMessage(t, "alice@mail.test", "INBOX", "MCP trash target")
+		appendMessage(t, "alice@mail.test", "INBOX", "MCP trash neighbor")
 		operationResult(t, callMCP(t, session, "organize_messages", map[string]any{
 			"account_id": "allowed", "folder_id": "INBOX", "uids": []uint32{uid}, "action": "trash",
 		}))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "INBOX", "MCP trash target", 0)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP trash target", 1)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "INBOX", "MCP trash neighbor", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP trash target", 0)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash target", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP trash neighbor", 1)
 	})
 
+	t.Run("permanent deletion preserves unrelated deleted messages", func(t *testing.T) {
+		session := connectTestMCP(t, s)
+		uid := appendMessage(t, "alice@mail.test", "INBOX", "MCP delete target")
+		other := appendMessage(t, "alice@mail.test", "INBOX", "MCP unrelated deleted flag")
+		client := dialIMAP(t, server.imapPort, "alice@mail.test", testPassword)
+		client.selectFolder("INBOX")
+		client.do(`UID STORE %d +FLAGS (\Deleted)`, other)
+		client.close()
+		args := map[string]any{"account_id": "allowed", "folder_id": "INBOX", "uids": []uint32{uid}, "request_id": "delete-supported"}
+		queued := operationResult(t, callMCP(t, session, "delete_permanently", args))
+		id := mcpRequireStatus(t, queued, "pending_approval")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP delete target", 1)
+		mcpRequireStatus(t, resolveMCP(t, app, id, true), "completed")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP delete target", 0)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP unrelated deleted flag", 1)
+		mcpRequireStatus(t, operationResult(t, callMCP(t, session, "delete_permanently", args)), "completed")
+	})
+
+	t.Run("empty trash uses the approved snapshot", func(t *testing.T) {
+		session := connectTestMCP(t, s)
+		appendMessage(t, "alice@mail.test", "Trash", "MCP trash snapshot")
+		args := map[string]any{"account_id": "allowed", "folder_id": "Trash", "request_id": "empty-trash-supported"}
+		queued := operationResult(t, callMCP(t, session, "empty_trash", args))
+		id := mcpRequireStatus(t, queued, "pending_approval")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash snapshot", 1)
+		appendMessage(t, "alice@mail.test", "Trash", "MCP trash new arrival")
+		mcpRequireStatus(t, resolveMCP(t, app, id, true), "completed")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash snapshot", 0)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash new arrival", 1)
+		mcpRequireStatus(t, operationResult(t, callMCP(t, session, "empty_trash", args)), "completed")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash new arrival", 1)
+	})
+}
+
+// Keep the no-UIDPLUS refusal coverage with a Dovecot fixture whose advertised
+// capabilities omit UIDPLUS. Production deletion must never fall back to a
+// mailbox-wide EXPUNGE that could remove another client's flagged messages.
+func TestIntegrationMCPWithoutUIDPLUS(t *testing.T) {
+	server := startMailServerWithConfig(t, "imap_capability = IMAP4rev1 IDLE MOVE\n")
+	sidecar, _ := startSidecar(t)
+	connectAccount(t, sidecar, server, "allowed", "alice@mail.test")
+	app := &App{sidecar: sidecar}
+	s := testMCPService(t, app, true)
+	s.config.Clients[0].Delete = true
+	appendMessage := func(t *testing.T, user, folder, subject string) uint32 {
+		t.Helper()
+		imapAppend(t, server.imapPort, user, testPassword, folder, rawMessage([]string{
+			"From: sender@mail.test", "To: " + user, "Subject: " + subject,
+			fmt.Sprintf("Message-ID: <%s@mail.test>", strings.ReplaceAll(subject, " ", "-")),
+			"Content-Type: text/plain; charset=utf-8",
+		}, "Body for "+subject))
+		return mcpAssertServerCopies(t, server, user, folder, subject, 1)[0]
+	}
 	t.Run("permanent deletion fails closed without UIDPLUS", func(t *testing.T) {
 		session := connectTestMCP(t, s)
-		uid := appendMessage(t, "alice@maddy.test", "INBOX", "MCP delete target")
-		other := appendMessage(t, "alice@maddy.test", "INBOX", "MCP unrelated deleted flag")
+		uid := appendMessage(t, "alice@mail.test", "INBOX", "MCP delete target")
+		other := appendMessage(t, "alice@mail.test", "INBOX", "MCP unrelated deleted flag")
 		// Refusing deletion must also preserve messages flagged by another client.
-		client := dialIMAP(t, server.imapPort, "alice@maddy.test", testPassword)
+		client := dialIMAP(t, server.imapPort, "alice@mail.test", testPassword)
 		client.selectFolder("INBOX")
 		client.do(`UID STORE %d +FLAGS (\Deleted)`, other)
 		client.close()
@@ -146,24 +199,24 @@ func TestIntegrationMCP(t *testing.T) {
 		for range 2 {
 			mcpRequireUIDPLUSRefusal(t, callMCP(t, session, "delete_permanently", args))
 		}
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "INBOX", "MCP delete target", 1)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP delete target", 0)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "INBOX", "MCP unrelated deleted flag", 1)
-		if flags := imapFlags(t, server.imapPort, "alice@maddy.test", testPassword, "INBOX", uid); strings.Contains(flags, `\Deleted`) {
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP delete target", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP delete target", 0)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "INBOX", "MCP unrelated deleted flag", 1)
+		if flags := imapFlags(t, server.imapPort, "alice@mail.test", testPassword, "INBOX", uid); strings.Contains(flags, `\Deleted`) {
 			t.Fatalf("refused deletion changed flags: %s", flags)
 		}
 	})
 
 	t.Run("empty trash fails closed without UIDPLUS", func(t *testing.T) {
 		session := connectTestMCP(t, s)
-		appendMessage(t, "alice@maddy.test", "Trash", "MCP trash snapshot")
+		appendMessage(t, "alice@mail.test", "Trash", "MCP trash snapshot")
 		args := map[string]any{"account_id": "allowed", "folder_id": "Trash", "request_id": "empty-trash"}
 		mcpRequireUIDPLUSRefusal(t, callMCP(t, session, "empty_trash", args))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP trash snapshot", 1)
-		appendMessage(t, "alice@maddy.test", "Trash", "MCP trash new arrival")
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash snapshot", 1)
+		appendMessage(t, "alice@mail.test", "Trash", "MCP trash new arrival")
 		mcpRequireUIDPLUSRefusal(t, callMCP(t, session, "empty_trash", args))
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP trash snapshot", 1)
-		mcpAssertServerCopies(t, server, "alice@maddy.test", "Trash", "MCP trash new arrival", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash snapshot", 1)
+		mcpAssertServerCopies(t, server, "alice@mail.test", "Trash", "MCP trash new arrival", 1)
 		pending, err := app.mcpSettings("mcp.pending", nil)
 		if err != nil || len(pending.([]any)) != 0 {
 			t.Fatalf("unsupported deletion queued approval: %v (%v)", pending, err)
@@ -171,9 +224,6 @@ func TestIntegrationMCP(t *testing.T) {
 	})
 }
 
-// Maddy 0.8 supports MOVE but not UIDPLUS. Keep this explicit: permanent
-// deletion must not fall back to an unsafe mailbox-wide EXPUNGE. Successful
-// deletion/snapshot execution requires a UIDPLUS-capable integration fixture.
 func mcpRequireUIDPLUSRefusal(t *testing.T, result *mcp.CallToolResult) {
 	t.Helper()
 	if result.IsError {
@@ -195,7 +245,7 @@ func mcpRequireStatus(t *testing.T, result map[string]any, status string) string
 	return id
 }
 
-func mcpAssertServerCopies(t *testing.T, server *maddyServer, user, folder, subject string, want int) []uint32 {
+func mcpAssertServerCopies(t *testing.T, server *mailServer, user, folder, subject string, want int) []uint32 {
 	t.Helper()
 	uids := imapSearchSubject(t, server.imapPort, user, testPassword, folder, subject)
 	if len(uids) != want {

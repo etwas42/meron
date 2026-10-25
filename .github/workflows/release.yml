@@ -142,7 +142,16 @@ jobs:
         if: startsWith(matrix.os, 'windows')
         shell: pwsh
         run: |
-          choco install nsis --no-progress -y
+          # The community feed times out now and then, and choco still exits 0
+          # when it does, so retry and check for makensis ourselves rather
+          # than let the build silently skip the installer.
+          $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          foreach ($attempt in 1..4) {
+            choco install nsis --no-progress -y
+            if (Test-Path $makensis) { break }
+            if ($attempt -eq 4) { throw "NSIS install failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
           # choco updates the machine PATH, but the running job won't pick that up
           # in later steps; expose makensis to the build step explicitly.
           "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
@@ -157,6 +166,13 @@ jobs:
           extra=""
           if [[ "${{ matrix.os }}" == windows* ]]; then extra="-nsis"; fi
           cd desktop
+          if [[ "${{ matrix.os }}" == ubuntu* ]]; then
+            # Wails claims org.wails_app_<id>.SingleInstance, which the Snap
+            # Store holds for manual review. Claim the app ID itself instead:
+            # the snap declaration already grants jp.nonbili.meron.
+            go mod vendor
+            patch -p1 < build/linux/wails-single-instance-dbus-name.patch
+          fi
           wails build -clean -platform ${{ matrix.platform }} -tags "${{ matrix.tags }}" $extra
 
       - name: package macOS dmg
@@ -318,6 +334,17 @@ jobs:
           installer=$(ls desktop/build/bin/*installer.exe)
           cp "$installer" "dist/${{ matrix.artifact }}.exe"
 
+      - name: build windows appx exe
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The appx ships meron-core.exe beside meron.exe, so its exe is built
+          # without embed_sidecar rather than carrying a second, unused copy.
+          # -s reuses the frontend assets from the release build above.
+          cd desktop
+          wails build -s -platform ${{ matrix.platform }} -o meron-appx.exe
+
       - name: package windows appx
         if: startsWith(matrix.os, 'windows')
         shell: pwsh
@@ -336,11 +363,23 @@ jobs:
           $assets = Join-Path $stage 'Assets'
           Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $assets | Out-Null
-          Copy-Item desktop/build/bin/meron.exe (Join-Path $stage 'meron.exe')
+          Copy-Item desktop/build/bin/meron-appx.exe (Join-Path $stage 'meron.exe')
+          # Ship the sidecar inside the package so it is covered by the package
+          # signature. Smart App Control / WDAC block the unsigned copy meron.exe
+          # would otherwise extract to AppData; bundledSidecarPath finds it there.
+          Copy-Item desktop/build/sidecar/meron-core (Join-Path $stage 'meron-core.exe')
 
           # Generate the tile/logo assets from the 1024px app icon.
-          choco install imagemagick.app --no-progress -y | Out-Null
+          # Same retry as the NSIS install: choco exits 0 when the feed times out.
           $magick = "magick"
+          foreach ($attempt in 1..4) {
+            choco install imagemagick.app --no-progress -y | Out-Null
+            # Pick up the PATH entry the installer just added to the machine.
+            $env:Path += ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            if (Get-Command $magick -ErrorAction SilentlyContinue) { break }
+            if ($attempt -eq 4) { throw "ImageMagick install failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
           $sizes = @{
             'Square44x44Logo.png'   = '44x44';
             'Square71x71Logo.png'   = '71x71';
@@ -350,6 +389,15 @@ jobs:
           }
           foreach ($name in $sizes.Keys) {
             & $magick desktop/build/appicon.png -resize $sizes[$name] (Join-Path $assets $name)
+          }
+          # Taskbar assets need unplated variants for both light and dark themes;
+          # otherwise Windows shrinks the logo onto an accent-colored square.
+          foreach ($size in @(16, 20, 24, 30, 32, 36, 40, 48, 60, 64, 72, 80, 96, 256)) {
+            foreach ($variant in @('', '_altform-unplated', '_altform-lightunplated')) {
+              $name = "Square44x44Logo.targetsize-${size}${variant}.png"
+              & $magick desktop/build/appicon.png -resize "${size}x${size}" (Join-Path $assets $name)
+              if ($LASTEXITCODE -ne 0) { throw "Taskbar icon generation failed: $name" }
+            }
           }
           # Wide tile: fit the icon centered on a transparent 310x150 canvas.
           & $magick desktop/build/appicon.png -resize 150x150 -background none -gravity center -extent 310x150 (Join-Path $assets 'Wide310x150Logo.png')
@@ -368,7 +416,21 @@ jobs:
             Sort-Object Name -Descending |
             Select-Object -First 1
           $makeappx = Join-Path $sdkBin.FullName 'x64\makeappx.exe'
+          $makepri = Join-Path $sdkBin.FullName 'x64\makepri.exe'
           $signtool = Join-Path $sdkBin.FullName 'x64\signtool.exe'
+
+          # Index qualified icons so the Windows shell can select the matching
+          # target size and unplated theme variant instead of the base logo.
+          $priConfig = Join-Path $env:RUNNER_TEMP 'meron-priconfig.xml'
+          & $makepri createconfig /cf $priConfig /dq en-US /o
+          if ($LASTEXITCODE -ne 0) { throw "makepri createconfig failed" }
+          [xml]$pri = Get-Content $priConfig
+          # Keep resources in this package rather than creating resource packs.
+          $packaging = $pri.SelectSingleNode('//packaging')
+          if ($packaging) { $packaging.ParentNode.RemoveChild($packaging) | Out-Null }
+          $pri.Save($priConfig)
+          & $makepri new /pr $stage /cf $priConfig /mn (Join-Path $stage 'AppxManifest.xml') /of (Join-Path $stage 'resources.pri') /o
+          if ($LASTEXITCODE -ne 0) { throw "makepri new failed" }
 
           $appx = "dist/${{ matrix.artifact }}.appx"
           & $makeappx pack /d $stage /p $appx /o

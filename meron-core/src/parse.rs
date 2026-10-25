@@ -3,8 +3,13 @@
 //! Two jobs: decode RFC 2047 encoded-words in bare header fragments, and turn
 //! a full RFC822 message into a readable summary + body for the reader view.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use html_to_markdown_rs::{ConversionOptions, convert};
-use mailparse::{DispositionType, MailHeaderMap, ParsedMail, addrparse, parse_header, parse_mail};
+use mailparse::body::Body;
+use mailparse::{
+    DispositionType, MailAddr, MailAddrList, MailHeader, MailHeaderMap, ParsedMail, addrparse,
+    addrparse_header, parse_header, parse_mail,
+};
 use std::path::{Path, PathBuf};
 
 /// Default cap for files served from the media cache. The desktop bridge stores
@@ -184,6 +189,31 @@ pub struct Message {
     pub body_is_rendered: bool,
     pub preview: String,
     pub attachments: Vec<Attachment>,
+    /// The calendar event a `text/calendar` part carries, when the message is
+    /// an invitation (or an update, cancellation or reply to one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<crate::calendar::Invite>,
+}
+
+impl Message {
+    /// The parts the user would call attachments: every one except those its
+    /// HTML body already shows inline (`cid:` logos and signature images,
+    /// rewritten to `/media/<key>` at parse time). The reader draws the same
+    /// line, and the store's v11 migration mirrors it for rows cached before
+    /// the list was stored.
+    pub fn file_attachments(&self) -> impl Iterator<Item = &Attachment> {
+        let html = self.body_html.as_deref().unwrap_or_default();
+        self.attachments
+            .iter()
+            .filter(move |attachment| match &attachment.key {
+                Some(key) => !html.contains(&format!("/media/{key}")),
+                None => true,
+            })
+    }
+
+    pub fn has_attachments(&self) -> bool {
+        self.file_attachments().next().is_some()
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -193,8 +223,15 @@ pub struct Attachment {
     pub size: usize,
     /// Relative media key (`account/folder/uid/index.ext`) for the bytes written
     /// to disk and served at `/media/<key>`; null only when no media context was
-    /// provided (tests, previews) or the write failed.
+    /// provided (tests, previews), the write failed, or the file is
+    /// `oversized`.
     pub key: Option<String>,
+    /// Left off disk on purpose: larger than the whole media cache, so it
+    /// could not outlive a prune. Downloading the message again would not
+    /// change that, which is what tells it from a key-less attachment whose
+    /// bytes were never written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub oversized: bool,
 }
 
 /// Decode a bare RFC 2047 header fragment — one that arrives without its field
@@ -209,15 +246,223 @@ pub fn decode_words(raw: &str) -> String {
     }
 }
 
+/// Parse an address header like `mailparse::addrparse_header`, but also decode
+/// encoded-words `mailparse` leaves verbatim: ones glued to surrounding text
+/// (`Acme=?UTF-8?B?...?=`), which RFC 2047 forbids but some senders emit, and
+/// ones after non-ASCII text on the same line, where `mailparse` misreads the
+/// preceding character. Display and group names holding an encoded-word are
+/// decoded here from the raw value and handed back to `mailparse` as one
+/// well-formed encoded-word on a line of its own, so it decodes them once and
+/// keeps the decoded text opaque to address syntax.
+pub fn addrparse_lenient(header: &MailHeader) -> Option<MailAddrList> {
+    let raw = header.get_value_raw();
+    let raw = match std::str::from_utf8(raw) {
+        Ok(text) => text.to_string(),
+        Err(_) => raw.iter().map(|&b| b as char).collect(),
+    };
+    let rewritten = reencode_names(&raw);
+    if rewritten == raw {
+        return addrparse_header(header).ok();
+    }
+    let line = format!("{}: {rewritten}", header.get_key_ref());
+    let (rewritten_header, _) = parse_header(line.as_bytes()).ok()?;
+    addrparse_header(&rewritten_header).ok()
+}
+
+/// Replace each display or group name in a raw address list that holds an
+/// encoded-word with its decoded text, re-encoded as a single UTF-8 encoded-word
+/// on a folded line of its own. Names with quoted strings or comments, and all
+/// addresses, are left as they are.
+fn reencode_names(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut segment_start = 0;
+    let mut quoted = false;
+    let mut comment_depth = 0usize;
+    let mut in_angle = false;
+    let mut escaped = false;
+    let mut skip_to = 0;
+    for (i, c) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if i < skip_to {
+            continue;
+        }
+        let top_level = !quoted && comment_depth == 0 && !in_angle;
+        if top_level && let Some(len) = encoded_word_at(raw, i) {
+            // Punctuation inside an encoded-word is text, not address syntax.
+            skip_to = i + len;
+            continue;
+        }
+        match c {
+            '\\' if quoted || comment_depth > 0 => escaped = true,
+            '"' if comment_depth == 0 && !in_angle => quoted = !quoted,
+            _ if quoted => {}
+            '(' if !in_angle => comment_depth += 1,
+            ')' if comment_depth > 0 => comment_depth -= 1,
+            _ if comment_depth > 0 => {}
+            '>' if in_angle => {
+                in_angle = false;
+                out.push_str(&raw[segment_start..=i]);
+                segment_start = i + 1;
+            }
+            _ if in_angle => {}
+            '<' | ':' => {
+                if c == '<' {
+                    in_angle = true;
+                }
+                out.push_str(&reencode_name(&raw[segment_start..i]));
+                out.push(c);
+                segment_start = i + 1;
+            }
+            ',' | ';' => {
+                out.push_str(&raw[segment_start..=i]);
+                segment_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push_str(&raw[segment_start..]);
+    out
+}
+
+fn reencode_name(name: &str) -> String {
+    let flat = flatten_name(name);
+    let has_word = flat
+        .match_indices("=?")
+        .any(|(i, _)| encoded_word_len(&flat[i..]).is_some());
+    if !has_word {
+        return name.to_string();
+    }
+    let decoded = decode_words_lenient(flat.trim());
+    if decoded.is_empty() {
+        return name.to_string();
+    }
+    format!("\r\n =?UTF-8?B?{}?= ", STANDARD.encode(decoded))
+}
+
+/// A raw display name as `mailparse` reads it before decoding: folds joined,
+/// comments dropped (the whitespace around them kept), quoted strings unwrapped
+/// with their escapes resolved. Encoded-words are copied through whole, so
+/// punctuation inside one stays text.
+fn flatten_name(name: &str) -> String {
+    let unfolded = name
+        .lines()
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out = String::with_capacity(unfolded.len());
+    let mut quoted = false;
+    let mut comment_depth = 0usize;
+    let mut chars = unfolded.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if comment_depth == 0
+            && let Some(len) = encoded_word_at(&unfolded, i)
+        {
+            out.push_str(&unfolded[i..i + len]);
+            while chars.offset() < i + len {
+                chars.next();
+            }
+            continue;
+        }
+        match c {
+            '\\' if quoted || comment_depth > 0 => {
+                if let Some((_, next)) = chars.next()
+                    && comment_depth == 0
+                {
+                    out.push(next);
+                }
+            }
+            '"' if comment_depth == 0 => quoted = !quoted,
+            '(' if !quoted => comment_depth += 1,
+            ')' if comment_depth > 0 => comment_depth -= 1,
+            _ if comment_depth > 0 => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Byte length of an encoded-word starting at byte `i` of `text`, if one does.
+fn encoded_word_at(text: &str, i: usize) -> Option<usize> {
+    text[i..]
+        .starts_with("=?")
+        .then(|| encoded_word_len(&text[i..]))
+        .flatten()
+}
+
+/// Decode every well-formed encoded-word in `text`, wherever it sits, dropping
+/// whitespace between adjacent encoded-words as RFC 2047 requires.
+fn decode_words_lenient(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    let mut after_word = false;
+    while let Some(start) = rest.find("=?") {
+        let decoded = encoded_word_len(&rest[start..]).and_then(|len| {
+            let word = &rest[start..start + len];
+            let decoded = decode_words(&format!(" {word}"));
+            (decoded != word).then_some((len, decoded))
+        });
+        let Some((len, decoded)) = decoded else {
+            out.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            after_word = false;
+            continue;
+        };
+        let gap = &rest[..start];
+        if !(after_word && gap.trim().is_empty()) {
+            out.push_str(gap);
+        }
+        out.push_str(&decoded);
+        rest = &rest[start + len..];
+        after_word = true;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Byte length of the `=?charset?enc?text?=` encoded-word at the start of `s`.
+fn encoded_word_len(s: &str) -> Option<usize> {
+    let mut parts = s[2..].splitn(3, '?');
+    let charset = parts.next()?;
+    let enc = parts.next()?;
+    let tail = parts.next()?;
+    if charset.is_empty() || !matches!(enc, "B" | "b" | "Q" | "q") {
+        return None;
+    }
+    let end = tail.find("?=")?;
+    if tail[..end].contains(char::is_whitespace) {
+        return None;
+    }
+    Some(2 + charset.len() + 1 + enc.len() + 1 + end + 2)
+}
+
 /// Split a `From`-style value ("Display Name <addr@host>") into name and address.
 pub fn split_address(raw: &str) -> (String, String) {
     if let Ok(list) = addrparse(raw)
-        && let Some(mailparse::MailAddr::Single(info)) = list.first()
+        && let Some(MailAddr::Single(info)) = list.first()
     {
         let name = info.display_name.clone().unwrap_or_default();
         return (name, info.addr.clone());
     }
     (String::new(), raw.to_string())
+}
+
+/// The first `From` address of `headers` as (name, address).
+fn from_of(headers: &[MailHeader]) -> (String, String) {
+    let Some(header) = headers.get_first_header("From") else {
+        return (String::new(), String::new());
+    };
+    if let Some(list) = addrparse_lenient(header)
+        && let Some(MailAddr::Single(info)) = list.first()
+    {
+        return (
+            info.display_name.clone().unwrap_or_default(),
+            info.addr.clone(),
+        );
+    }
+    (String::new(), header.get_value())
 }
 
 /// The Message-ID of a raw message, headers only — the body (and any megabyte
@@ -235,18 +480,26 @@ pub fn message_id_of(raw: &[u8]) -> String {
 /// written under `media` (when provided) and referenced by key; passing `None`
 /// (tests, previews) skips disk writes and leaves every attachment key null.
 pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
+    let message = parse_message_unpruned(raw, media);
+    if let Some(ctx) = media {
+        prune_media_cache(&ctx.root);
+    }
+    message
+}
+
+/// Batch fetches prune once off the async runtime after parsing their messages.
+pub(crate) fn parse_message_unpruned(raw: &[u8], media: Option<&MediaCtx>) -> Message {
     let mail = match parse_mail(raw) {
         Ok(mail) => mail,
         Err(_) => return Message::default(),
     };
     let headers = &mail.headers;
     let subject = headers.get_first_value("Subject").unwrap_or_default();
-    let (from_name, from_addr) =
-        split_address(&headers.get_first_value("From").unwrap_or_default());
-    let to = collect_address_list(&headers.get_all_values("To"));
-    let reply_to = collect_address_list(&headers.get_all_values("Reply-To"));
-    let cc = collect_address_list(&headers.get_all_values("Cc"));
-    let bcc = collect_address_list(&headers.get_all_values("Bcc"));
+    let (from_name, from_addr) = from_of(headers);
+    let to = collect_address_list(&headers.get_all_headers("To"));
+    let reply_to = collect_address_list(&headers.get_all_headers("Reply-To"));
+    let cc = collect_address_list(&headers.get_all_headers("Cc"));
+    let bcc = collect_address_list(&headers.get_all_headers("Bcc"));
     let message_id = normalize_msgid(&headers.get_first_value("Message-ID").unwrap_or_default());
     let references =
         normalize_references(&headers.get_first_value("References").unwrap_or_default());
@@ -255,14 +508,11 @@ pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
         .iter()
         .any(|name| headers.get_first_value(name).is_some());
     let sources = body_sources(&mail);
+    let invite = calendar_invite(&mail);
 
     let mut attachments = Vec::new();
     let mut cid_keys: Vec<(String, String)> = Vec::new();
     collect_attachments(&mail, &mut attachments, &mut cid_keys, media);
-    if let Some(ctx) = media {
-        prune_media_cache(&ctx.root);
-    }
-
     // Prefer the MIME text/plain alternative for the conversation and Plain
     // reader view. Keep HTML separately for the HTML reader; when a message is
     // HTML-only, fall back to converting HTML so there is still readable text.
@@ -301,7 +551,39 @@ pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
         body_is_rendered,
         preview,
         attachments,
+        invite,
     }
+}
+
+/// The event of the message's calendar part. iMIP puts it in a `text/calendar`
+/// alternative (Outlook: that alone; Google: that plus an `application/ics`
+/// copy as a file), so look at every calendar leaf, and take one that names
+/// its iTIP method on the Content-Type first — that is the one the sender
+/// means to be acted on.
+fn calendar_invite(mail: &ParsedMail) -> Option<crate::calendar::Invite> {
+    let mut parts = Vec::new();
+    collect_calendar_parts(mail, &mut parts);
+    parts.sort_by_key(|part| !part.ctype.params.contains_key("method"));
+    parts
+        .into_iter()
+        .filter_map(|part| text_body(part))
+        .find_map(|ics| crate::calendar::parse_invite(&ics))
+}
+
+fn collect_calendar_parts<'a>(part: &'a ParsedMail<'a>, out: &mut Vec<&'a ParsedMail<'a>>) {
+    if !part.subparts.is_empty() {
+        for sub in &part.subparts {
+            collect_calendar_parts(sub, out);
+        }
+        return;
+    }
+    if is_calendar_mime(&part.ctype.mimetype) {
+        out.push(part);
+    }
+}
+
+pub(crate) fn is_calendar_mime(mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("text/calendar") || mime.eq_ignore_ascii_case("application/ics")
 }
 
 /// Strip angle brackets / whitespace from a single Message-ID header value,
@@ -332,28 +614,29 @@ fn normalize_references(raw: &str) -> String {
 /// comma-separated address list, with RFC 2047 encoded-words decoded. Group
 /// syntax and nested groups are flattened to their member addresses; if parsing
 /// fails entirely the raw header value is preserved so the user still sees it.
-fn collect_address_list(values: &[String]) -> String {
+fn collect_address_list(headers: &[&MailHeader]) -> String {
     let mut out: Vec<String> = Vec::new();
-    for raw in values {
-        let trimmed = raw.trim();
+    for header in headers {
+        let value = header.get_value();
+        let trimmed = value.trim();
         if trimmed.is_empty() {
             continue;
         }
-        match addrparse(trimmed) {
-            Ok(list) => {
+        match addrparse_lenient(header) {
+            Some(list) => {
                 for entry in list.iter() {
                     push_addr(entry, &mut out);
                 }
             }
-            Err(_) => out.push(trimmed.to_string()),
+            None => out.push(trimmed.to_string()),
         }
     }
     out.join(", ")
 }
 
-fn push_addr(entry: &mailparse::MailAddr, out: &mut Vec<String>) {
+fn push_addr(entry: &MailAddr, out: &mut Vec<String>) {
     match entry {
-        mailparse::MailAddr::Single(info) => {
+        MailAddr::Single(info) => {
             let formatted = match info.display_name.as_deref() {
                 Some(name) if !name.trim().is_empty() => {
                     format!("{} <{}>", name.trim(), info.addr)
@@ -364,7 +647,7 @@ fn push_addr(entry: &mailparse::MailAddr, out: &mut Vec<String>) {
                 out.push(formatted);
             }
         }
-        mailparse::MailAddr::Group(group) => {
+        MailAddr::Group(group) => {
             for addr in &group.addrs {
                 let formatted = match addr.display_name.as_deref() {
                     Some(name) if !name.trim().is_empty() => {
@@ -727,13 +1010,22 @@ fn split_important(value: &str) -> (&str, bool) {
 /// WebKitGTK); the `default-src 'none'` CSP still blocks all email JS, so the
 /// CSP also gates remote image/media loads.
 pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
+    prepare_message_html(source, load_remote_images, "")
+}
+
+/// [`prepare_html`] for a mail with a subject, which is what tells an Outlook
+/// forward from a reply when folding the quote (see quote.rs).
+pub fn prepare_message_html(source: &str, load_remote_images: bool, subject: &str) -> String {
     // Defence in depth: strip script-bearing markup *before* the CSP `<meta>` is
     // injected, so a CSP bypass alone can't run the email's JS. CSS is kept (the
     // CSP allows `style-src 'unsafe-inline'`); only script vectors are removed.
     let raw_source = source;
     // Marked after sanitizing, which drops every sender `data-*` attribute, so
     // the quote marker the frames fold on is always ours.
-    let source = &crate::quote::mark_html_quote(&sanitize_email_html(source));
+    let source = &crate::quote::mark_html_quote(
+        &sanitize_email_html(source),
+        crate::quote::is_forward_subject(subject),
+    );
     let (img, media) = if load_remote_images {
         (
             "'self' data: http: https:",
@@ -781,22 +1073,14 @@ pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
     inject_head(source, &head)
 }
 
-/// Insert `head_extra` into the document head: after an existing `<head ...>`, or
-/// after `<html ...>` as a new head, or as a prepended document otherwise.
+/// Wrap a sanitized message in the document that carries `head_extra`.
+///
+/// Always a fresh shell, never a search for the message's own `<html>` or
+/// `<head>`: ammonia returns a fragment, so those strings can only occur inside
+/// its `<style>` text or an attribute value. Injecting there would park the CSP
+/// `<meta>` where the browser does not read it. The desktop frame recognises
+/// this exact shell (see `bubbleHtml.ts`), so keep the two in step.
 fn inject_head(html: &str, head_extra: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    if let Some(head) = lower.find("<head")
-        && let Some(rel) = lower[head..].find('>')
-    {
-        let at = head + rel + 1;
-        return format!("{}{head_extra}{}", &html[..at], &html[at..]);
-    }
-    if let Some(htmltag) = lower.find("<html")
-        && let Some(rel) = lower[htmltag..].find('>')
-    {
-        let at = htmltag + rel + 1;
-        return format!("{}<head>{head_extra}</head>{}", &html[..at], &html[at..]);
-    }
     format!("<!doctype html><html><head>{head_extra}</head><body>{html}</body></html>")
 }
 
@@ -807,7 +1091,14 @@ pub fn render_body(html: &str) -> String {
     html_to_text(html)
 }
 
-/// Walk the MIME tree collecting non-text leaf parts (images and attachments).
+/// Shared by BODYSTRUCTURE metadata and the full MIME reader. Text parts need
+/// an attachment disposition: a name alone can describe the body or an inline
+/// calendar alternative. Named non-text parts and images can be files.
+pub(crate) fn is_attachment_part(mime: &str, explicit: bool, named: bool) -> bool {
+    explicit || (!mime.starts_with("text/") && (named || mime.starts_with("image/")))
+}
+
+/// Walk the MIME tree collecting file and image leaf parts.
 /// Image bytes are written to disk under `media` and referenced by key so they
 /// never round-trip through the JSON bridge; non-images stay metadata-only.
 fn collect_attachments(
@@ -826,13 +1117,11 @@ fn collect_attachments(
     let mime = part.ctype.mimetype.to_ascii_lowercase();
     let disposition = part.get_content_disposition();
     let is_attachment = disposition.disposition == DispositionType::Attachment;
-    let is_image = mime.starts_with("image/");
-
-    // Skip the text/html/plain body parts unless explicitly an attachment.
-    if mime.starts_with("text/") && !is_attachment {
-        return;
-    }
-    if !is_attachment && !is_image {
+    let filename = disposition
+        .params
+        .get("filename")
+        .or_else(|| part.ctype.params.get("name"));
+    if !is_attachment_part(&mime, is_attachment, filename.is_some()) {
         return;
     }
 
@@ -841,18 +1130,18 @@ fn collect_attachments(
         Err(_) => return,
     };
     let size = bytes.len();
-    let filename = disposition
-        .params
-        .get("filename")
-        .cloned()
-        .or_else(|| part.ctype.params.get("name").cloned())
+    let filename = filename
+        .map(|name| decode_words(&format!(" {name}")))
         .unwrap_or_else(|| "attachment".to_string());
 
     let index = out.len();
     // Persist every attachment (images and files alike) so the bridge can serve
     // it at `/media/<key>` and the user can download it. Without media context
     // (tests, previews) the key stays null and only metadata is kept.
-    let key = media.and_then(|ctx| write_media(ctx, index, &filename, &mime, &bytes));
+    let oversized = media.is_some() && size as u64 > media_cache_cap();
+    let key = media
+        .filter(|_| !oversized)
+        .and_then(|ctx| write_media(ctx, index, &filename, &mime, &bytes));
 
     // Map this inline image's Content-ID to its served key so HTML mode can
     // rewrite `cid:` references (`<foo@host>` headers — strip the angle brackets).
@@ -874,6 +1163,7 @@ fn collect_attachments(
         mime,
         size,
         key,
+        oversized,
     });
 }
 
@@ -889,6 +1179,21 @@ fn write_media(
     mime: &str,
     bytes: &[u8],
 ) -> Option<String> {
+    write_media_with_cap(ctx, index, filename, mime, bytes, media_cache_cap())
+}
+
+fn write_media_with_cap(
+    ctx: &MediaCtx,
+    index: usize,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+    cap: u64,
+) -> Option<String> {
+    // An individual file larger than the entire cache cannot survive pruning.
+    if bytes.len() as u64 > cap {
+        return None;
+    }
     let ext = sanitize_segment(
         Path::new(filename)
             .extension()
@@ -916,26 +1221,37 @@ fn write_media(
 /// True when every attachment's bytes are still on disk. Used before serving
 /// cached mail rows; when false the caller refetches and re-parses the message.
 /// Two cases force a refetch: a keyed file that pruning removed independently of
-/// SQLite, and a key-less attachment — a row cached before attachments were
-/// persisted to disk, whose bytes were never written and must be fetched now.
+/// SQLite, and a key-less attachment whose bytes were never written — a row
+/// cached before attachments were persisted to disk, or a write that failed.
+/// An `oversized` attachment is key-less by design and is not one of them.
 pub fn cached_media_available(root: &Path, message: &Message) -> bool {
+    missing_media_count(root, message) == 0
+}
+
+/// How many of a cached message's attachments a download could put back on
+/// disk: pruned, or never written. Not the ones left off for their size.
+pub fn missing_media_count(root: &Path, message: &Message) -> usize {
     message
         .attachments
         .iter()
-        .all(|att| match att.key.as_deref() {
-            Some(key) => root.join(key).is_file(),
-            None => false,
+        .filter(|att| match att.key.as_deref() {
+            Some(key) => !root.join(key).is_file(),
+            None => !att.oversized,
         })
+        .count()
 }
 
 /// Keep the shared media cache under its configured cap by removing oldest files
 /// first. The cap is bytes and can be overridden with `MERON_MEDIA_CAP`.
-pub fn prune_media_cache(root: &Path) {
-    let cap = std::env::var("MERON_MEDIA_CAP")
+fn media_cache_cap() -> u64 {
+    std::env::var("MERON_MEDIA_CAP")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(MEDIA_CAP_BYTES);
+        .unwrap_or(MEDIA_CAP_BYTES)
+}
 
+pub fn prune_media_cache(root: &Path) {
+    let cap = media_cache_cap();
     let mut files = Vec::new();
     let mut total = 0u64;
     collect_media_files(root, &mut files, &mut total);
@@ -1249,15 +1565,23 @@ struct BodySources {
 /// carries both text/plain and text/html; the plain part is the source for the
 /// conversation/plain reader, and HTML is kept for the HTML reader.
 fn body_sources(part: &mailparse::ParsedMail) -> BodySources {
-    let plain = find_text_part(part, "text/plain");
+    let mut plain = find_text_part(part, "text/plain");
     let html = find_text_part(part, "text/html");
+    // Some senders put their HTML into the text/plain alternative as well.
+    // Shown as text it is a wall of tags (and a notification snippet reading
+    // `<div style=...`), so fall back to rendering the real HTML part. Only
+    // then: that part is what the HTML tab shows, so nothing is lost, while a
+    // plain-only message is always kept as the sender wrote it.
+    if html.is_some() && plain.as_deref().is_some_and(plain_is_markup) {
+        plain = None;
+    }
     if plain.is_some() || html.is_some() {
         return BodySources { plain, html };
     }
 
     let ctype = part.ctype.mimetype.to_ascii_lowercase();
     if part.subparts.is_empty() && ctype.starts_with("text/") {
-        let content = part.get_body().unwrap_or_default();
+        let content = text_body(part).unwrap_or_default();
         if content.contains("<html")
             || content.contains("<body")
             || content.contains("<p>")
@@ -1276,9 +1600,36 @@ fn body_sources(part: &mailparse::ParsedMail) -> BodySources {
     BodySources::default()
 }
 
+/// Whether a text/plain part is really an HTML document: it opens and closes
+/// on a tag, and tags make up most of it. Prose that quotes tags as examples
+/// (`<p>hello</p>` then an explanation) is mostly text and stays plain.
+fn plain_is_markup(plain: &str) -> bool {
+    let trimmed = plain.trim();
+    if !trimmed.starts_with('<') || !trimmed.ends_with('>') {
+        return false;
+    }
+    let (mut markup, mut total) = (0usize, 0usize);
+    let mut in_tag = false;
+    for c in trimmed.chars() {
+        if c == '<' {
+            in_tag = true;
+        }
+        if !c.is_whitespace() {
+            total += 1;
+            if in_tag {
+                markup += 1;
+            }
+        }
+        if c == '>' {
+            in_tag = false;
+        }
+    }
+    markup * 2 >= total
+}
+
 fn find_text_part(part: &ParsedMail, mime: &str) -> Option<String> {
     if part.ctype.mimetype.eq_ignore_ascii_case(mime) {
-        return part.get_body().ok();
+        return text_body(part);
     }
     for sub in &part.subparts {
         if let Some(body) = find_text_part(sub, mime) {
@@ -1286,6 +1637,39 @@ fn find_text_part(part: &ParsedMail, mime: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Decoded text of a leaf part. A base64 body cut off mid-quantum (a truncated
+/// message, a sender that drops the padding) fails to decode as a whole, which
+/// would leave the reader with no body at all; decode the complete quanta
+/// instead and show what did arrive.
+fn text_body(part: &ParsedMail) -> Option<String> {
+    if let Ok(body) = part.get_body() {
+        return Some(body);
+    }
+    let Body::Base64(encoded) = part.get_body_encoded() else {
+        return None;
+    };
+    let mut cleaned: Vec<u8> = encoded
+        .get_raw()
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    cleaned.truncate(cleaned.len() / 4 * 4);
+    // Nothing complete arrived: leave the part out so an HTML alternative can
+    // stand in for it.
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Re-parse as a part of its own so `mailparse` applies the charset.
+    let mut raw = format!(
+        "Content-Type: {}; charset={}\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+        part.ctype.mimetype, part.ctype.charset
+    )
+    .into_bytes();
+    raw.extend_from_slice(&cleaned);
+    parse_mail(&raw).ok()?.get_body().ok()
 }
 
 /// Drop the markup that makes a body readable in the reader but noisy in a
@@ -1625,11 +2009,92 @@ mod tests {
     }
 
     #[test]
+    fn truncated_base64_body_keeps_what_decodes() {
+        // "hello world" is `aGVsbG8gd29ybGQ=`; cut mid-quantum it no longer
+        // decodes as a whole.
+        let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8gd29y\r\nbGQ\r\n--b--\r\n";
+        let msg = parse_message(raw, None);
+        assert_eq!(msg.body, "hello wor");
+    }
+
+    #[test]
+    fn undecodable_base64_plain_part_falls_back_to_html() {
+        let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\naG\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>hello world</p>\r\n--b--\r\n";
+        let msg = parse_message(raw, None);
+        assert!(msg.body_is_rendered);
+        assert_eq!(msg.body, "hello world");
+    }
+
+    #[test]
     fn plain_text_keeps_no_html_source() {
         let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: text/plain\r\n\r\nhello world";
         let msg = parse_message(raw, None);
         assert!(msg.body_html.is_none());
         assert_eq!(msg.body, "hello world");
+    }
+
+    #[test]
+    fn markup_in_the_plain_part_renders_as_html() {
+        // A sender that stuffs its HTML into text/plain: the real HTML part
+        // renders instead, so neither the reader nor the snippet shows tags.
+        let raw = b"From: a@b.com\r\n\
+Subject: x\r\n\
+Content-Type: multipart/alternative; boundary=sep\r\n\
+\r\n\
+--sep\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+<div style=\"font-family: Arial\"><p>plain markup</p></div>\r\n\
+--sep\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p><strong>html part</strong></p>\r\n\
+--sep--\r\n";
+        let msg = parse_message(raw, None);
+        assert_eq!(msg.body, "**html part**");
+        assert_eq!(msg.preview, "html part");
+
+        // Prose that opens on a tag example keeps its plain part, tags and all.
+        let raw = b"From: a@b.com\r\n\
+Subject: x\r\n\
+Content-Type: multipart/alternative; boundary=sep\r\n\
+\r\n\
+--sep\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+<p>hello</p>\r\n\
+\r\n\
+Please replace <p> with <div> in this example.\r\n\
+--sep\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>&lt;p&gt;hello&lt;/p&gt;</p>\r\n\
+--sep--\r\n";
+        let msg = parse_message(raw, None);
+        assert!(msg.body.starts_with("<p>hello</p>"));
+        assert!(msg.body.contains("replace <p> with <div>"));
+
+        // A plain-only message is never reclassified, even when it is all tags.
+        let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: text/plain\r\n\r\n\
+<div style=\"font-family: Arial\"><p>hello</p></div>";
+        let msg = parse_message(raw, None);
+        assert!(msg.body_html.is_none());
+        assert!(msg.body.starts_with("<div style="));
+    }
+
+    #[test]
+    fn plain_markup_needs_tags_to_dominate() {
+        assert!(plain_is_markup(
+            "<div style=\"font-family: Arial\">\n<p style=\"color: #1a2b3c\">Connect</p>\n</div>"
+        ));
+        // Tag examples in prose, even when the message ends on one.
+        assert!(!plain_is_markup(
+            "<p>hello</p>\n\nPlease replace <p> with <div> in this example."
+        ));
+        assert!(!plain_is_markup(
+            "<p>hello</p>\n\nPlease replace <p> with <div>"
+        ));
+        assert!(!plain_is_markup("hello <b>world</b>"));
     }
 
     #[test]
@@ -1669,6 +2134,100 @@ Content-Type: text/html; charset=utf-8\r\n\
         // "=?UTF-8?B?SGVsbMO2?=" is base64 for "Hellö".
         assert_eq!(decode_words(" =?UTF-8?B?SGVsbMO2?="), "Hellö");
         assert_eq!(decode_words(" Plain subject"), "Plain subject");
+    }
+
+    fn lenient_from(raw: &str) -> (String, String) {
+        let line = format!("From: {raw}\r\n\r\n");
+        let (headers, _) = mailparse::parse_headers(line.as_bytes()).unwrap();
+        from_of(&headers)
+    }
+
+    #[test]
+    fn decodes_encoded_words_glued_to_text() {
+        // "GyRCJUYlOSVIGyhC" is ISO-2022-JP "テスト"; "Q2Fmw6k=" is UTF-8 "Café".
+        assert_eq!(
+            lenient_from("Acme=?iso-2022-jp?B?GyRCJUYlOSVIGyhC?= <news@example.com>"),
+            ("Acmeテスト".to_string(), "news@example.com".to_string())
+        );
+        // Adjacent encoded-words join without the whitespace between them, even
+        // when the first is glued to text.
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?Foo?= =?UTF-8?Q?Bar?= <a@example.com>").0,
+            "AcmeFooBar"
+        );
+        assert_eq!(
+            lenient_from("=?UTF-8?B?Q2Fmw6k=?= =?UTF-8?Q?_Bar?= Inc <a@example.com>").0,
+            "Café Bar Inc"
+        );
+        // A name whose decoded text looks like an encoded-word is not decoded twice.
+        // "PT9VVEYtOD9RP0NFTz89" is base64 for "=?UTF-8?Q?CEO?=".
+        assert_eq!(
+            lenient_from("=?UTF-8?B?PT9VVEYtOD9RP0NFTz89?= <a@example.com>").0,
+            "=?UTF-8?Q?CEO?="
+        );
+        // Folded across lines.
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?Foo?=\r\n =?UTF-8?Q?Bar?= <a@example.com>").0,
+            "AcmeFooBar"
+        );
+        // Glued on both sides, and two glued words back to back.
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?Foo?=Inc <a@example.com>").0,
+            "AcmeFooInc"
+        );
+        assert_eq!(
+            lenient_from("=?UTF-8?Q?Foo?==?UTF-8?Q?Bar?= <a@example.com>").0,
+            "FooBar"
+        );
+        // Punctuation inside an encoded-word stays text, not address syntax.
+        assert_eq!(
+            lenient_from("=?UTF-8?Q?Doe,_Jane?= <jane@example.com>"),
+            ("Doe, Jane".to_string(), "jane@example.com".to_string())
+        );
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?_(News)?= <a@example.com>").0,
+            "Acme (News)"
+        );
+        assert_eq!(
+            lenient_from("=?UTF-8?Q?Acme_(News)?= <a@example.com>").0,
+            "Acme (News)"
+        );
+        // Glued words inside a quoted name, or a name with a comment.
+        assert_eq!(
+            lenient_from("\"Acme=?UTF-8?Q?Foo?=\" <a@example.com>").0,
+            "AcmeFoo"
+        );
+        assert_eq!(
+            lenient_from("\"Acme \\\"Q\\\"=?UTF-8?Q?Foo?=\" <a@example.com>").0,
+            "Acme \"Q\"Foo"
+        );
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?Foo?= (News) <a@example.com>").0,
+            "AcmeFoo"
+        );
+        assert_eq!(
+            lenient_from("Acme=?UTF-8?Q?Foo?= (Ne\\)ws) Inc <a@example.com>").0,
+            "AcmeFoo  Inc"
+        );
+        // Non-ASCII text before the encoded-word, glued or not.
+        assert_eq!(
+            lenient_from("Café=?UTF-8?Q?Foo?= <a@example.com>").0,
+            "CaféFoo"
+        );
+        assert_eq!(
+            lenient_from("Café =?UTF-8?Q?Foo?= <a@example.com>").0,
+            "Café Foo"
+        );
+        // Encoded-word lookalikes inside an address are left alone.
+        assert_eq!(
+            lenient_from("User <user=?UTF-8?Q?foo?=@example.com>"),
+            (
+                "User".to_string(),
+                "user=?UTF-8?Q?foo?=@example.com".to_string()
+            )
+        );
+        assert_eq!(lenient_from("a =? b ?= c <a@example.com>").0, "a =? b ?= c");
+        assert_eq!(lenient_from("Plain Name <a@example.com>").0, "Plain Name");
     }
 
     #[test]
@@ -1747,6 +2306,21 @@ AQID\r\n\
         assert!(html.contains("/media/acct/inbox/7/0.png"));
         assert!(!html.contains("cid:logo123"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_html_keeps_the_csp_ahead_of_markup_posing_as_a_head() {
+        // `<style>` text and attribute values survive sanitizing verbatim.
+        for source in [
+            "<style>/*<html><head>*/</style><img src=\"https://t.example/p.png\">",
+            "<img alt=\"<html><head>\" src=\"https://t.example/p.png\">",
+        ] {
+            let out = prepare_html(source, false);
+            let head = "<!doctype html><html><head><meta charset=\"utf-8\">\
+                        <meta http-equiv=\"Content-Security-Policy\"";
+            assert!(out.starts_with(head), "{out}");
+            assert_eq!(out.matches("Content-Security-Policy").count(), 1, "{out}");
+        }
     }
 
     #[test]
@@ -1962,6 +2536,24 @@ AQID\r\n\
     }
 
     #[test]
+    fn prepare_html_marks_a_gmail_reply_with_signatures_above_and_below_the_quote() {
+        // Gmail's reply with the signature under the quote, which itself holds
+        // the quoted message's own signature.
+        let out = prepare_html(
+            r#"<div dir="ltr">x1</div><br><div class="gmail_quote gmail_quote_container"><div dir="ltr" class="gmail_attr">On Thu, Sep 10, 2026 at 5:11 PM rnons &lt;<a href="mailto:a@b.c">a@b.c</a>&gt; wrote:<br></div><blockquote class="gmail_quote"><div dir="ltr"><div>t2</div><span class="gmail_signature_prefix">-- </span><br><div dir="ltr" class="gmail_signature">2t</div></div></blockquote></div><div><br clear="all"></div><span class="gmail_signature_prefix">-- </span><br><div dir="ltr" class="gmail_signature"><div dir="ltr">s2</div></div>"#,
+            false,
+        );
+        assert!(
+            out.contains(r#"<div class="gmail_quote gmail_quote_container" data-meron-quote="">"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<div class="gmail_signature" data-meron-quote="">"#),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn prepare_html_strips_sender_claimed_meron_hooks() {
         // The frames read their own `meron-*` ids and classes back out of the
         // document; a sender must not be able to plant one.
@@ -2007,18 +2599,107 @@ AQID\r\n\
             mime: "image/png".to_string(),
             size: 3,
             key: Some("acct/inbox/1/0.png".to_string()),
+            oversized: false,
         });
         assert!(cached_media_available(&root, &msg));
 
         std::fs::remove_file(root.join("acct/inbox/1/0.png")).unwrap();
         assert!(!cached_media_available(&root, &msg));
+        assert_eq!(missing_media_count(&root, &msg), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn cached_media_unavailable_for_keyless_attachment() {
+    fn has_attachments_ignores_images_the_html_shows_inline() {
+        let attachment = |key: &str| Attachment {
+            filename: "x".to_string(),
+            mime: "image/png".to_string(),
+            size: 3,
+            key: Some(key.to_string()),
+            oversized: false,
+        };
+        let mut msg = Message {
+            body_html: Some("<img src=\"/media/acct/inbox/1/0.png\">".to_string()),
+            ..Default::default()
+        };
+        assert!(!msg.has_attachments());
+
+        msg.attachments.push(attachment("acct/inbox/1/0.png"));
+        assert!(!msg.has_attachments(), "a cid: logo is not an attachment");
+
+        msg.attachments.push(attachment("acct/inbox/1/1.pdf"));
+        assert!(msg.has_attachments());
+
+        // Plain-text mail has no HTML to show anything inline.
+        let mut plain = Message::default();
+        plain.attachments.push(attachment("acct/inbox/2/0.png"));
+        assert!(plain.has_attachments());
+    }
+
+    #[test]
+    fn named_calendar_alternative_is_not_a_duplicate_attachment() {
+        let raw = "Content-Type: multipart/mixed; boundary=outer
+
+--outer
+Content-Type: multipart/alternative; boundary=inner
+
+--inner
+Content-Type: text/plain; name=body.txt
+
+Invitation
+--inner
+Content-Type: text/calendar; name=invite.ics
+Content-Disposition: inline; filename=invite.ics
+
+BEGIN:VCALENDAR
+END:VCALENDAR
+--inner--
+--outer
+Content-Type: text/calendar; name=invite.ics
+Content-Disposition: attachment; filename=invite.ics
+
+BEGIN:VCALENDAR
+END:VCALENDAR
+--outer--
+"
+        .replace('\n', "\r\n");
+        let message = parse_message(raw.as_bytes(), None);
+        let files: Vec<_> = message.file_attachments().collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "invite.ics");
+        assert_eq!(files[0].mime, "text/calendar");
+    }
+
+    #[test]
+    fn a_failed_write_is_recovered_and_an_oversized_file_is_not_written() {
+        let root = std::env::temp_dir().join(format!("meron-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_file(&root);
+        std::fs::write(&root, b"not a directory").unwrap();
+        let ctx = MediaCtx {
+            root: root.clone(),
+            account: "acc".into(),
+            folder: "INBOX".into(),
+            uid: 1,
+        };
+        let raw = b"Message-ID: <one@test>\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=file.bin\r\n\r\ndata";
+        let message = parse_message(raw, Some(&ctx));
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].key, None);
+        assert!(!message.attachments[0].oversized);
+        assert_eq!(missing_media_count(&root, &message), 1);
+        std::fs::remove_file(&root).unwrap();
+        assert_eq!(
+            write_media_with_cap(&ctx, 0, "file.bin", "application/octet-stream", b"data", 3),
+            None
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn keyless_attachments_trigger_media_recovery_unless_oversized() {
         // A row cached before attachments were persisted has a key-less file;
         // it must report unavailable so the caller refetches and writes it.
+        // One left off disk for its size would only be left off again.
         let root = std::env::temp_dir().join(format!("meron-keyless-{}", std::process::id()));
         let mut msg = Message::default();
         msg.attachments.push(Attachment {
@@ -2026,8 +2707,13 @@ AQID\r\n\
             mime: "text/calendar".to_string(),
             size: 3072,
             key: None,
+            oversized: false,
         });
         assert!(!cached_media_available(&root, &msg));
+        assert_eq!(missing_media_count(&root, &msg), 1);
+        msg.attachments[0].oversized = true;
+        assert!(cached_media_available(&root, &msg));
+        assert_eq!(missing_media_count(&root, &msg), 0);
     }
 
     #[test]

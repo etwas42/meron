@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Copy } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { openExternal } from '../../lib/native'
+import { copyText, openExternal } from '../../lib/native'
+import { thread$ } from '../../states/thread'
 import type { Message } from '../../types'
 import {
   MESSAGE_BODY_MAX_HEIGHT,
@@ -16,6 +17,10 @@ import {
 import { BubbleHtmlFrame } from './BubbleHtmlFrame'
 import { matchRanges } from './frameSearchHighlight'
 import { isQuoteUnfolded, setQuoteUnfolded, splitQuotedBody } from './quoteFold'
+import { ConversationScrollIntentContext } from './useConversationScroll'
+import type { FrameSurface } from './frameTheme'
+
+const setHoveredLink = (url: string | null) => thread$.hoveredLink.set(url)
 
 // The message body: the sandboxed HTML view, or the plain/markdown renderer with
 // inline bold/italic/code, fenced code blocks (with copy buttons) and links,
@@ -24,18 +29,20 @@ export function MessageBubbleBody({
   message,
   useHtmlBody,
   outgoing = false,
+  surface = 'bubble',
   allowRemote = false,
   normalizedSearchQuery,
   activeSearchOffset,
   fullHeight = false,
-  onLinkHover,
-  onUserScrollIntent,
+  onNaturalWidth,
 }: {
   message: Message
   useHtmlBody: boolean
   /** Whether this message sits in an outgoing bubble; its HTML frame is painted
    *  with that bubble's colors. */
   outgoing?: boolean
+  /** A chat bubble, a draft's, or a traditional layout's row: what a darkened body blends onto. */
+  surface?: FrameSurface
   /** Whether this message's remote content may load (account setting, allowed
    *  sender, or a reveal the user just made). */
   allowRemote?: boolean
@@ -46,11 +53,12 @@ export function MessageBubbleBody({
   /** Grow to fit the content instead of scrolling inside a capped box — the
    *  traditional layout lets the conversation itself do the scrolling. */
   fullHeight?: boolean
-  onLinkHover?: (url: string | null) => void
-  onUserScrollIntent?: () => void
+  /** HTML body only: the width a plain-text-like document needs, null when it should fill the bubble. */
+  onNaturalWidth?: (width: number | null) => void
 }) {
   const { t } = useTranslation()
   const bodyRef = useRef<HTMLDivElement | null>(null)
+  const releasePinForUserScroll = useContext(ConversationScrollIntentContext)
   // The active <mark> is scrolled to from here, where it is rendered — the pane
   // only knows which message to bring into view, and its own effect runs a
   // render before this body has moved its highlight. (The HTML frame does the
@@ -73,12 +81,18 @@ export function MessageBubbleBody({
       <div className={`${boxClass} -mr-3.5 pr-3.5`} style={boxStyle}>
         <BubbleHtmlFrame
           html={message.body_html!}
+          attachments={message.attachments}
           outgoing={outgoing}
+          surface={surface}
           allowRemote={allowRemote}
+          mediaMissing={message.media_missing ?? 0}
           searchQuery={normalizedSearchQuery}
           activeSearchOffset={activeSearchOffset}
-          onLinkHover={onLinkHover}
-          onUserScrollIntent={onUserScrollIntent}
+          onLinkHover={setHoveredLink}
+          // Only a full-height body hands the wheel on to the pane; a capped
+          // one scrolls itself and leaves the pane where it is.
+          onUserScrollIntent={fullHeight ? releasePinForUserScroll : undefined}
+          onNaturalWidth={onNaturalWidth}
         />
       </div>
     )
@@ -168,7 +182,7 @@ export function MessageBubbleBody({
           <div key={`${section}-code-${blockIndex}`} className="group relative my-2 max-w-full">
             <button
               type="button"
-              onClick={() => navigator.clipboard?.writeText(block.content).catch(() => undefined)}
+              onClick={() => copyText(block.content).catch(() => undefined)}
               className="absolute right-1.5 top-1.5 z-10 flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-chats/90 text-secondary opacity-0 shadow-sm transition-opacity hover:text-primary group-hover:opacity-100"
               title={t('chat.copyCode')}
             >
@@ -193,10 +207,10 @@ export function MessageBubbleBody({
                     e.preventDefault()
                     openExternal(part.content)
                   }}
-                  onMouseEnter={() => onLinkHover?.(part.content)}
-                  onMouseLeave={() => onLinkHover?.(null)}
-                  onFocus={() => onLinkHover?.(part.content)}
-                  onBlur={() => onLinkHover?.(null)}
+                  onMouseEnter={() => setHoveredLink(part.content)}
+                  onMouseLeave={() => setHoveredLink(null)}
+                  onFocus={() => setHoveredLink(part.content)}
+                  onBlur={() => setHoveredLink(null)}
                   title={part.content}
                   className="text-accent hover:underline break-all font-semibold cursor-pointer"
                 >
@@ -233,7 +247,7 @@ export function MessageBubbleBody({
               title={quoteLabel}
               aria-label={quoteLabel}
               aria-expanded={showQuote}
-              className="flex h-3.5 w-7 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-black/5 font-sans text-[10px] leading-none font-bold tracking-[1px] text-secondary hover:bg-black/10 hover:text-primary dark:bg-white/10 dark:hover:bg-white/15"
+              className="flex h-3.5 w-7 cursor-pointer items-center justify-center rounded-full border border-border/70 bg-black/5 font-sans text-[10px] leading-none font-bold tracking-[1px] text-secondary hover:bg-black/10 hover:text-primary dark:bg-white/10 dark:hover:bg-white/15 aria-expanded:border-secondary aria-expanded:bg-black/15 aria-expanded:text-primary dark:aria-expanded:bg-white/25"
             >
               •••
             </button>

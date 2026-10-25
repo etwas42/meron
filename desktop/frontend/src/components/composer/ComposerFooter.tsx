@@ -34,7 +34,7 @@ export function ComposerFooter({
   const draftAutosaveFailed = t('composer.status.draftAutosaveFailed')
 
   return (
-    <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border bg-header px-4 py-2.5 select-none">
+    <div className="flex shrink-0 items-center justify-between gap-2 border-t border-border/60 bg-chat px-4 py-2.5 select-none">
       <div className="flex items-center gap-1">
         <IconButton
           icon={Paperclip}

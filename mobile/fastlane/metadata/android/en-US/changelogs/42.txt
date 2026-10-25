@@ -1,0 +1,4 @@
+- Float quick reply as a card with single-row controls
+- Add expand all and collapse all to the thread menu
+- Darken message bodies to the surface they sit on, not black
+- Always scroll the conversation to a reply just sent

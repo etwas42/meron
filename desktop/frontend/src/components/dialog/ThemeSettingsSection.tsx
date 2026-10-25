@@ -2,8 +2,8 @@ import { useState } from 'react'
 import { Palette } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
 import { useValue } from '@legendapp/state/react'
-import { BUILTIN_THEMES, DEFAULT_LIGHT_ID } from '../../lib/themes'
-import { settings$ } from '../../states/settings'
+import { useActiveTheme } from '../../lib/useThemeChoice'
+import { followedThemeDef, settings$ } from '../../states/settings'
 import { ThemeDialog } from './ThemeDialog'
 import { SettingRow } from './AccountSettingsRows'
 
@@ -13,13 +13,11 @@ import { SettingRow } from './AccountSettingsRows'
 export function ThemeSettingsSection() {
   const { t: translate } = useTranslation()
   const [dialogOpen, setDialogOpen] = useState(false)
-  const selectedId = useValue(settings$.themeId)
-  const customThemes = useValue(settings$.customThemes)
-
-  const themes = [...BUILTIN_THEMES, ...customThemes]
-  // A stale selection (deleted custom theme) shows the default, matching what
-  // resolveThemeDef actually paints.
-  const active = themes.find((item) => item.id === selectedId) ?? themes.find((item) => item.id === DEFAULT_LIGHT_ID)!
+  const followSystem = useValue(settings$.themeFollowSystem)
+  // The preview is what is painted now; while following the system the label
+  // names both picks. useActiveTheme subscribes to everything they depend on.
+  const active = useActiveTheme()
+  const name = followSystem ? `${followedThemeDef('light').name} / ${followedThemeDef('dark').name}` : active.name
   const t = active.tokens
 
   return (
@@ -28,7 +26,7 @@ export function ThemeSettingsSection() {
       title={translate('common.theme')}
       control={
         <div className="flex items-center gap-3 select-none">
-          <span className="text-[0.6875rem] font-semibold text-secondary truncate max-w-32">{active.name}</span>
+          <span className="text-[0.6875rem] font-semibold text-secondary truncate max-w-48">{name}</span>
           <div
             className="h-7 w-11 rounded-lg border border-border/80 overflow-hidden relative shadow-inner shrink-0 flex"
             style={{ background: t.bgApp }}

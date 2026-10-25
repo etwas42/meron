@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { Contact } from '../../types'
 import { suggestContacts, formatContact } from '../../lib/contacts'
+import { useEscapeKey } from '../../lib/useEscapeKey'
 
 type RecipientInputProps = {
   value: string
@@ -10,13 +11,22 @@ type RecipientInputProps = {
   autoFocus?: boolean
   inputRef?: React.Ref<HTMLInputElement>
   onTab?: () => void
+  /** Bare addresses, as search's `from:`/`to:` take them: a pick adds the address, not `Name <address>`. */
+  bare?: boolean
+  className?: string
 }
 
 // A comma-separated recipient field carries multiple addresses; autocomplete
-// only ever completes the token after the final comma. Returns the leading
-// portion (including that comma) plus the active token being typed.
+// only ever completes the token after the final comma — outside quotes, as a
+// quoted name like `"Lee, Ann"` holds one. Returns the leading portion
+// (including that comma) plus the active token being typed.
 function splitTail(value: string): { head: string; tail: string } {
-  const idx = value.lastIndexOf(',')
+  let idx = -1
+  let quoted = false
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] === '"') quoted = !quoted
+    else if (value[i] === ',' && !quoted) idx = i
+  }
   if (idx === -1) return { head: '', tail: value }
   return { head: value.slice(0, idx + 1), tail: value.slice(idx + 1) }
 }
@@ -31,6 +41,8 @@ export function RecipientInput({
   autoFocus,
   inputRef,
   onTab,
+  bare = false,
+  className = inputClass,
 }: RecipientInputProps) {
   const [suggestions, setSuggestions] = useState<Contact[]>([])
   const [open, setOpen] = useState(false)
@@ -40,18 +52,31 @@ export function RecipientInput({
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const tail = splitTail(value).tail.trim()
+  // The account and token the held suggestions were looked up for.
+  const lookupKey = `${accountId}\n${tail}`
+  const suggestionsKeyRef = useRef('')
 
-  // Fetch suggestions (debounced) while focused. An empty token surfaces the
-  // top correspondents; otherwise we match what's been typed so far.
+  // Fetch suggestions (debounced) while focused and typing. An empty token
+  // shows nothing: a list of top correspondents on every open composer only
+  // covers the fields below it.
   useEffect(() => {
+    if (!tail) {
+      setOpen(false)
+      setSuggestions([])
+      suggestionsKeyRef.current = ''
+      return
+    }
     if (!focusedRef.current || !suggestionsEnabledRef.current) return
     let cancelled = false
     const timer = setTimeout(async () => {
       const results = await suggestContacts(accountId, tail)
-      if (cancelled || !focusedRef.current || !suggestionsEnabledRef.current) return
+      if (cancelled || !suggestionsEnabledRef.current) return
+      // Kept even when focus has left, so coming back finds the lookup for
+      // the token as it stands rather than one from before the last edit.
+      suggestionsKeyRef.current = `${accountId}\n${tail}`
       setSuggestions(results)
       setActive(0)
-      setOpen(results.length > 0)
+      setOpen(focusedRef.current && results.length > 0)
     }, 120)
     return () => {
       cancelled = true
@@ -59,13 +84,17 @@ export function RecipientInput({
     }
   }, [tail, accountId])
 
+  // The topmost Escape layer, so closing the list leaves a form or dialog around it open.
+  useEscapeKey(() => setOpen(false), open && suggestions.length > 0)
+
   function accept(contact: Contact) {
     suggestionsEnabledRef.current = false
     const { head } = splitTail(value)
     const prefix = head ? `${head} ` : ''
-    onChange(`${prefix}${formatContact(contact)}, `)
+    onChange(`${prefix}${bare ? contact.addr : formatContact(contact)}, `)
     setOpen(false)
     setSuggestions([])
+    suggestionsKeyRef.current = ''
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -95,12 +124,6 @@ export function RecipientInput({
         accept(suggestions[active])
         return
       }
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        e.stopPropagation()
-        setOpen(false)
-        return
-      }
     }
   }
 
@@ -112,7 +135,7 @@ export function RecipientInput({
         value={value}
         placeholder={placeholder}
         spellCheck={false}
-        className={inputClass}
+        className={className}
         onChange={(e) => {
           suggestionsEnabledRef.current = true
           onChange(e.target.value)
@@ -121,20 +144,13 @@ export function RecipientInput({
         onFocus={() => {
           focusedRef.current = true
           if (blurTimer.current) clearTimeout(blurTimer.current)
-          // Existing recipients should only trigger suggestions when edited.
-          suggestionsEnabledRef.current = value.trim().length === 0
-          if (!suggestionsEnabledRef.current) {
-            setOpen(false)
-            return
-          }
-          if (suggestions.length > 0) setOpen(true)
-          else
-            void suggestContacts(accountId, tail).then((r) => {
-              if (!focusedRef.current || !suggestionsEnabledRef.current) return
-              setSuggestions(r)
-              setActive(0)
-              setOpen(r.length > 0)
-            })
+          // Focusing never starts suggesting; typing does (see onChange). Coming
+          // back to a token that was mid-edit reopens what it had, though —
+          // but only a lookup for that very token and account, never one the
+          // edit overtook, or Tab would insert a recipient nobody typed.
+          const resume = tail.length > 0 && suggestions.length > 0 && suggestionsKeyRef.current === lookupKey
+          if (resume) suggestionsEnabledRef.current = true
+          setOpen(resume)
         }}
         onBlur={() => {
           focusedRef.current = false

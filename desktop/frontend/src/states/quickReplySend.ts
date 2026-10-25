@@ -2,6 +2,7 @@ import { t } from '../lib/i18n'
 import type { Attachment, ComposerAttachment, Message } from '../types'
 import { invoke } from '../lib/bridge'
 import { ui$, showToast } from './ui'
+import { thread$ } from './thread'
 import { accounts$ } from './accounts'
 import { mail$, getActiveThread, loadThread, normalizeMessageId } from './mail'
 import { isDraftFolder } from './mailFolders'
@@ -17,13 +18,21 @@ import {
   discardUnsentRescue,
 } from './pendingSends'
 import { offerCertificateTrust } from './certificateTrust'
-import { escapeHtml, saveComposedDraft, textToHtml } from './compose'
+import {
+  bodyHasReplyQuote,
+  draftIdOfFailedSave,
+  escapeHtml,
+  replyQuote,
+  saveComposedDraft,
+  textToHtml,
+} from './compose'
+import { inlineRichStyles, prepareInlineImages } from '../components/composer/composerHelpers'
 import { buildReplyRecipients, buildReplyThreading, pickReplyTarget, resolveQuickReplyFrom } from './composeReply'
 import { allocateMessageIdentity, compose$, newDraftMessageId } from './composeState'
 import {
   cancelQuickReplyDraftSave,
   clearQuickReplyDraftOwnership,
-  discardingDraftIds,
+  discardSentDraft,
   draftOpenInComposeTab,
   isQuickReplyBlank,
   pendingQuickReplySendClaims,
@@ -36,6 +45,8 @@ import {
   quickReplySendHydrationGuards,
   releaseUnsentQuickReplyClaim,
   seedQuickReplySignature,
+  unconfirmedDraftIds,
+  unconfirmedQuickReplyDraftId,
 } from './quickReply'
 
 // Sending from the quick-reply composer: optimistic bubbles, dispatch, retry,
@@ -110,7 +121,14 @@ export async function sendReply() {
     draftId: compose$.quickReplyDraftSaved.peek()
       ? compose$.quickReplyDraftId.peek()
       : (matchingLoadedDraft?.message_id ?? ''),
+    // A copy a failed autosave may have left: cleaned up once the reply is out,
+    // but never taken for the safety net above.
+    unconfirmedDraftId: '',
     generation: boxGeneration,
+  }
+  const unconfirmedBoxDraftId = unconfirmedQuickReplyDraftId()
+  if (unconfirmedBoxDraftId && normalizeMessageId(unconfirmedBoxDraftId) !== normalizeMessageId(claim.draftId)) {
+    claim.unconfirmedDraftId = unconfirmedBoxDraftId
   }
   pendingQuickReplySendClaims.push(claim)
   // The draft leaves the box with the send, right now rather than at the guard:
@@ -144,7 +162,7 @@ export async function sendReply() {
     const target = pickReplyTarget(activeT, tempId)
     const { to, cc } = buildReplyRecipients(target)
     const { in_reply_to, references } = buildReplyThreading(target)
-    return { to, cc, in_reply_to, references, from: resolveQuickReplyFrom(target, activeAcc) }
+    return { target, to, cc, in_reply_to, references, from: resolveQuickReplyFrom(target, activeAcc) }
   }
   let addressed = addressReply()
 
@@ -188,6 +206,7 @@ export async function sendReply() {
     })),
   }
   mail$.messages.push(sent)
+  thread$.pendingOwnSendId.set(tempId)
 
   // Clear the composer optimistically, in the same tick as the click: nothing
   // has happened since that could make the box anyone else's. On a failed SMTP
@@ -219,6 +238,10 @@ export async function sendReply() {
   // too — the identity allocation this save needs is often the very thing that
   // just failed — must not take the last copy down with it. The bubble's Retry
   // then re-runs this, so the reply is recoverable once the backend is back.
+  // One id across the rescue's attempts: a failed save may have written its copy
+  // anyway, and a retry under a fresh id would put the reply in Drafts twice.
+  // The same goes for a copy an autosave of this reply may have left.
+  let rescueDraftId = ''
   const rescueUnsentQuickReply = async (): Promise<void> => {
     // Registered before the first await (see abortUnsent), so deleting the
     // bubble mid-rescue is seen here rather than missing the registration and
@@ -245,12 +268,15 @@ export async function sendReply() {
           content: text,
           inReplyTo: addressed.in_reply_to,
           references: addressed.references,
-          draftMessageId: newDraftMessageId(),
+          draftMessageId: rescueDraftId || claim.unconfirmedDraftId || newDraftMessageId(),
           attachments: box.attachments,
         })
+        unconfirmedDraftIds.delete(normalizeMessageId(savedDraftId))
       }
     } catch (saveError) {
       console.error('Failed to save unsent quick reply as a draft:', saveError)
+      rescueDraftId = draftIdOfFailedSave(saveError) ?? rescueDraftId
+      if (rescueDraftId) unconfirmedDraftIds.add(normalizeMessageId(rescueDraftId))
       rescue.inFlight = false
       // The bubble is still the reply: say so, since the thrown send error goes
       // nowhere the user can see. Its Retry runs this again.
@@ -339,6 +365,26 @@ export async function sendReply() {
     addressed = addressReply()
   }
 
+  // The quote goes out with the mail but stays out of the box and the bubble:
+  // the conversation already shows the message it answers.
+  let outgoing = { body: text, html, attachments: sendAttachments }
+  const quote = replyQuote(addressed.target)
+  // A saved quoted reply carried back into the box already holds its quote.
+  if (quote && !bodyHasReplyQuote(text, quote)) {
+    const body = text.trim() ? `${text.replace(/\n+$/, '')}\n\n${quote.text}` : quote.text
+    if (!quote.rich && !html) {
+      outgoing = { ...outgoing, body }
+    } else {
+      // The original's inline images are served from the media cache; they go
+      // out as attachments of this reply, like a forward's.
+      const prepared = await prepareInlineImages(
+        inlineRichStyles(`${html || textToHtml(text)}${quote.html}`),
+        sendAttachments,
+      )
+      outgoing = { body, html: prepared.html, attachments: prepared.attachments }
+    }
+  }
+
   let messageId: string
   try {
     messageId = await allocateMessageIdentity(replyAccountId, false)
@@ -350,13 +396,13 @@ export async function sendReply() {
     to: addressed.to,
     cc: addressed.cc,
     subject,
-    body: text,
-    html,
+    body: outgoing.body,
+    html: outgoing.html,
     in_reply_to: addressed.in_reply_to,
     references: addressed.references,
     from: addressed.from,
     message_id: messageId,
-    attachments: sendAttachments.map((a) => ({
+    attachments: outgoing.attachments.map((a) => ({
       filename: a.filename,
       mime: a.mime,
       data: a.data,
@@ -390,6 +436,7 @@ export async function sendReply() {
     threadId: activeT.thread_id,
     accountId: replyAccountId,
     draftId: claim.draftId,
+    unconfirmedDraftId: claim.unconfirmedDraftId,
     claimTick,
     inFlight: true,
     suppressDraft: true,
@@ -445,35 +492,30 @@ async function finishQuickReplySendLifecycle(tempId: string) {
   // land — discarding ahead of it would delete nothing and leave the copy
   // behind — and pick up the id it hands over.
   while (quickReplyDraftSaveInFlight) await quickReplyDraftSaveInFlight
-  if (!guard.draftId || draftOpenInComposeTab(guard.draftId)) {
-    // Opened in the full editor while the send was out (from the Drafts list, or
-    // after a failure the user retried): it is the user's again, and emptying
-    // the editor they are typing in is worse than leaving a draft behind.
-    quickReplySendHydrationGuards.delete(tempId)
-    publishSendingDraftIds()
-    return
-  }
-  const discardingId = normalizeMessageId(guard.draftId)
-  discardingDraftIds.add(discardingId)
-  let discarded: boolean
-  try {
-    discarded = await discardSavedDraftCopy({
-      threadId: guard.threadId,
-      messageId: '',
-      folderId: '',
-      accountId: guard.accountId,
-      draftMessageId: guard.draftId,
-    })
-  } finally {
-    discardingDraftIds.delete(discardingId)
-  }
+  // Both the saved copy and any a failed autosave may have left went out with
+  // the reply — except one opened in the full editor while the send was out
+  // (from the Drafts list, or after a failure the user retried): it is the
+  // user's again, and emptying the editor they are typing in is worse than
+  // leaving a draft behind.
+  const leftovers = [guard.draftId, guard.unconfirmedDraftId].filter((id) => id && !draftOpenInComposeTab(id))
+  await Promise.all(
+    leftovers.map((draftMessageId) => {
+      unconfirmedDraftIds.delete(normalizeMessageId(draftMessageId))
+      return discardSentDraft({
+        threadId: guard.threadId,
+        messageId: '',
+        folderId: '',
+        accountId: guard.accountId,
+        draftMessageId,
+      })
+    }),
+  )
   if (quickReplySendHydrationGuards.get(tempId) !== guard) return
-  if (discarded) {
-    quickReplySendHydrationGuards.delete(tempId)
-    publishSendingDraftIds()
-  } else {
-    settleFailedQuickReplySendGuard(tempId)
-  }
+  // The send is settled either way. A copy the discard couldn't remove yet is
+  // not a safety net to hand back like a failed send's: the message went out,
+  // so discardSentDraft keeps it suppressed and retries on its own.
+  quickReplySendHydrationGuards.delete(tempId)
+  publishSendingDraftIds()
 }
 
 function settleFailedQuickReplySendGuard(tempId: string) {

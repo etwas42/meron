@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { X, Check, Upload, Image as ImageIcon } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
 import type { ChatWallpaper } from '../../types'
 import { WALLPAPER_PRESETS, sanitizeChatWallpaper, wallpaperCss } from '../../lib/wallpapers'
 import { pickImageFile } from '../../lib/nativeFilePicker'
@@ -37,8 +37,6 @@ export function WallpaperDialog({
   const wallpaper = sanitizeChatWallpaper(rawWallpaper)
   const selectedKey = wallpaperKey(wallpaper)
 
-  useEscapeKey(onClose)
-
   const uploadWallpaper = async () => {
     try {
       const file = await pickImageFile(t('wallpaper.chooseImage'))
@@ -55,121 +53,125 @@ export function WallpaperDialog({
   const previewInfo = wallpaperCss(wallpaper)
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/45 dark:bg-black/65 backdrop-blur-[3px] p-4 animate-fade-in">
-      <div className="w-full max-w-4xl h-[620px] max-h-[90vh] rounded-3xl border border-border bg-chats text-primary shadow-2xl animate-slide-up flex flex-col overflow-hidden">
-        {/* Title Header */}
-        <div className="flex items-center justify-between gap-3 border-b border-border/70 px-6 py-4 shrink-0">
-          <div className="flex items-center gap-2">
-            <ImageIcon className="text-accent" size={16} />
-            <h3 className="text-[0.875rem] font-bold leading-tight">{title}</h3>
+    <Dialog
+      onClose={onClose}
+      closeOnBackdrop={false}
+      aria-label={title}
+      backdropClassName="z-[70] bg-black/45 dark:bg-black/65"
+      className="max-w-4xl h-[620px] max-h-[90vh] flex flex-col overflow-hidden"
+    >
+      {/* Title Header */}
+      <div className="flex items-center justify-between gap-3 border-b border-border/70 px-6 py-4 shrink-0">
+        <div className="flex items-center gap-2">
+          <ImageIcon className="text-accent" size={16} />
+          <h3 className="text-[0.875rem] font-bold leading-tight">{title}</h3>
+        </div>
+        <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
+      </div>
+
+      {/* Split Panel Body */}
+      <div className="flex flex-1 min-h-0 overflow-hidden flex-col md:flex-row">
+        {/* Left panel: Wallpapers grid */}
+        <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-4">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pb-2">
+            {/* Custom Upload Card */}
+            <button
+              type="button"
+              onClick={() => void uploadWallpaper()}
+              disabled={busy}
+              className={`relative flex aspect-[16/10] flex-col items-center justify-center gap-1.5 overflow-hidden rounded-xl border border-dashed cursor-pointer transition-all ${
+                selectedKey.startsWith('custom:')
+                  ? 'border-accent text-accent bg-accent/5 ring-2 ring-accent/20'
+                  : 'border-border text-secondary hover:text-accent hover:border-accent/50 hover:bg-accent/2'
+              } disabled:opacity-50`}
+            >
+              {wallpaper?.kind === 'custom' && (
+                <span
+                  className="absolute inset-0 bg-cover bg-center"
+                  style={{
+                    backgroundImage: `linear-gradient(rgba(15, 23, 42, 0.15), rgba(15, 23, 42, 0.15)), url("${wallpaper.url}")`,
+                  }}
+                />
+              )}
+              <span className="relative flex flex-col items-center gap-1 rounded-lg bg-chats/90 px-3 py-2 border border-border/30 shadow-xs">
+                <Upload size={15} />
+                <span className="text-[0.625rem] font-bold leading-none">
+                  {busy ? t('wallpaper.uploading') : t('wallpaper.uploadCustom')}
+                </span>
+              </span>
+              {selectedKey.startsWith('custom:') && (
+                <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
+                  <Check size={11} />
+                </span>
+              )}
+            </button>
+
+            {/* Preset Cards */}
+            {WALLPAPER_PRESETS.map((preset) => {
+              const selected = selectedKey === `preset:${preset.id}`
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  title={preset.name}
+                  onClick={() => void onSelect({ kind: 'preset', presetId: preset.id })}
+                  className={`relative aspect-[16/10] overflow-hidden rounded-xl border cursor-pointer transition-all ${
+                    selected
+                      ? 'border-accent ring-2 ring-accent/20'
+                      : 'border-border hover:border-secondary/40 hover:scale-[1.01]'
+                  }`}
+                >
+                  <span className={`absolute inset-0 ${preset.previewClass}`} />
+                  {selected && (
+                    <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
+                      <Check size={11} />
+                    </span>
+                  )}
+                </button>
+              )
+            })}
           </div>
-          <IconButton icon={X} iconSize={15} label={t('buttons.close')} size="sm" onClick={onClose} />
         </div>
 
-        {/* Split Panel Body */}
-        <div className="flex flex-1 min-h-0 overflow-hidden flex-col md:flex-row">
-          {/* Left panel: Wallpapers grid */}
-          <div className="flex-1 overflow-y-auto p-6 flex flex-col gap-4">
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pb-2">
-              {/* Custom Upload Card */}
-              <button
-                type="button"
-                onClick={() => void uploadWallpaper()}
-                disabled={busy}
-                className={`relative flex aspect-[16/10] flex-col items-center justify-center gap-1.5 overflow-hidden rounded-xl border border-dashed cursor-pointer transition-all ${
-                  selectedKey.startsWith('custom:')
-                    ? 'border-accent text-accent bg-accent/5 ring-2 ring-accent/20'
-                    : 'border-border text-secondary hover:text-accent hover:border-accent/50 hover:bg-accent/2'
-                } disabled:opacity-50`}
-              >
-                {wallpaper?.kind === 'custom' && (
-                  <span
-                    className="absolute inset-0 bg-cover bg-center"
-                    style={{
-                      backgroundImage: `linear-gradient(rgba(15, 23, 42, 0.15), rgba(15, 23, 42, 0.15)), url("${wallpaper.url}")`,
-                    }}
-                  />
-                )}
-                <span className="relative flex flex-col items-center gap-1 rounded-lg bg-chats/90 px-3 py-2 border border-border/30 shadow-xs">
-                  <Upload size={15} />
-                  <span className="text-[0.625rem] font-bold leading-none">
-                    {busy ? t('wallpaper.uploading') : t('wallpaper.uploadCustom')}
-                  </span>
-                </span>
-                {selectedKey.startsWith('custom:') && (
-                  <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
-                    <Check size={11} />
-                  </span>
-                )}
-              </button>
+        {/* Right panel: Live Mockup Chat Preview */}
+        <div className="w-full md:w-[320px] shrink-0 border-t md:border-t-0 md:border-l border-border/70 bg-raised p-5 flex flex-col select-none">
+          {/* Chat screen mockup frame */}
+          <div className="flex-1 rounded-2xl border border-border overflow-hidden flex flex-col bg-chat relative shadow-inner min-h-[280px]">
+            {/* Wallpaper background inside mockup */}
+            <div
+              className={`absolute inset-0 transition-all duration-300 ${previewInfo.className}`}
+              style={previewInfo.style}
+            />
 
-              {/* Preset Cards */}
-              {WALLPAPER_PRESETS.map((preset) => {
-                const selected = selectedKey === `preset:${preset.id}`
-                return (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    title={preset.name}
-                    onClick={() => void onSelect({ kind: 'preset', presetId: preset.id })}
-                    className={`relative aspect-[16/10] overflow-hidden rounded-xl border cursor-pointer transition-all ${
-                      selected
-                        ? 'border-accent ring-2 ring-accent/20'
-                        : 'border-border hover:border-secondary/40 hover:scale-[1.01]'
-                    }`}
-                  >
-                    <span className={`absolute inset-0 ${preset.previewClass}`} />
-                    {selected && (
-                      <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-accent text-accent-label shadow-xs">
-                        <Check size={11} />
-                      </span>
-                    )}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
+            {/* Overlay to dim mockup and ensure contrast */}
+            <div className="absolute inset-0 bg-gradient-to-b from-black/5 to-transparent pointer-events-none" />
 
-          {/* Right panel: Live Mockup Chat Preview */}
-          <div className="w-full md:w-[320px] shrink-0 border-t md:border-t-0 md:border-l border-border/70 bg-raised p-5 flex flex-col select-none">
-            {/* Chat screen mockup frame */}
-            <div className="flex-1 rounded-2xl border border-border overflow-hidden flex flex-col bg-chat relative shadow-inner min-h-[280px]">
-              {/* Wallpaper background inside mockup */}
-              <div
-                className={`absolute inset-0 transition-all duration-300 ${previewInfo.className}`}
-                style={previewInfo.style}
-              />
+            {/* Chat bubbles container */}
+            <div className="relative z-10 flex-1 flex flex-col justify-end p-3.5 gap-3">
+              <div className="mx-auto select-none rounded-full bg-active border border-border/30 px-2.5 py-0.8 text-center text-[0.5625rem] font-bold text-secondary/80">
+                Today
+              </div>
 
-              {/* Overlay to dim mockup and ensure contrast */}
-              <div className="absolute inset-0 bg-gradient-to-b from-black/5 to-transparent pointer-events-none" />
-
-              {/* Chat bubbles container */}
-              <div className="relative z-10 flex-1 flex flex-col justify-end p-3.5 gap-3">
-                <div className="mx-auto select-none rounded-full bg-active border border-border/30 px-2.5 py-0.8 text-center text-[0.5625rem] font-bold text-secondary/80">
-                  Today
+              {/* Left Bubble (Incoming) */}
+              <div className="flex items-end gap-1.5 max-w-[85%] self-start">
+                <div className="h-5 w-5 rounded-full bg-accent flex items-center justify-center text-[0.53125rem] font-bold text-accent-label shadow-xs">
+                  {previewName ? previewName.slice(0, 1) : 'U'}
                 </div>
-
-                {/* Left Bubble (Incoming) */}
-                <div className="flex items-end gap-1.5 max-w-[85%] self-start">
-                  <div className="h-5 w-5 rounded-full bg-accent flex items-center justify-center text-[0.53125rem] font-bold text-accent-label shadow-xs">
-                    {previewName ? previewName.slice(0, 1) : 'U'}
-                  </div>
-                  <div className="rounded-2xl rounded-bl-sm border border-border/40 bg-bubble-in p-2.5 text-[0.6875rem] leading-normal text-bubble-in-text shadow-bubble-in">
-                    How does this chat wallpaper look on your screen?
-                  </div>
+                <div className="rounded-2xl rounded-bl-sm border border-border/40 bg-bubble-in p-2.5 text-[0.6875rem] leading-normal text-bubble-in-text shadow-bubble-in">
+                  How does this chat wallpaper look on your screen?
                 </div>
+              </div>
 
-                {/* Right Bubble (Outgoing) */}
-                <div className="flex flex-col max-w-[80%] self-end">
-                  <div className="rounded-2xl rounded-br-sm border border-border/35 bg-bubble-out text-bubble-out-text p-2.5 text-[0.6875rem] leading-normal shadow-bubble-out">
-                    Looks fantastic! The text contrast and background pattern are perfectly balanced.
-                  </div>
+              {/* Right Bubble (Outgoing) */}
+              <div className="flex flex-col max-w-[80%] self-end">
+                <div className="rounded-2xl rounded-br-sm border border-border/35 bg-bubble-out text-bubble-out-text p-2.5 text-[0.6875rem] leading-normal shadow-bubble-out">
+                  Looks fantastic! The text contrast and background pattern are perfectly balanced.
                 </div>
               </div>
             </div>
           </div>
         </div>
       </div>
-    </div>
+    </Dialog>
   )
 }

@@ -1,4 +1,4 @@
-import { luminance, parseColor } from '../../lib/color'
+import { formatColor, luminance, mix, parseColor, type Rgba } from '../../lib/color'
 import type { Appearance, ThemeTokens } from '../../lib/themes'
 
 // A message body renders in its own document, so it inherits none of the app's
@@ -14,6 +14,8 @@ import type { Appearance, ThemeTokens } from '../../lib/themes'
  */
 export interface ReaderTheme {
   appearance: Appearance
+  /** Draw a light self-styled message inverted rather than as a light card. */
+  darkenStyled: boolean
   /** Behind the reader column — always themed, whatever the message declares. */
   pageBg: string
   text: string
@@ -28,6 +30,7 @@ export interface ReaderTheme {
 
 export const DEFAULT_READER_THEME: ReaderTheme = {
   appearance: 'light',
+  darkenStyled: false,
   pageBg: '#f8fafc',
   text: '#0f172a',
   surface: '#f1f5f9',
@@ -39,7 +42,7 @@ export const DEFAULT_READER_THEME: ReaderTheme = {
 }
 
 /** Map the active theme's tokens onto the frame's palette. */
-export function readerThemeFromTokens(appearance: Appearance, tokens: ThemeTokens): ReaderTheme {
+export function readerThemeFromTokens(appearance: Appearance, tokens: ThemeTokens, darkenStyled = false): ReaderTheme {
   if (appearance === 'light') {
     // Light frames keep the hand-picked slate palette; only the gutter follows
     // the theme, so a tinted light theme doesn't sit next to a grey letterbox.
@@ -47,6 +50,7 @@ export function readerThemeFromTokens(appearance: Appearance, tokens: ThemeToken
   }
   return {
     appearance,
+    darkenStyled,
     pageBg: tokens.bgChat,
     text: tokens.textPrimary,
     surface: tokens.bgRaised,
@@ -66,6 +70,8 @@ export function readerThemeFromTokens(appearance: Appearance, tokens: ThemeToken
  */
 export interface BubbleTheme {
   appearance: Appearance
+  /** Draw a light self-styled message inverted rather than as a light card. */
+  darkenStyled: boolean
   text: string
   link: string
   /** Code blocks and inline code. */
@@ -79,6 +85,8 @@ export interface BubbleTheme {
   raisedHover: string
   /** Text on a search hit's yellow highlight, which never follows the theme. */
   highlightText: string
+  /** What a darkened body turns its white into: the surface the frame sits on. */
+  darkenedBackdrop: string
 }
 
 /** The foreground for a canvas that turned out to be dark and declared no text color. */
@@ -86,6 +94,7 @@ export const LIGHT_ON_DARK_TEXT = '#f8fafc'
 
 export const DEFAULT_BUBBLE_THEME: BubbleTheme = {
   appearance: 'light',
+  darkenStyled: false,
   text: '#0f172a',
   link: '#4f46e5',
   surface: '#f1f5f9',
@@ -96,14 +105,37 @@ export const DEFAULT_BUBBLE_THEME: BubbleTheme = {
   raised: 'rgba(255, 255, 255, 0.92)',
   raisedHover: '#ffffff',
   highlightText: 'inherit',
+  darkenedBackdrop: '#000000',
+}
+
+/** What a message body frame sits on: a chat bubble, a draft's bubble, or a traditional layout's row. */
+export type FrameSurface = 'bubble' | 'draft' | 'row'
+
+/** How much of the outgoing colour a draft's bubble is painted with (`bg-bubble-out/55`). */
+const DRAFT_BUBBLE_OPACITY = 0.55
+
+/** The colour of the surface a frame sits on, for a darkened body to blend onto. */
+function surfaceColor(tokens: ThemeTokens, outgoing: boolean, surface: FrameSurface): string {
+  if (surface === 'row') return tokens.bgChats
+  // A draft's bubble is see-through; over the conversation's own background it
+  // comes out as this. A wallpaper behind it can't be matched from in here.
+  if (surface === 'draft') return mix(tokens.bgChat, tokens.bubbleOut, DRAFT_BUBBLE_OPACITY)
+  return outgoing ? tokens.bubbleOut : tokens.bubbleIn
 }
 
 /** Map the active theme's tokens onto a bubble frame's palette. */
-export function bubbleThemeFromTokens(appearance: Appearance, tokens: ThemeTokens, outgoing: boolean): BubbleTheme {
+export function bubbleThemeFromTokens(
+  appearance: Appearance,
+  tokens: ThemeTokens,
+  outgoing: boolean,
+  darkenStyled = false,
+  surface: FrameSurface = 'bubble',
+): BubbleTheme {
   // Light bubbles are already the palette these frames were drawn for.
   if (appearance === 'light') return DEFAULT_BUBBLE_THEME
   return {
     appearance,
+    darkenStyled,
     text: outgoing ? tokens.bubbleOutText : tokens.bubbleInText,
     link: tokens.accent,
     surface: tokens.bgRaised,
@@ -115,6 +147,7 @@ export function bubbleThemeFromTokens(appearance: Appearance, tokens: ThemeToken
     raisedHover: tokens.bgActive,
     // The highlight keeps its yellow in both appearances, so its text can't.
     highlightText: '#0f172a',
+    darkenedBackdrop: surfaceColor(tokens, outgoing, surface),
   }
 }
 
@@ -396,12 +429,17 @@ export function frameCanvas(
   /** False where the frame's own background already suits the message — a light
    *  bubble under a light design — which still has to undo an earlier restore. */
   wantsCanvas = true,
+  preparedBackground?: { background: string | null },
 ): FrameCanvas {
   const declared = declaredCanvas(doc)
   const isImportant = (property: string) => declared.important.includes(property)
   writeBodyDeclarations(doc, [['color', declared.text, isImportant('color')]])
 
-  const background = wantsCanvas ? frameCanvasBackground(doc, appearance) : null
+  const background = preparedBackground
+    ? preparedBackground.background
+    : wantsCanvas
+      ? frameCanvasBackground(doc, appearance)
+      : null
   const restoresDeclared = !!background && background === declared.background
   // The canvas is painted on the body itself rather than from the frame's
   // stylesheet. A stylesheet declaration is in the cascade whether or not the
@@ -423,7 +461,7 @@ export function frameCanvas(
   }
 }
 
-// Text the sender hides// Text the sender hides — the preheader every newsletter opens with, a
+// Text the sender hides — the preheader every newsletter opens with, a
 // screen-reader-only line — is not what the message looks like, so it can't be
 // what decides the canvas.
 function isHidden(style: CSSStyleDeclaration): boolean {
@@ -449,39 +487,58 @@ function isHidden(style: CSSStyleDeclaration): boolean {
  * its own length, so the colors that cover the message decide it, and the ones
  * on a hidden preheader or an empty wrapper decide nothing.
  */
-function declaredTextTone(doc: Document): 'light' | 'dark' | null {
+function* textToneWalk(doc: Document): Generator<void, 'light' | 'dark' | null> {
   const win = doc.defaultView
-  // A document that was only parsed has no engine to ask, and no rendering to
-  // describe. Callers treat null as "nothing declared", which is the safe read.
-  if (!win) return null
-
+  if (!win || !doc.body) return null
   let light = 0
   let dark = 0
-  const walk = (el: Element) => {
-    if (SKIPPED_TAGS.has(el.tagName)) return
+  const pending: Element[] = [doc.body]
+  while (pending.length) {
+    const el = pending.pop()!
+    yield
+    if (SKIPPED_TAGS.has(el.tagName)) continue
     const style = win.getComputedStyle(el)
-    if (isHidden(style)) return
-
+    if (isHidden(style)) continue
     const tone = colorTone(style.color)
     for (const node of el.childNodes) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        walk(node as Element)
-        continue
+      if (node.nodeType === Node.ELEMENT_NODE) pending.push(node as Element)
+      else if (node.nodeType === Node.TEXT_NODE && tone) {
+        const length = node.textContent?.trim().length ?? 0
+        if (tone === 'light') light += length
+        else dark += length
       }
-      if (node.nodeType !== Node.TEXT_NODE || !tone) continue
-      // Only the text this element paints itself: a child's runs are counted
-      // with the child, in whatever color it resolves to.
-      const length = node.textContent?.trim().length ?? 0
-      if (tone === 'light') light += length
-      else dark += length
     }
   }
-  if (doc.body) walk(doc.body)
+  return !light && !dark ? null : light > dark ? 'dark' : 'light'
+}
 
-  if (!light && !dark) return null
-  // Text lighter than the canvas it never declared means the sender assumed a
-  // dark one, so the tone the *canvas* wants is the opposite of the text's.
-  return light > dark ? 'dark' : 'light'
+// Give input and paint a turn between small batches of computed-style reads.
+async function runThemeWalk<T>(walk: Generator<void, T>, cancelled: () => boolean): Promise<T | undefined> {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+  let slice = performance.now()
+  while (!cancelled()) {
+    const step = walk.next()
+    if (step.done) return step.value
+    if (performance.now() - slice >= 4) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+      slice = performance.now()
+    }
+  }
+  return undefined
+}
+
+export async function frameCanvasAsync(
+  doc: Document,
+  appearance: Appearance,
+  fallbackText: string,
+  wantsCanvas: boolean,
+  cancelled: () => boolean,
+): Promise<FrameCanvas | undefined> {
+  const declared = declaredCanvas(doc)
+  writeBodyDeclarations(doc, [['color', declared.text, declared.important.includes('color')]])
+  const background = wantsCanvas ? await runThemeWalk(canvasBackgroundWalk(doc, appearance), cancelled) : null
+  if (cancelled()) return undefined
+  return frameCanvas(doc, appearance, fallbackText, wantsCanvas, { background: background ?? null })
 }
 
 /**
@@ -494,7 +551,7 @@ function declaredTextTone(doc: Document): 'light' | 'dark' | null {
  * that declares only light text was written for a dark canvas and already has
  * one — the frame's — so it keeps it.
  */
-export function frameCanvasBackground(doc: Document, appearance: Appearance): string | null {
+function* canvasBackgroundWalk(doc: Document, appearance: Appearance): Generator<void, string | null> {
   const { background } = declaredCanvas(doc)
   // A canvas whose color can't be judged can't be paired with a readable
   // foreground either, so it is treated as no canvas at all and falls through to
@@ -502,7 +559,14 @@ export function frameCanvasBackground(doc: Document, appearance: Appearance): st
   if (background && colorTone(background)) return background
   if (appearance === 'light') return null
   if (!messageIsSelfStyled(doc)) return null
-  return declaredTextTone(doc) === 'dark' ? null : '#ffffff'
+  return (yield* textToneWalk(doc)) === 'dark' ? null : '#ffffff'
+}
+
+export function frameCanvasBackground(doc: Document, appearance: Appearance): string | null {
+  const walk = canvasBackgroundWalk(doc, appearance)
+  let step = walk.next()
+  while (!step.done) step = walk.next()
+  return step.value
 }
 
 /**
@@ -517,4 +581,179 @@ export function canvasTextColor(doc: Document, canvas: string | null, fallback: 
   const { text } = declaredCanvas(doc)
   if (text) return text
   return colorTone(canvas) === 'dark' ? fallback : null
+}
+
+/**
+ * Set on a frame's `<html>` while its body is drawn inverted. The sanitiser
+ * drops every `data-*` attribute, so sender markup can't carry it.
+ */
+export const DARKENED_ATTR = 'data-meron-darkened'
+
+/** Set by `setDarkened` on an element that is a background picture and nothing else. */
+export const PICTURE_ATTR = 'data-meron-picture'
+
+/** `hue-rotate(180deg)` as the matrix the engine applies, row by row. */
+const HUE_TURN = [
+  [-0.574, 1.43, 0.144],
+  [0.426, 0.43, 0.144],
+  [0.426, 1.43, -0.856],
+]
+
+/**
+ * The color a darkened body has to be painted with to come out as `surface`:
+ * the darkening filter run backwards. The filter can't reach every color — a
+ * very saturated surface falls outside what it produces — and then this is the
+ * nearest it gets to, a shade duller than the surface itself.
+ */
+export function darkenedFloor(surface: string): string {
+  const color = parseColor(surface)
+  if (!color) return '#ffffff'
+  const channels = [color.r, color.g, color.b]
+  const [r, g, b] = HUE_TURN.map((row) => 255 - row.reduce((sum, weight, i) => sum + weight * channels[i], 0))
+  return formatColor({ r, g, b, a: 1 })
+}
+
+/**
+ * The rules that draw a darkened body: inverted, with the hue turned back so
+ * links and brand colors stay recognisable, and pictures inverted a second time
+ * so they come out as sent — once only, so an image inside a re-inverted
+ * background picture is left alone. The search highlight keeps its yellow too.
+ *
+ * Inverted white is black, not the surface the frame sits on, so a layer over
+ * the body caps how light it gets before the filter runs: at the color that
+ * inverts to that surface (see `darkenedFloor`). The layer is the first thing
+ * positioned in the body, above everything in the flow and below whatever
+ * comes after it with a filter of its own — the pictures, which a cap applied
+ * to the whole body would tint with the surface instead. Whatever else paints
+ * above it — a box the sender positioned, and all that is in one — has its
+ * background capped one element at a time (see `cappedBackground`).
+ */
+export const darkenedCss = (v: (name: string) => string) => `
+  html[${DARKENED_ATTR}] body,
+  html[${DARKENED_ATTR}] body :is(img, video, [${PICTURE_ATTR}], mark.meron-search-hit) {
+    filter: invert(1) hue-rotate(180deg);
+  }
+  html[${DARKENED_ATTR}] body [${PICTURE_ATTR}] img {
+    filter: none;
+  }
+  html[${DARKENED_ATTR}] body::before {
+    content: '' !important;
+    display: block !important;
+    position: absolute !important;
+    inset: 0 !important;
+    background: var(${v('darkened-floor')}, #ffffff) !important;
+    mix-blend-mode: darken !important;
+    pointer-events: none !important;
+  }
+`
+
+/**
+ * Whether a frame should draw its body inverted: the reader asked for dark
+ * bodies, the theme is dark, and the message was given a light canvas of its
+ * own — the one case a dark theme otherwise leaves bright. Mail with no colors
+ * of its own is already painted in the theme's palette, and a dark canvas is
+ * dark already.
+ */
+export function darkensCanvas(appearance: Appearance, darkenStyled: boolean, canvas: string | null): boolean {
+  return darkenStyled && appearance === 'dark' && !!canvas && colorTone(canvas) === 'light'
+}
+
+/**
+ * Whether an element is a picture painted as a background, with no text of its
+ * own. Only those are turned back to their own colors: turning a box back also
+ * turns back the text in it, which would then read as sent — dark — on a canvas
+ * that is now dark too. `background-image: none` is no picture at all.
+ */
+function isBackgroundPicture(el: HTMLElement): boolean {
+  if (el.textContent?.trim()) return false
+  const win = el.ownerDocument.defaultView
+  // A document that was only parsed has no engine to resolve stylesheets; its
+  // inline declaration and the legacy attribute are all there is to go on.
+  const image = win ? win.getComputedStyle(el).backgroundImage : el.style.backgroundImage
+  return /url\(/i.test(image) || (!win && !!el.getAttribute('background')?.trim())
+}
+
+/**
+ * Set by `setDarkened` on an element whose background color it capped, holding
+ * the inline declaration that was there before: its priority, a bar, its value.
+ */
+export const CAPPED_ATTR = 'data-meron-capped'
+
+/** Elements that are turned back to their own colors, which a cap would then show through. */
+const UNCAPPED_SELECTOR = `img, video, mark.meron-search-hit, [${PICTURE_ATTR}], [${PICTURE_ATTR}] *`
+
+/**
+ * An element's background color held to the floor, or null if it is under it
+ * already. The layer over the body (see `darkenedCss`) caps what is in the
+ * flow, but a positioned box paints above that layer, and so does everything
+ * inside one: its white would invert to black, not to the surface.
+ */
+function cappedBackground(el: HTMLElement, floor: Rgba): string | null {
+  if (el.matches(UNCAPPED_SELECTOR)) return null
+  const win = el.ownerDocument.defaultView
+  const declared = win
+    ? win.getComputedStyle(el).backgroundColor
+    : el.style.backgroundColor || el.getAttribute('bgcolor') || ''
+  const color = parseColor(declared)
+  if (!color || color.a === 0) return null
+  if (color.r <= floor.r && color.g <= floor.g && color.b <= floor.b) return null
+  return formatColor({
+    r: Math.min(color.r, floor.r),
+    g: Math.min(color.g, floor.g),
+    b: Math.min(color.b, floor.b),
+    a: color.a,
+  })
+}
+
+/** Put back the inline background an element had before it was capped. */
+function uncapBackground(el: HTMLElement) {
+  const saved = el.getAttribute(CAPPED_ATTR) ?? ''
+  const bar = saved.indexOf('|')
+  const value = saved.slice(bar + 1)
+  if (value) el.style.setProperty('background-color', value, saved.slice(0, bar))
+  else el.style.removeProperty('background-color')
+  el.removeAttribute(CAPPED_ATTR)
+}
+
+/** Mark or unmark a frame's document as darkened (see `darkenedCss`). */
+function* darkenedWalk(doc: Document, darkened: boolean, floor: string): Generator<void, void> {
+  doc.documentElement.toggleAttribute(DARKENED_ATTR, darkened)
+  for (const el of doc.querySelectorAll(`[${PICTURE_ATTR}]`)) {
+    el.removeAttribute(PICTURE_ATTR)
+    yield
+  }
+  for (const el of doc.querySelectorAll<HTMLElement>(`[${CAPPED_ATTR}]`)) {
+    uncapBackground(el)
+    yield
+  }
+  if (!darkened || !doc.body) return
+  const cap = parseColor(floor)
+  // Written once the walk has read every element: a write in between would
+  // have the engine resolve the document's styles again for the next read.
+  const capped: Array<[HTMLElement, string]> = []
+  for (const el of doc.body.querySelectorAll<HTMLElement>('*')) {
+    if (isBackgroundPicture(el)) el.setAttribute(PICTURE_ATTR, '')
+    const background = cap && cappedBackground(el, cap)
+    if (background) capped.push([el, background])
+    yield
+  }
+  for (const [el, background] of capped) {
+    const { style } = el
+    el.setAttribute(
+      CAPPED_ATTR,
+      `${style.getPropertyPriority('background-color')}|${style.getPropertyValue('background-color')}`,
+    )
+    style.setProperty('background-color', background, 'important')
+  }
+}
+
+/** `floor` is the color a darkened body is capped at (see `darkenedFloor`). */
+export function setDarkened(doc: Document, darkened: boolean, floor: string) {
+  for (const _ of darkenedWalk(doc, darkened, floor)) {
+    /* finish synchronously for reader callers */
+  }
+}
+
+export async function setDarkenedAsync(doc: Document, darkened: boolean, floor: string, cancelled: () => boolean) {
+  await runThemeWalk(darkenedWalk(doc, darkened, floor), cancelled)
 }

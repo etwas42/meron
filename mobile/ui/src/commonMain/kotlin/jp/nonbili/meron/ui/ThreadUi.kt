@@ -1,15 +1,20 @@
 package jp.nonbili.meron.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,14 +23,18 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.automirrored.filled.ReplyAll
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Archive
@@ -41,9 +50,12 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material.icons.filled.UnfoldLess
+import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -63,13 +75,14 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TextField
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -81,15 +94,31 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.backhandler.BackHandler
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.chrisbanes.haze.HazeInput
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.blur.HazeBlurStyle
+import dev.chrisbanes.haze.blur.HazeColorEffect
+import dev.chrisbanes.haze.blur.hazeBlur
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 import jp.nonbili.meron.shared.DraftAttachment
 import jp.nonbili.meron.shared.FolderSummary
 import jp.nonbili.meron.shared.MessageAttachment
@@ -109,6 +138,7 @@ import jp.nonbili.meron.shared.threadIdIsRss
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -126,11 +156,17 @@ internal fun ThreadScreen(
     onArchive: () -> Unit,
     onDelete: () -> Unit,
     onToggleStar: () -> Unit,
+    /** Null when Tasks is switched off, which hides the action entirely. */
+    onAddToTasks: (() -> Unit)? = null,
     moveFolders: List<FolderSummary>,
     copyFolders: List<FolderSummary>,
+    transferAccounts: List<jp.nonbili.meron.shared.AccountSummary> = emptyList(),
+    loadTransferFolders: () -> Unit = {},
     onMoveToFolder: (FolderSummary) -> Unit,
     onCreateFolderAndMove: (String) -> Unit,
     onCopyToFolder: (FolderSummary) -> Unit,
+    recentTransfers: List<RecentThreadTransferItem> = emptyList(),
+    loadRecentTransferFolders: suspend () -> Unit = {},
     quickReplyBody: String,
     canLoadOlder: Boolean,
     loadingOlder: Boolean,
@@ -158,9 +194,11 @@ internal fun ThreadScreen(
     quickReplySelectedFrom: SendIdentity?,
     onSelectQuickReplyFrom: (SendIdentity) -> Unit,
     onForward: (MessageBody) -> Unit,
+    onReplyToMessage: (MessageBody) -> Unit,
     onReplyAllToMessage: (MessageBody) -> Unit,
     canReplyAllToMessage: (MessageBody) -> Boolean,
     onEditAsNew: (MessageBody) -> Unit,
+    readerBottomActions: Boolean,
     onOpenDraft: (MessageBody) -> Unit,
     onToggleMessageRead: (MessageBody) -> Unit,
     onToggleMessageStarred: (MessageBody) -> Unit,
@@ -178,12 +216,15 @@ internal fun ThreadScreen(
     onComposeTo: (String) -> Unit,
     onCopyMessageText: (String, String) -> Unit,
     onRetryLoadMessages: () -> Unit,
+    onRespondToInvite: (MessageBody, String) -> Unit,
+    onRemoveInviteEvent: (MessageBody) -> Unit,
+    onAddInviteToCalendar: (MessageBody) -> Unit,
     onMessagesRead: (List<String>) -> Unit,
     onViewedToBottom: () -> Unit,
     snackbarHost: SnackbarHostState,
 ) {
     val isRss = thread?.let { threadIdIsRss(it.id) } ?: false
-    val deleteLabel = thread?.let { threadDeleteActionLabel(it.folder, it.folderRole) } ?: "Move to Trash"
+    val deleteLabel = tr(thread?.let { threadDeleteActionKey(it.folder, it.folderRole) } ?: "threads.actions.moveToTrash")
     val chat = LocalChatColors.current
     val services = LocalPlatformServices.current
     var searchOpen by remember(thread?.id) { mutableStateOf(false) }
@@ -203,6 +244,9 @@ internal fun ThreadScreen(
     var printing by remember(thread?.id) { mutableStateOf(false) }
     val printScope = rememberCoroutineScope()
     var overflowOpen by remember(thread?.id) { mutableStateOf(false) }
+    LaunchedEffect(overflowOpen, thread?.accountId) {
+        if (overflowOpen) loadRecentTransferFolders()
+    }
     val closeSearch = {
         threadSearch = ""
         searchOpen = false
@@ -220,8 +264,10 @@ internal fun ThreadScreen(
     val mediaItems =
         remember(messages, remoteContentPolicy, revealedRemote) { buildThreadMediaItems(messages, remoteAllowed) }
     val targetMoveFolders =
-        remember(currentThreadFolder, moveFolders) {
-            moveFolders.filterNot { folder -> folder.name.equals(currentThreadFolder, ignoreCase = true) }
+        remember(currentThreadAccountId, currentThreadFolder, moveFolders) {
+            moveFolders.filterNot { folder ->
+                folder.accountId.ifBlank { currentThreadAccountId } == currentThreadAccountId && folder.name.equals(currentThreadFolder, ignoreCase = true)
+            }
         }
     val targetCopyFolders =
         remember(currentThreadAccountId, currentThreadFolder, copyFolders) {
@@ -246,6 +292,10 @@ internal fun ThreadScreen(
     // Traditional layout only: message ids the user has explicitly expanded or
     // collapsed, overriding the default below. Reset when the thread changes.
     var expandOverrides by remember(thread?.id) { mutableStateOf(emptyMap<String, Boolean>()) }
+    // The reader's last expand-all or collapse-all from the menu, null until
+    // used. Every message without a toggle of its own follows it, earlier ones
+    // loaded afterwards included.
+    var expandAll by remember(thread?.id) { mutableStateOf<Boolean?>(null) }
     // Which messages were unread when they first appeared. Scroll-driven read
     // marking clears `unread` while the user reads, so a default derived from
     // the live flag would collapse an open message out from under them — and
@@ -263,16 +313,65 @@ internal fun ThreadScreen(
         // collapsed summary would hide the very text that was searched for.
         if (message.id == activeSearchId) return true
         return expandOverrides[message.id]
+            // Collapsing all still leaves the newest open: a thread of nothing
+            // but summary lines has nothing to read, and it is the one a reply
+            // answers.
+            ?: expandAll?.let { it || message.id == lastMessageId }
             ?: (message.id == lastMessageId || message.id in unreadOnArrival || searchMatches.contains(message.id))
     }
+    // What the menu's expand-all / collapse-all item would do now: true to
+    // expand, false to collapse, null where there is nothing to offer.
+    val expandAllAction: Boolean? =
+        when {
+            conversationLayout != ConversationLayout.Traditional -> null
+
+            messages.any { !isMessageExpanded(it) } -> true
+
+            // Collapsing all leaves the newest open, which is all a thread of
+            // one has.
+            messages.size > 1 -> false
+
+            else -> null
+        }
     val listState = rememberLazyListState()
+    // The quick reply floats over the end of the list, whose viewport runs on
+    // underneath it. What the reader can see ends at the card's top, so
+    // everything that asks where the viewport ends — read marking, the
+    // keyboard anchor — takes the card's height off first.
+    var replyBarHeightPx by remember { mutableIntStateOf(0) }
+    // The header pinned over a long message, its top gap included; zero while
+    // nothing is pinned.
+    var pinnedHeaderHeightPx by remember { mutableIntStateOf(0) }
+    // The conversation, captured for the frosted bands at either end of it.
+    val hazeState = rememberHazeState()
+    val showReplyBar = thread != null && !isRss && messages.isNotEmpty()
+    val replyOverlayPx by rememberUpdatedState(if (showReplyBar) replyBarHeightPx else 0)
     var endFollowRequest by remember(thread?.id) { mutableStateOf(0) }
     var followNextLocalSend by remember(thread?.id) { mutableStateOf(false) }
     var keyboardAnchor by remember(thread?.id) { mutableStateOf<Pair<String, Int>?>(null) }
+    // Expanding or collapsing a card can dispose the view that holds focus (the
+    // tapped card, or its web view), and focus then falls to the next focusable
+    // thing, the quick reply, which opens the keyboard. Drop focus first, unless
+    // the reply is what the reader is typing in.
+    val focusManager = LocalFocusManager.current
+    val releaseFocusBeforeToggle = { if (keyboardAnchor == null) focusManager.clearFocus() }
     val currentMessages by rememberUpdatedState(messages)
     val currentHeaderItemCount by rememberUpdatedState(threadHeaderItemCount(canLoadOlder || loadingOlder))
 
+    // The one list item the conversation holds at the top of the viewport, and
+    // the sole owner of the scroll while it does. Both the open positioning and
+    // an expanded message publish their target here rather than driving the
+    // list themselves: a single slot means expanding a message during the open
+    // settle window supersedes that positioning — cancelling it outright —
+    // instead of the two pulling the list in different directions on every
+    // layout change. Cleared once the anchor is released.
+    var anchorItem by remember(thread?.id) { mutableStateOf<ThreadListAnchor?>(null) }
+
     fun requestEndFollow() {
+        // Following the end takes the list over from whatever message was being
+        // held at the top; left running, the two would pull it opposite ways on
+        // every layout change.
+        anchorItem = null
         endFollowRequest += 1
     }
 
@@ -298,6 +397,48 @@ internal fun ThreadScreen(
             }
         }
     }
+    // Expand all / collapse all with the reader at the end of the thread. The
+    // list holds the item at the top of the screen, which in a short thread is
+    // the first summary line, so everything above the newest message opening
+    // would carry the reader off to the start. They were reading the newest
+    // message, which neither action collapses: hold the end instead, while the
+    // bodies settle, unless the reader drags or a message anchor (a summary
+    // tapped open) takes the list over.
+    var endHoldRequest by remember(thread?.id) { mutableStateOf(0) }
+    LaunchedEffect(endHoldRequest) {
+        if (endHoldRequest == 0) return@LaunchedEffect
+        anchorItem = null
+        withTimeoutOrNull(THREAD_OPEN_ANCHOR_WINDOW_MS) {
+            coroutineScope {
+                val holder =
+                    launch {
+                        // Null once an anchor is set, which ends the hold.
+                        snapshotFlow {
+                            if (anchorItem != null) null else listState.layoutInfo.visibleItemsInfo.map { it.index to it.size }
+                        }.distinctUntilChanged()
+                            .takeWhile { it != null }
+                            .collect {
+                                if (!listState.canScrollForward) return@collect
+                                val last = listState.layoutInfo.totalItemsCount - 1
+                                if (last < 0) return@collect
+                                // To the newest message's top, then on to the
+                                // end: its bottom is what was on screen.
+                                listState.scrollToItem(last)
+                                val info = listState.layoutInfo
+                                val lastSize = info.visibleItemsInfo.lastOrNull()?.size ?: 0
+                                listState.scrollBy((lastSize + info.viewportEndOffset).toFloat())
+                            }
+                    }
+                val dragWatch =
+                    launch {
+                        listState.interactionSource.interactions.first { it is DragInteraction.Start }
+                        holder.cancel()
+                    }
+                holder.join()
+                dragWatch.cancel()
+            }
+        }
+    }
     LaunchedEffect(messages.lastOrNull()?.id) {
         if (!followNextLocalSend || messages.lastOrNull()?.id?.startsWith("local-send-") != true) return@LaunchedEffect
         followNextLocalSend = false
@@ -312,7 +453,7 @@ internal fun ThreadScreen(
                         val info = listState.layoutInfo
                         val messageIndex = currentMessages.indexOfFirst { it.id == messageId }
                         Triple(
-                            info.viewportStartOffset to info.viewportEndOffset,
+                            info.viewportStartOffset to info.viewportEndOffset - replyOverlayPx,
                             info.visibleItemsInfo.map { ListItemGeometry(it.index, it.offset, it.size) },
                             messageIndex.takeIf { it >= 0 }?.plus(currentHeaderItemCount),
                         )
@@ -337,14 +478,6 @@ internal fun ThreadScreen(
     // place leaves the body wherever the tap happened to be; bring its header
     // to the top of the viewport so the message reads from its beginning.
     var scrollToExpandedId by remember(thread?.id) { mutableStateOf<String?>(null) }
-    // The one list item the conversation holds at the top of the viewport, and
-    // the sole owner of the scroll while it does. Both the open positioning and
-    // an expanded message publish their target here rather than driving the
-    // list themselves: a single slot means expanding a message during the open
-    // settle window supersedes that positioning — cancelling it outright —
-    // instead of the two pulling the list in different directions on every
-    // layout change. Cleared once the anchor is released.
-    var anchorItem by remember(thread?.id) { mutableStateOf<ThreadListAnchor?>(null) }
     LaunchedEffect(anchorItem) {
         val anchorTo = anchorItem ?: return@LaunchedEffect
         // Resolved fresh on every scroll rather than captured once: loading an
@@ -458,7 +591,7 @@ internal fun ThreadScreen(
                     firstVisibleIndex = listState.firstVisibleItemIndex,
                     visible = info.visibleItemsInfo.map { ListItemGeometry(it.index, it.offset, it.size) },
                     totalItemCount = info.totalItemsCount,
-                    viewportEndOffset = info.viewportEndOffset,
+                    viewportEndOffset = info.viewportEndOffset - replyOverlayPx,
                 )
             }.collect { snapshot ->
                 val msgs = currentMessages
@@ -479,7 +612,10 @@ internal fun ThreadScreen(
                         topSlackPx = topSlackPx,
                         viewportEndOffset = snapshot.viewportEndOffset,
                     ).mapNotNull { msgs.getOrNull(it) }
-                        .filter { it.unread }
+                        // A body still loading (or failed) shows only a short
+                        // placeholder, which fits on screen without having been
+                        // read. It is marked once the body lands and relayouts.
+                        .filter { it.unread && !it.bodyMissing }
                         .map { it.id }
                         .filter { it !in heldUnreadIds }
                         .filter { markedReadIds.add(it) }
@@ -496,7 +632,13 @@ internal fun ThreadScreen(
                 // stand down while a hand-unread message is on screen, or it
                 // undoes the action the held set just protected. It resumes as
                 // soon as that message scrolls out of view.
-                if (atBottom && heldUnreadIds.isEmpty() && (!viewedToBottomSent || msgs.any { it.unread })) {
+                // It also waits for placeholder bodies, for the same reason.
+                if (
+                    atBottom &&
+                    heldUnreadIds.isEmpty() &&
+                    msgs.none { it.unread && it.bodyMissing } &&
+                    (!viewedToBottomSent || msgs.any { it.unread })
+                ) {
                     viewedToBottomSent = true
                     currentOnViewedToBottom()
                 }
@@ -581,149 +723,190 @@ internal fun ThreadScreen(
         Scaffold(
             topBar = {
                 TopAppBar(
-                    title = {
-                        Column(Modifier.clickable { detailsOpen = true }) {
-                            Text(
-                                thread?.subject?.ifBlank { "(no subject)" } ?: "Conversation",
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontWeight = FontWeight.SemiBold,
-                                style = MaterialTheme.typography.titleMedium,
-                            )
-                            val subtitle = threadHeaderSubtitle(messages, isRss)
-                            if (subtitle.isNotBlank()) {
-                                Text(
-                                    subtitle,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                    },
+                    // The subject is at the top of the list instead, in full;
+                    // the bar keeps only its floating buttons.
+                    title = {},
                     navigationIcon = {
-                        IconButton(onClick = onBack) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = tr("buttons.back"))
+                        FloatingBarChip(CircleShape, Modifier.padding(start = 4.dp).width(FLOATING_BAR_CHIP_HEIGHT)) {
+                            IconButton(onClick = onBack) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = tr("buttons.back"))
+                            }
                         }
                     },
                     actions = {
-                        if (printing) CircularProgressIndicator(Modifier.size(20.dp))
-                        IconButton(onClick = onToggleStar) {
-                            Icon(
-                                if (thread?.starred == true) Icons.Filled.Star else Icons.Filled.StarBorder,
-                                contentDescription = tr("chat.star"),
-                                tint = if (thread?.starred == true) chat.star else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        Box {
-                            IconButton(onClick = { overflowOpen = true }) {
-                                Icon(Icons.Filled.MoreVert, contentDescription = tr("chat.moreActions"))
+                        FloatingBarChip(RoundedCornerShape(50), Modifier.padding(end = 4.dp)) {
+                            if (printing) CircularProgressIndicator(Modifier.padding(start = 12.dp).size(20.dp))
+                            // On the bar, like the desktop header's, and not the
+                            // Tasks screen's checklist icon: this files the thread.
+                            if (onAddToTasks != null) {
+                                IconButton(onClick = onAddToTasks) {
+                                    Icon(Icons.AutoMirrored.Filled.PlaylistAdd, contentDescription = tr("tasks.addFromMessage"))
+                                }
                             }
-                            DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
-                                DropdownMenuItem(
-                                    text = { Text(if (isRss) tr("feeds.actions.deleteFeed") else tr("threads.actions.archiveThread")) },
-                                    leadingIcon = { Icon(if (isRss) Icons.Filled.Delete else Icons.Filled.Archive, contentDescription = null) },
-                                    onClick = {
-                                        overflowOpen = false
-                                        onArchive()
-                                    },
+                            IconButton(onClick = onToggleStar) {
+                                Icon(
+                                    if (thread?.starred == true) Icons.Filled.Star else Icons.Filled.StarBorder,
+                                    contentDescription = tr("chat.star"),
+                                    tint = if (thread?.starred == true) chat.star else MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
-                                DropdownMenuItem(
-                                    text = { Text(tr("chat.searchThread")) },
-                                    leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                                    onClick = {
-                                        overflowOpen = false
-                                        searchOpen = !searchOpen
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text(if (isRss) tr("chat.feedDetails") else tr("chat.conversationDetails")) },
-                                    leadingIcon = { Icon(Icons.Filled.Info, contentDescription = null) },
-                                    onClick = {
-                                        overflowOpen = false
-                                        detailsOpen = true
-                                    },
-                                )
-                                if (!isRss) {
+                            }
+                            Box {
+                                IconButton(onClick = { overflowOpen = true }) {
+                                    Icon(Icons.Filled.MoreVert, contentDescription = tr("chat.moreActions"))
+                                }
+                                DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
                                     DropdownMenuItem(
-                                        text = { Text(tr("chat.actions.printThread")) },
-                                        trailingIcon = { if (printing) CircularProgressIndicator(Modifier.size(16.dp)) },
-                                        enabled = !printing && thread != null,
+                                        text = { Text(if (isRss) tr("feeds.actions.deleteFeed") else tr("threads.actions.archiveThread")) },
+                                        leadingIcon = { Icon(if (isRss) Icons.Filled.Delete else Icons.Filled.Archive, contentDescription = null) },
                                         onClick = {
                                             overflowOpen = false
-                                            printing = true
-                                            val subject = thread?.subject.orEmpty()
-                                            printScope.launch {
-                                                try {
-                                                    printThread(subject, loadPrintMessages())
-                                                } catch (error: kotlinx.coroutines.CancellationException) {
-                                                    throw error
-                                                } catch (_: Exception) {
-                                                    onPrintError(printError)
-                                                } finally {
-                                                    printing = false
-                                                }
-                                            }
+                                            onArchive()
                                         },
                                     )
-                                    // Hidden when the reply target has no other
-                                    // recipients: a reply-all identical to the
-                                    // reply is a second name for the same action.
-                                    if (canReplyAllToThread) {
+                                    DropdownMenuItem(
+                                        text = { Text(tr("chat.searchThread")) },
+                                        leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+                                        onClick = {
+                                            overflowOpen = false
+                                            searchOpen = !searchOpen
+                                        },
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text(if (isRss) tr("chat.feedDetails") else tr("chat.conversationDetails")) },
+                                        leadingIcon = { Icon(Icons.Filled.Info, contentDescription = null) },
+                                        onClick = {
+                                            overflowOpen = false
+                                            detailsOpen = true
+                                        },
+                                    )
+                                    expandAllAction?.let { expand ->
                                         DropdownMenuItem(
-                                            text = { Text(tr("chat.actions.replyAll")) },
-                                            leadingIcon = { Icon(Icons.AutoMirrored.Filled.ReplyAll, contentDescription = null) },
+                                            text = { Text(if (expand) tr("chat.expandAll") else tr("chat.collapseAll")) },
+                                            leadingIcon = {
+                                                Icon(
+                                                    if (expand) Icons.Filled.UnfoldMore else Icons.Filled.UnfoldLess,
+                                                    contentDescription = null,
+                                                )
+                                            },
                                             onClick = {
                                                 overflowOpen = false
-                                                onReplyAll()
+                                                releaseFocusBeforeToggle()
+                                                // The list keeps the message at the top of
+                                                // the screen where it is as the rows
+                                                // around it change height — or, for a
+                                                // reader at the end, the end.
+                                                if (!listState.canScrollForward) endHoldRequest += 1
+                                                expandOverrides = emptyMap()
+                                                expandAll = expand
                                             },
                                         )
                                     }
-                                    DropdownMenuItem(
-                                        text = { Text(if (preferHtml) "View as plain text" else "View as HTML") },
-                                        leadingIcon = { Icon(Icons.Filled.Code, contentDescription = null) },
-                                        onClick = {
+                                    if (!isRss) {
+                                        DropdownMenuItem(
+                                            text = { Text(tr("chat.actions.printThread")) },
+                                            leadingIcon = { Icon(Icons.Filled.Print, contentDescription = null) },
+                                            trailingIcon = { if (printing) CircularProgressIndicator(Modifier.size(16.dp)) },
+                                            enabled = !printing && thread != null,
+                                            onClick = {
+                                                overflowOpen = false
+                                                printing = true
+                                                val subject = thread?.subject.orEmpty()
+                                                printScope.launch {
+                                                    try {
+                                                        printThread(subject, loadPrintMessages())
+                                                    } catch (error: kotlinx.coroutines.CancellationException) {
+                                                        throw error
+                                                    } catch (_: Exception) {
+                                                        onPrintError(printError)
+                                                    } finally {
+                                                        printing = false
+                                                    }
+                                                }
+                                            },
+                                        )
+                                        // Hidden when the reply target has no other
+                                        // recipients: a reply-all identical to the
+                                        // reply is a second name for the same action.
+                                        if (canReplyAllToThread) {
+                                            DropdownMenuItem(
+                                                text = { Text(tr("chat.actions.replyAll")) },
+                                                leadingIcon = { Icon(Icons.AutoMirrored.Filled.ReplyAll, contentDescription = null) },
+                                                onClick = {
+                                                    overflowOpen = false
+                                                    onReplyAll()
+                                                },
+                                            )
+                                        }
+                                        DropdownMenuItem(
+                                            text = { Text(if (preferHtml) tr("chat.viewAsPlainText") else tr("chat.viewAsHtml")) },
+                                            leadingIcon = { Icon(Icons.Filled.Code, contentDescription = null) },
+                                            onClick = {
+                                                overflowOpen = false
+                                                onPreferHtmlChange(!preferHtml)
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(tr("threads.actions.moveTo")) },
+                                            leadingIcon = { Icon(Icons.Outlined.FolderOpen, contentDescription = null) },
+                                            onClick = {
+                                                overflowOpen = false
+                                                loadTransferFolders()
+                                                moveDialogOpen = true
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text(tr("threads.actions.copyTo")) },
+                                            leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
+                                            onClick = {
+                                                overflowOpen = false
+                                                loadTransferFolders()
+                                                copyDialogOpen = true
+                                            },
+                                        )
+                                        RecentThreadTransferMenuItems(recentTransfers) { item ->
                                             overflowOpen = false
-                                            onPreferHtmlChange(!preferHtml)
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text(tr("threads.actions.moveTo")) },
-                                        leadingIcon = { Icon(Icons.Outlined.FolderOpen, contentDescription = null) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            moveDialogOpen = true
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text(tr("threads.actions.copyTo")) },
-                                        leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            copyDialogOpen = true
-                                        },
-                                    )
-                                    DropdownMenuItem(
-                                        text = { Text(deleteLabel, color = MaterialTheme.colorScheme.error) },
-                                        leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                                        onClick = {
-                                            overflowOpen = false
-                                            onDelete()
-                                        },
-                                    )
+                                            if (item.transfer.action == "move") onMoveToFolder(item.folder) else onCopyToFolder(item.folder)
+                                        }
+                                        DropdownMenuItem(
+                                            text = { Text(deleteLabel, color = MaterialTheme.colorScheme.error) },
+                                            leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                                            onClick = {
+                                                overflowOpen = false
+                                                onDelete()
+                                            },
+                                        )
+                                    }
                                 }
                             }
                         }
                     },
+                    // See-through: the conversation scrolls on under the bar,
+                    // between its floating chips, and under the status bar.
+                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent, scrolledContainerColor = Color.Transparent),
                 )
             },
             snackbarHost = { SnackbarHost(snackbarHost) },
         ) { innerPadding ->
+            val layoutDirection = LocalLayoutDirection.current
+            val barHeight = innerPadding.calculateTopPadding()
+            // The list runs up under the app bar, except while the search bar
+            // sits between them.
+            val underBar = if (searchOpen) 0.dp else barHeight
+            val underBarPx = with(LocalDensity.current) { underBar.roundToPx() }
+            // And down under the navigation bar, below the reply card, which
+            // itself stays above it.
+            val navBarHeight = innerPadding.calculateBottomPadding()
+            val contentPadding =
+                PaddingValues(
+                    start = innerPadding.calculateStartPadding(layoutDirection),
+                    top = barHeight - underBar,
+                    end = innerPadding.calculateEndPadding(layoutDirection),
+                )
             if (moveDialogOpen && thread != null) {
                 MoveThreadDialog(
                     thread = thread,
                     folders = targetMoveFolders,
+                    accounts = transferAccounts,
                     onMove = { folder ->
                         moveDialogOpen = false
                         onMoveToFolder(folder)
@@ -739,6 +922,7 @@ internal fun ThreadScreen(
                 CopyThreadDialog(
                     thread = thread,
                     folders = targetCopyFolders,
+                    accounts = transferAccounts,
                     onCopy = { folder ->
                         copyDialogOpen = false
                         onCopyToFolder(folder)
@@ -746,11 +930,18 @@ internal fun ThreadScreen(
                     onDismiss = { copyDialogOpen = false },
                 )
             }
+            // Behind the reply card as well as the messages, so the card floats
+            // on the conversation. Not inside the keyboard's padding: the
+            // picture keeps its crop while the keyboard comes and goes.
+            ChatWallpaperBackground(
+                presetId = wallpaperPresetId,
+                customUrl = wallpaperCustomUrl,
+                modifier = Modifier.fillMaxSize().padding(contentPadding).hazeSource(hazeState, zIndex = 0f),
+            )
             Column(
                 Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.background)
-                    .padding(innerPadding)
+                    .padding(contentPadding)
                     .consumeWindowInsets(innerPadding)
                     .imePadding(),
             ) {
@@ -766,30 +957,35 @@ internal fun ThreadScreen(
                     )
                 }
                 Box(Modifier.weight(1f).fillMaxWidth()) {
-                    ChatWallpaperBackground(
-                        presetId = wallpaperPresetId,
-                        customUrl = wallpaperCustomUrl,
-                        modifier = Modifier.matchParentSize(),
-                    )
                     if (messages.isEmpty()) {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator()
                         }
                     } else {
                         val traditional = conversationLayout == ConversationLayout.Traditional
+                        val sidePadding = if (traditional) 8.dp else 12.dp
+                        val edgePadding = if (traditional) 8.dp else 16.dp
+                        // The last message scrolls clear of the reply card,
+                        // whose own top margin is the gap between the two.
+                        val replyBarHeight = with(LocalDensity.current) { replyOverlayPx.toDp() }
                         LazyColumn(
-                            Modifier.fillMaxSize().appScrollbar(listState),
+                            Modifier
+                                .fillMaxSize()
+                                .hazeSource(hazeState, zIndex = 1f)
+                                .appScrollbar(listState),
                             state = listState,
                             contentPadding =
                                 PaddingValues(
-                                    horizontal = if (traditional) 8.dp else 12.dp,
-                                    vertical = if (traditional) 8.dp else 16.dp,
+                                    start = sidePadding,
+                                    end = sidePadding,
+                                    top = underBar + edgePadding,
+                                    // The reply card's measured height takes in the navigation bar.
+                                    bottom = if (replyOverlayPx > 0) replyBarHeight else navBarHeight + edgePadding,
                                 ),
                             verticalArrangement = Arrangement.spacedBy(if (traditional) 6.dp else 10.dp),
                         ) {
-                            // The app bar clips the subject to one line, so repeat it
-                            // in full at the top of the list. It scrolls away with the
-                            // messages; the bar title stays as the fallback.
+                            // The subject, in full, at the top of the list. It
+                            // scrolls away with the messages.
                             item {
                                 Text(
                                     (thread?.subject ?: "").ifBlank { tr("threads.noSubject") },
@@ -823,6 +1019,7 @@ internal fun ThreadScreen(
                                         activeSearchMatch = message.id == activeSearchId,
                                         expanded = expanded,
                                         onToggleExpanded = {
+                                            releaseFocusBeforeToggle()
                                             expandOverrides = expandOverrides + (message.id to !expanded)
                                             if (!expanded) scrollToExpandedId = message.id
                                         },
@@ -846,9 +1043,11 @@ internal fun ThreadScreen(
                                         onOpenHtmlImage = ::openGalleryForHtmlSrc,
                                         onCopyMessageText = onCopyMessageText,
                                         onComposeTo = onComposeTo,
-                                        onOpenMessage = { readerMessage = it },
                                         onOpenUrl = services::openUrl,
                                         onRetryLoad = onRetryLoadMessages,
+                                        onRespondToInvite = onRespondToInvite,
+                                        onRemoveInviteEvent = onRemoveInviteEvent,
+                                        onAddInviteToCalendar = onAddInviteToCalendar,
                                     )
                                 } else {
                                     MessageBubble(
@@ -881,6 +1080,9 @@ internal fun ThreadScreen(
                                         onOpenMessage = { readerMessage = it },
                                         onOpenUrl = services::openUrl,
                                         onRetryLoad = onRetryLoadMessages,
+                                        onRespondToInvite = onRespondToInvite,
+                                        onRemoveInviteEvent = onRemoveInviteEvent,
+                                        onAddInviteToCalendar = onAddInviteToCalendar,
                                     )
                                 }
                             }
@@ -888,6 +1090,42 @@ internal fun ThreadScreen(
                                 Spacer(Modifier.height(1.dp))
                             }
                         }
+                        // What scrolls on under the status bar and the app bar,
+                        // down to the middle of the pinned header while there
+                        // is one, is frosted; so is what shows around the reply
+                        // card and under the navigation bar, from a line the
+                        // card itself covers: below its top margin and the
+                        // curve of its corners. Over the list, under the pinned
+                        // header and the card.
+                        val fadePx = with(LocalDensity.current) { 16.dp.toPx() }
+                        val topBandPx =
+                            when {
+                                // Its measured height takes in the bar it sits below.
+                                pinnedHeaderHeightPx > 0 -> underBarPx + (pinnedHeaderHeightPx - underBarPx) / 2
+
+                                else -> underBarPx
+                            }
+                        val bottomBandPx =
+                            if (replyOverlayPx > 0) {
+                                with(LocalDensity.current) { replyOverlayPx - (REPLY_CARD_TOP_MARGIN + REPLY_CARD_RADIUS).roundToPx() }
+                            } else {
+                                with(LocalDensity.current) { navBarHeight.roundToPx() }
+                            }
+                        FrostedBand(
+                            hazeState,
+                            heightPx = topBandPx,
+                            // Soft where it ends in the open; the pinned header covers its end otherwise.
+                            fadeAtBottomPx = if (pinnedHeaderHeightPx > 0) 0f else fadePx,
+                            // A little heavier: the status bar's icons sit on it.
+                            tintAlpha = 0.4f,
+                            modifier = Modifier.align(Alignment.TopCenter),
+                        )
+                        FrostedBand(
+                            hazeState,
+                            heightPx = bottomBandPx,
+                            fadeAtTopPx = fadePx,
+                            modifier = Modifier.align(Alignment.BottomCenter),
+                        )
                         // Reading a message taller than the screen scrolls its
                         // header away, and with it the tap target that collapses
                         // the message again. Float a copy of that header at the
@@ -899,14 +1137,15 @@ internal fun ThreadScreen(
                             // Recomputed on every recomposition so the derived
                             // state below never reads a stale expansion map.
                             val expandedFlags by rememberUpdatedState(messages.map(::isMessageExpanded))
-                            val pinnedIndex by remember(headerItemCount, messages.size) {
+                            val pinnedIndex by remember(headerItemCount, messages.size, underBarPx) {
                                 derivedStateOf {
                                     val info = listState.layoutInfo
                                     pinnedHeaderMessageIndex(
                                         visible = info.visibleItemsInfo.map { ListItemGeometry(it.index, it.offset, it.size) },
                                         headerItemCount = headerItemCount,
                                         messageCount = expandedFlags.size,
-                                        viewportStartOffset = info.viewportStartOffset,
+                                        // The bottom of the app bar, not the top of the screen.
+                                        viewportStartOffset = info.viewportStartOffset + underBarPx,
                                         minRemainingPx = minRemainingPx,
                                         expanded = { index -> expandedFlags.getOrElse(index) { false } },
                                     )
@@ -916,14 +1155,23 @@ internal fun ThreadScreen(
                             pinnedMessage?.let { message ->
                                 val outgoing = isOutgoing(message, accountEmail)
                                 val textColor = MaterialTheme.colorScheme.onSurface
+                                DisposableEffect(Unit) { onDispose { pinnedHeaderHeightPx = 0 } }
+                                // A card floating on the conversation, drawn
+                                // like the reply card at the other end of it.
                                 Surface(
                                     color = MaterialTheme.colorScheme.surface,
-                                    shape = RoundedCornerShape(topStart = 12.dp, topEnd = 12.dp),
-                                    shadowElevation = 3.dp,
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                                    shape = RoundedCornerShape(16.dp),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                                    shadowElevation = FLOATING_CARD_ELEVATION,
+                                    modifier =
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .onSizeChanged { pinnedHeaderHeightPx = it.height }
+                                            .padding(start = 8.dp, end = 8.dp, top = underBar + 6.dp),
                                 ) {
-                                    Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                    Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp)) {
                                         MessageRowHeader(
+                                            compact = true,
                                             message = message,
                                             senderLabel = messageSenderLabel(message, outgoing),
                                             outgoing = outgoing,
@@ -937,6 +1185,7 @@ internal fun ThreadScreen(
                                             actionsEnabled = !isRss,
                                             itemActionsEnabled = true,
                                             onToggleExpanded = {
+                                                releaseFocusBeforeToggle()
                                                 expandOverrides = expandOverrides + (message.id to false)
                                             },
                                             onForward = onForward,
@@ -948,53 +1197,67 @@ internal fun ThreadScreen(
                                             onToggleStarred = onToggleMessageStarred,
                                             onDelete = onDeleteMessage,
                                             onCopyMessageText = onCopyMessageText,
+                                            onOpenUrl = services::openUrl,
                                             onComposeTo = onComposeTo,
-                                            onOpenMessage = { readerMessage = it },
                                         )
                                     }
                                 }
                             }
                         }
                     }
-                }
-                if (thread != null && !isRss && messages.isNotEmpty()) {
-                    ReplyBar(
-                        value = quickReplyBody,
-                        onChange = onQuickReplyChange,
-                        attachments = quickReplyAttachments,
-                        failureMessage = quickReplyFailure,
-                        sendShortcutMode = sendShortcutMode,
-                        onAttach = onQuickReplyAttach,
-                        onRemoveAttachment = onRemoveQuickReplyAttachment,
-                        onOpenFullEditor = onOpenFullReply,
-                        onFocusChange = { focused ->
-                            keyboardAnchor =
-                                if (focused) {
-                                    val info = listState.layoutInfo
-                                    bottomVisibleMessageAnchor(
-                                        visible = info.visibleItemsInfo.map { ListItemGeometry(it.index, it.offset, it.size) },
-                                        headerItemCount = currentHeaderItemCount,
-                                        messageCount = messages.size,
-                                        viewportStartOffset = info.viewportStartOffset,
-                                        viewportEndOffset = info.viewportEndOffset,
-                                    )?.let { anchor -> messages.getOrNull(anchor.messageIndex)?.id?.let { it to anchor.bottomGapPx } }
-                                } else {
-                                    null
-                                }
-                        },
-                        onSend = {
-                            keyboardAnchor = null
-                            followNextLocalSend = !listState.canScrollForward
-                            onSendReply()
-                        },
-                        onRetry = onRetryReply,
-                        hasContent = quickReplyHasContent,
-                        sending = quickReplySending,
-                        fromIdentities = quickReplyFromIdentities,
-                        recipients = quickReplyRecipients,
-                        selectedFrom = quickReplySelectedFrom,
-                        onSelectFrom = onSelectQuickReplyFrom,
-                    )
+                    // Over the list rather than under it: messages scroll on
+                    // behind the card, like desktop's composer.
+                    if (showReplyBar) {
+                        // With the keyboard up, the list already stops the
+                        // navigation bar's height into it, so the same padding
+                        // puts the card right on top of the keyboard.
+                        Box(
+                            Modifier
+                                .align(Alignment.BottomCenter)
+                                .onSizeChanged { replyBarHeightPx = it.height }
+                                .padding(bottom = navBarHeight),
+                        ) {
+                            ReplyBar(
+                                value = quickReplyBody,
+                                onChange = onQuickReplyChange,
+                                attachments = quickReplyAttachments,
+                                failureMessage = quickReplyFailure,
+                                sendShortcutMode = sendShortcutMode,
+                                onAttach = onQuickReplyAttach,
+                                onRemoveAttachment = onRemoveQuickReplyAttachment,
+                                onOpenFullEditor = onOpenFullReply,
+                                onFocusChange = { focused ->
+                                    keyboardAnchor =
+                                        if (focused) {
+                                            val info = listState.layoutInfo
+                                            bottomVisibleMessageAnchor(
+                                                visible = info.visibleItemsInfo.map { ListItemGeometry(it.index, it.offset, it.size) },
+                                                headerItemCount = currentHeaderItemCount,
+                                                messageCount = messages.size,
+                                                viewportStartOffset = info.viewportStartOffset + underBarPx,
+                                                viewportEndOffset = info.viewportEndOffset - replyOverlayPx,
+                                            )?.let { anchor -> messages.getOrNull(anchor.messageIndex)?.id?.let { it to anchor.bottomGapPx } }
+                                        } else {
+                                            null
+                                        }
+                                },
+                                onSend = {
+                                    keyboardAnchor = null
+                                    // The reader's own reply is followed from wherever
+                                    // they had scrolled to, unlike mail that arrives.
+                                    followNextLocalSend = true
+                                    onSendReply()
+                                },
+                                onRetry = onRetryReply,
+                                hasContent = quickReplyHasContent,
+                                sending = quickReplySending,
+                                fromIdentities = quickReplyFromIdentities,
+                                recipients = quickReplyRecipients,
+                                selectedFrom = quickReplySelectedFrom,
+                                onSelectFrom = onSelectQuickReplyFrom,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1028,6 +1291,7 @@ internal fun ThreadScreen(
             MessageReaderScreen(
                 message = reader,
                 preferHtml = preferHtml,
+                isRss = isRss,
                 actionsEnabled = !isRss,
                 remoteContent = remoteContentFor(reader),
                 onBack = { readerMessage = null },
@@ -1035,6 +1299,11 @@ internal fun ThreadScreen(
                 onComposeTo = { email ->
                     readerMessage = null
                     onComposeTo(email)
+                },
+                bottomActions = readerBottomActions,
+                onReplyToMessage = { message ->
+                    readerMessage = null
+                    onReplyToMessage(message)
                 },
                 canReplyAllToMessage = canReplyAllToMessage,
                 onReplyAllToMessage = { message ->
@@ -1193,8 +1462,9 @@ internal fun ConversationDetailsScreen(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
                         )
+                        val feedUrlLabel = tr("chat.feedUrl")
                         IconButton(
-                            onClick = { onCopy("Feed URL", feedUrl) },
+                            onClick = { onCopy(feedUrlLabel, feedUrl) },
                             modifier = Modifier.size(36.dp),
                         ) {
                             Icon(
@@ -1254,8 +1524,9 @@ internal fun ConversationDetailsScreen(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            val emailLabel = tr("accounts.fields.emailAddress")
                             IconButton(
-                                onClick = { onCopy("Email address", person.email) },
+                                onClick = { onCopy(emailLabel, person.email) },
                                 modifier = Modifier.size(36.dp),
                             ) {
                                 Icon(
@@ -1443,6 +1714,100 @@ internal fun ConversationSearchBar(
     }
 }
 
+private val REPLY_CARD_TOP_MARGIN = 8.dp
+private val REPLY_CARD_RADIUS = 24.dp
+
+// The reply card and the pinned header ride over the conversation, so they
+// sit higher than the bubbles (3.dp) that scroll under them.
+private val FLOATING_CARD_ELEVATION = 4.dp
+internal val FLOATING_BAR_CHIP_HEIGHT = 48.dp
+
+// A card floating on content that scrolls on under it, drawn like the reply
+// card and the pinned header.
+@Composable
+internal fun FloatingCard(
+    shape: Shape,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = shape,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+        shadowElevation = FLOATING_CARD_ELEVATION,
+        modifier = modifier,
+        content = content,
+    )
+}
+
+// One of an app bar's controls, floating on the content that scrolls on under
+// the bar.
+@Composable
+internal fun FloatingBarChip(
+    shape: Shape,
+    modifier: Modifier = Modifier,
+    content: @Composable RowScope.() -> Unit,
+) {
+    FloatingCard(shape, modifier.height(FLOATING_BAR_CHIP_HEIGHT)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center, content = content)
+    }
+}
+
+/**
+ * Frosts what [hazeState]'s sources draw behind this band: content scrolling on
+ * under the system bars and the floating controls stays visible as movement
+ * without its text competing with them. [fadeAtTopPx] and [fadeAtBottomPx]
+ * soften an edge that shows in the open.
+ *
+ * The sources are drawn into an offscreen layer, which MailWebView.android.kt
+ * notes crashes Android's WebView natively on some GL-pipeline devices. A Pixel
+ * 3a on Skia GL renders HTML bodies into it fine; fall back to a plain veil if
+ * reports say otherwise.
+ */
+@Composable
+internal fun FrostedBand(
+    hazeState: HazeState,
+    heightPx: Int,
+    modifier: Modifier = Modifier,
+    fadeAtTopPx: Float = 0f,
+    fadeAtBottomPx: Float = 0f,
+    // Strong enough to keep lines of text from reading as text, light
+    // enough that they still show moving underneath.
+    tintAlpha: Float = 0.3f,
+) {
+    if (heightPx <= 0) return
+    val background = MaterialTheme.colorScheme.background
+    val style =
+        remember(background, heightPx, fadeAtTopPx, fadeAtBottomPx, tintAlpha) {
+            val height = heightPx.toFloat()
+            HazeBlurStyle {
+                backgroundColor(background)
+                blurRadius(12.dp)
+                noiseFactor(0f)
+                colorEffects(listOf(HazeColorEffect.tint(background.copy(alpha = tintAlpha))))
+                // Where blurring is unavailable (before Android 12); Haze
+                // strengthens it to make up for the missing blur.
+                fallbackColorEffect(HazeColorEffect.tint(background.copy(alpha = 0.7f)))
+                if (fadeAtTopPx > 0f || fadeAtBottomPx > 0f) {
+                    mask(
+                        Brush.verticalGradient(
+                            0f to if (fadeAtTopPx > 0f) Color.Transparent else Color.Black,
+                            (fadeAtTopPx / height).coerceIn(0f, 0.5f) to Color.Black,
+                            (1f - fadeAtBottomPx / height).coerceIn(0.5f, 1f) to Color.Black,
+                            1f to if (fadeAtBottomPx > 0f) Color.Transparent else Color.Black,
+                        ),
+                    )
+                }
+            }
+        }
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(with(LocalDensity.current) { heightPx.toDp() })
+            .hazeBlur(HazeInput.Sources(hazeState), style),
+    )
+}
+
 @Composable
 internal fun ReplyBar(
     value: String,
@@ -1466,40 +1831,24 @@ internal fun ReplyBar(
     selectedFrom: SendIdentity? = null,
     onSelectFrom: (SendIdentity) -> Unit = {},
 ) {
-    Surface(tonalElevation = 3.dp, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-        Column(
-            Modifier.fillMaxWidth().padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            val showRecipients = addressChipItems(recipients.to).isNotEmpty()
-            val showFrom = selectedFrom != null && fromIdentities.size > 1
-            if (showRecipients || showFrom) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    if (showRecipients) {
-                        ReplyRecipientsRow(
-                            recipients = recipients,
-                            onOpenFullEditor = onOpenFullEditor,
-                            modifier = Modifier.weight(1f),
-                        )
-                    } else {
-                        Spacer(Modifier.weight(1f))
-                    }
-                    if (showFrom) {
-                        ReplyFromRow(
-                            identities = fromIdentities,
-                            selected = selectedFrom,
-                            onSelect = onSelectFrom,
-                            modifier = Modifier.weight(1f, fill = false),
-                        )
-                    }
-                }
-            }
+    // One rounded card floating on the conversation, like desktop's composer:
+    // the text and its controls read as a single box rather than as a field
+    // set into a bar.
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = REPLY_CARD_TOP_MARGIN, bottom = 12.dp),
+        shape = RoundedCornerShape(REPLY_CARD_RADIUS),
+        // The surface the message cards are drawn on, so the card reads as
+        // one of them rather than as a pressed or disabled slab.
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+        shadowElevation = FLOATING_CARD_ELEVATION,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(4.dp)) {
             if (attachments.isNotEmpty()) {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                LazyRow(
+                    contentPadding = PaddingValues(start = 10.dp, end = 10.dp, top = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                     items(attachments, key = { it.id }) { attachment ->
                         FilterChip(
                             selected = false,
@@ -1520,7 +1869,7 @@ internal fun ReplyBar(
             }
             if (failureMessage.isNotBlank()) {
                 Row(
-                    Modifier.fillMaxWidth(),
+                    Modifier.fillMaxWidth().padding(start = 12.dp, top = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -1536,60 +1885,104 @@ internal fun ReplyBar(
                     }
                 }
             }
-            Row(
-                Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                val canSend = !sending && hasContent
-                TextField(
-                    value = value,
-                    onValueChange = onChange,
-                    placeholder = { Text(tr("composer.placeholders.quickMessage")) },
-                    shape = RoundedCornerShape(24.dp),
-                    colors =
-                        TextFieldDefaults.colors(
-                            focusedContainerColor = MaterialTheme.colorScheme.surface,
-                            unfocusedContainerColor = MaterialTheme.colorScheme.surface,
-                            focusedIndicatorColor = Color.Transparent,
-                            unfocusedIndicatorColor = Color.Transparent,
-                            disabledIndicatorColor = Color.Transparent,
-                        ),
-                    trailingIcon = {
-                        Row {
-                            IconButton(onClick = onAttach) {
-                                Icon(Icons.Filled.AttachFile, contentDescription = tr("composer.actions.attachFiles"), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            val canSend = !sending && hasContent
+            // The text leads and has the card's full width; everything else
+            // shares the one line under it, so a phone's width goes to the
+            // reply rather than to the buttons beside it.
+            // A bare field rather than Material's, whose 56dp minimum made the
+            // card half as tall again as it needs to be. The padding is inside
+            // the field, so a tap anywhere on the row focuses it.
+            val replyTextStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface)
+            BasicTextField(
+                value = value,
+                onValueChange = onChange,
+                textStyle = replyTextStyle,
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                maxLines = 5,
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { onFocusChange(it.isFocused) }
+                        .onPreviewKeyEvent { event ->
+                            if (shouldSendFromEditor(event, sendShortcutMode) && canSend) {
+                                onSend()
+                                true
+                            } else {
+                                false
                             }
-                            IconButton(onClick = onOpenFullEditor) {
-                                Icon(Icons.Filled.OpenInFull, contentDescription = tr("composer.actions.openFullEditor"), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        },
+                decorationBox = { field ->
+                    Box(Modifier.padding(start = 14.dp, end = 14.dp, top = 12.dp, bottom = 4.dp)) {
+                        if (value.isEmpty()) {
+                            Text(
+                                tr("composer.placeholders.quickMessage"),
+                                style = replyTextStyle,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        field()
+                    }
+                },
+            )
+            Row(Modifier.fillMaxWidth().padding(start = 2.dp, end = 4.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onAttach, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        Icons.Filled.AttachFile,
+                        contentDescription = tr("composer.actions.attachFiles"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+                IconButton(onClick = onOpenFullEditor, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        Icons.Filled.OpenInFull,
+                        contentDescription = tr("composer.actions.openFullEditor"),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+                // The recipients sit against the send button and are measured
+                // first — they change from thread to thread — so the send-as
+                // address after the buttons is the one that truncates, down to
+                // a floor that keeps its picker reachable.
+                val showRecipients = addressChipItems(recipients.to).isNotEmpty()
+                val showFrom = selectedFrom != null && fromIdentities.size > 1
+                BoxWithConstraints(Modifier.weight(1f)) {
+                    val recipientsMaxWidth = if (showFrom) (maxWidth - REPLY_FROM_MIN_WIDTH).coerceAtLeast(0.dp) else maxWidth
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.weight(1f)) {
+                            if (showFrom) {
+                                ReplyFromRow(
+                                    identities = fromIdentities,
+                                    selected = selectedFrom,
+                                    onSelect = onSelectFrom,
+                                )
                             }
                         }
-                    },
-                    modifier =
-                        Modifier
-                            .weight(1f)
-                            .onFocusChanged { onFocusChange(it.isFocused) }
-                            .onPreviewKeyEvent { event ->
-                                if (shouldSendFromEditor(event, sendShortcutMode) && canSend) {
-                                    onSend()
-                                    true
-                                } else {
-                                    false
-                                }
-                            },
-                    maxLines = 5,
-                )
+                        if (showRecipients) {
+                            ReplyRecipientsRow(
+                                recipients = recipients,
+                                onOpenFullEditor = onOpenFullEditor,
+                                modifier = Modifier.widthIn(max = recipientsMaxWidth),
+                            )
+                        }
+                    }
+                }
                 FilledIconButton(
                     onClick = onSend,
                     enabled = canSend,
-                    modifier = Modifier.size(48.dp),
+                    modifier = Modifier.padding(start = 4.dp).size(40.dp),
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = tr("reply.send"))
+                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = tr("reply.send"), modifier = Modifier.size(20.dp))
                 }
             }
         }
     }
 }
+
+// The least the send-as address keeps beside long recipients: its label and
+// the dropdown arrow.
+private val REPLY_FROM_MIN_WIDTH = 72.dp
 
 // Who the reply goes to. The bar has no address fields, and a plain reply keeps
 // the Cc while dropping the other To recipients — a recipient set worth

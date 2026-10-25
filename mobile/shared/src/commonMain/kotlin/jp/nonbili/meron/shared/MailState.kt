@@ -101,6 +101,11 @@ data class FolderSummary(
     val displayName: String = name,
     /** Hierarchy separator the server reported for this mailbox, if any. */
     val delimiter: String = "",
+    /** The user opted this folder in to background sync and new-mail notifications. */
+    val notify: Boolean = false,
+    /** Opted in and holding one of the account's IMAP IDLE slots. Core polls
+     *  the opted-in folders past those, so only these need a live watch. */
+    val notifyLive: Boolean = false,
 )
 
 data class ThreadSummary(
@@ -123,6 +128,10 @@ data class ThreadSummary(
     val starred: Boolean = false,
     val hasStarredItems: Boolean = false,
     val hasDraft: Boolean = false,
+    val hasAttachments: Boolean = false,
+    /** The thread's attachments in thread order, for the chips under the row;
+     *  only messages whose body is cached are known. Name and type only. */
+    val files: List<MessageAttachment> = emptyList(),
     val dateEpochSeconds: Long = 0,
     val feedUrl: String = "",
     val threadId: String = "",
@@ -215,6 +224,11 @@ data class MessageBody(
     // True when the core has no cached body for this message (the on-demand
     // fetch failed), as opposed to a message whose body is genuinely empty.
     val bodyMissing: Boolean = false,
+    // With bodyMissing: the core is downloading the body in the background, so
+    // it is not a failure yet and a re-read will deliver it.
+    val bodyLoading: Boolean = false,
+    // An RSS item's original page; empty for mail and for items without one.
+    val link: String = "",
     val attachments: List<MessageAttachment> = emptyList(),
     val sendStatus: SendStatus = SendStatus.None,
     // Who a reply to this message addresses and copies, decided by the core so
@@ -222,6 +236,11 @@ data class MessageBody(
     // locally (an optimistic send bubble) or by a version before the core sent
     // it.
     val reply: MessageReply? = null,
+    // Files the core is restoring in the background; a decrease retries failed images.
+    val mediaMissing: Int = 0,
+    // The calendar event when the message is an invitation (or an update,
+    // cancellation or reply to one).
+    val invite: MessageInvite? = null,
 )
 
 data class DraftAttachment(
@@ -261,13 +280,52 @@ data class ReplyRecipients(
 
 /** Both reply forms of one message, as the core decided them (see
  * meron-core/src/reply.rs): `to`/`cc` for a plain reply, `allTo`/`allCc` for
- * reply-all, and whether reply-all reaches anyone the plain reply does not. */
+ * reply-all, whether reply-all reaches anyone the plain reply does not, and
+ * whether a reply reaches anyone at all (false for no-reply and bounce
+ * addresses, which quick replies pass over). */
 data class MessageReply(
     val to: String = "",
     val cc: String = "",
     val allTo: String = "",
     val allCc: String = "",
     val allAddsRecipients: Boolean = false,
+    val acceptsReplies: Boolean = true,
+)
+
+/** One attendee of a calendar invitation; [partstat] is the lowercase
+ * PARTSTAT (`needs-action`, `accepted`, `tentative`, `declined`, …). */
+data class InviteAttendee(
+    val name: String = "",
+    val addr: String = "",
+    val partstat: String = "",
+)
+
+/** The calendar event a message carries, as meron-core/src/calendar.rs
+ * describes it. [start]/[end] are epoch seconds; for an all-day event they are
+ * UTC midnights with [end] exclusive, so they are formatted in UTC. */
+data class MessageInvite(
+    val method: String = "",
+    val uid: String = "",
+    val summary: String = "",
+    val location: String = "",
+    val start: Long = 0,
+    val end: Long = 0,
+    val allDay: Boolean = false,
+    val recurring: Boolean = false,
+    val cancelled: Boolean = false,
+    val organizerName: String = "",
+    val organizerAddr: String = "",
+    val attendees: List<InviteAttendee> = emptyList(),
+    /** Whether Accept / Maybe / Decline apply: an open request from someone else. */
+    val canRespond: Boolean = false,
+    /** The user's answer (`accepted`, `tentative`, `declined`), empty when none. */
+    val response: String = "",
+    /** The calendar event this invitation is filed as; empty when it is not
+     *  in the calendar. */
+    val eventId: String = "",
+    /** Which occurrence of a repeating event this is about (epoch seconds);
+     *  0 for the whole event. */
+    val recurrenceId: Long = 0,
 )
 
 fun newDraftMessageId(accountId: String = ""): String {
@@ -627,20 +685,71 @@ fun forwardedHtmlBody(
     return "$FORWARD_HTML_OPEN<p>$FORWARD_QUOTE_MARKER</p>$header<br>$body</div>"
 }
 
-// Assemble the HTML alternative for a forward at send time. The mobile composer
-// only edits plain text, so the user's own words live above the quote marker in
-// `body`; they are converted to HTML and prepended to the quote block. Returns ""
+// Assemble the HTML alternative for a forward or a quoted reply at send time.
+// The mobile composer only edits plain text, so the user's own words live above
+// the quote marker in `body` (the forward header, or a reply's attribution
+// line); they are converted to HTML and prepended to the quote block. Returns ""
 // when the marker is gone (the user deleted or rewrote the quote): there is then
 // no reliable boundary between their text and the quote, and sending plain-only
 // beats sending a body that no longer matches what they typed.
 fun forwardHtmlForSend(
     body: String,
     forwardedHtml: String,
+    marker: String = FORWARD_QUOTE_MARKER,
 ): String {
-    if (forwardedHtml.isBlank()) return ""
-    val marker = body.indexOf(FORWARD_QUOTE_MARKER)
-    if (marker < 0) return ""
-    return plainTextToHtml(body.substring(0, marker).trim()) + forwardedHtml
+    if (forwardedHtml.isBlank() || marker.isBlank()) return ""
+    val at = body.indexOf(marker)
+    if (at < 0) return ""
+    return plainTextToHtml(body.substring(0, at).trim()) + forwardedHtml
+}
+
+// The line over a quoted reply: "On <date>, Jane <jane@example.com> wrote:", as
+// the desktop composer writes it. It doubles as the reply's quote marker (see
+// [forwardHtmlForSend]).
+fun replyQuoteAttribution(
+    message: MessageBody,
+    dateLabel: String,
+): String {
+    val name = message.from.trim()
+    val addr = message.fromAddr.trim()
+    val sender =
+        when {
+            addr.isBlank() -> name
+            name.isBlank() || name.equals(addr, ignoreCase = true) -> addr
+            else -> "$name <$addr>"
+        }
+    return "On $dateLabel, $sender wrote:"
+}
+
+// Whether a reply to this message has anything to quote.
+fun hasReplyQuote(message: MessageBody): Boolean = message.body.isNotBlank() || message.bodyHtml.isNotBlank()
+
+// The original quoted under a reply, for the plain body the composer edits:
+// the attribution line, then every line of the original `> `-prefixed. Starts
+// with the blank line the user writes above it, like [forwardedPlainBody].
+fun replyQuotedPlainBody(
+    message: MessageBody,
+    dateLabel: String,
+): String {
+    val quoted =
+        message.body
+            .trimEnd()
+            .split("\n")
+            .joinToString("\n") { line -> if (line.isEmpty()) ">" else "> $line" }
+    return "\n\n${replyQuoteAttribution(message, dateLabel)}\n$quoted"
+}
+
+// The same quote for the HTML alternative, in a `<blockquote type="cite">` — the
+// shape the conversation view folds in our own sent replies. Only an HTML
+// original gets one: a text-only mail stays a text-only reply.
+fun replyQuotedHtmlBody(
+    message: MessageBody,
+    dateLabel: String,
+    inlineImages: List<ForwardInlineImage> = emptyList(),
+): String {
+    if (message.bodyHtml.isBlank()) return ""
+    val quoted = rewriteForwardMediaRefs(forwardableHtmlSource(message.bodyHtml), forwardInlineImages(message), inlineImages)
+    return "<p>${escapeHtml(replyQuoteAttribution(message, dateLabel))}</p><blockquote type=\"cite\">$quoted</blockquote>"
 }
 
 // Recover the quote block from a saved forward draft's HTML, so reopening one and

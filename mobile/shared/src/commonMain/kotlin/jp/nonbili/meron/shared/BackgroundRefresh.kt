@@ -32,15 +32,19 @@ fun backgroundRefreshDelaySeconds(pollIntervalMinutes: Int): Double {
     return maxOf(minutes, 15) * 60.0
 }
 
-fun backgroundRefreshSummary(
+/**
+ * The catalog key summing up a background refresh, for the platform to localize
+ * with `refreshed`, `skipped` and `failed` as its arguments.
+ */
+fun backgroundRefreshSummaryKey(
     refreshed: Int,
     skipped: Int,
     failed: Int,
 ): String =
     when {
-        refreshed > 0 && failed > 0 -> "$refreshed account(s) refreshed, $failed failed"
-        refreshed > 0 -> "$refreshed account(s) refreshed"
-        failed > 0 -> "$failed account(s) failed to refresh"
-        skipped > 0 -> "No accounts refreshed; $skipped skipped"
-        else -> "No accounts configured"
+        refreshed > 0 && failed > 0 -> "mobile.refresh.refreshedWithFailures"
+        refreshed > 0 -> "mobile.refresh.refreshed"
+        failed > 0 -> "mobile.refresh.failed"
+        skipped > 0 -> "mobile.refresh.skipped"
+        else -> "mobile.refresh.noAccounts"
     }

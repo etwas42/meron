@@ -1,4 +1,3 @@
-import { useRef } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from './lib/i18n'
 import { ui$ } from './states/ui'
@@ -12,18 +11,24 @@ import { useAppEffects } from './useAppEffects'
 import { SideNav } from './components/sidenav/SideNav'
 import { ThreadList } from './components/threads/ThreadList'
 import { KanbanView } from './components/kanban/KanbanView'
+import { KanbanConversationPane } from './components/kanban/KanbanConversationPane'
+import { CalendarView } from './components/calendar/CalendarView'
+import { TasksPanel } from './components/tasks/TasksPanel'
+import { TasksSlide } from './components/tasks/TasksSlide'
 import { MessagePane } from './components/chat/MessagePane'
 import { AboutDialog } from './components/dialog/AboutDialog'
 import { ChangelogDialog } from './components/dialog/ChangelogDialog'
 import { CommandPalette } from './components/palette/CommandPalette'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { AppHotkeys } from './components/dialog/AppHotkeys'
+import { QuitHotkey } from './components/dialog/QuitHotkey'
 import { ShortcutsDialog } from './components/dialog/ShortcutsDialog'
 import { AppToast } from './components/toast/AppToast'
+import { EmlExportProgress } from './components/toast/EmlExportProgress'
 import { McpApprovalDialog } from './components/dialog/McpApprovalDialog'
 import { AppConfirm } from './components/dialog/AppConfirm'
 import { CertificateTrustDialog } from './components/dialog/CertificateTrustDialog'
-import { MacTitleBar } from './components/titlebar/MacTitleBar'
+import { TitleBar, useTitleBar } from './components/titlebar/TitleBar'
 import { ConnectivityBanner } from './components/banner/ConnectivityBanner'
 import { UpdateBanner } from './components/banner/UpdateBanner'
 import { SetupScreen } from './components/setup/SetupScreen'
@@ -34,10 +39,12 @@ import { FeedEditDialog } from './components/dialog/FeedEditDialog'
 
 export default function App() {
   const { t } = useTranslation()
-  const mainRef = useRef<HTMLElement | null>(null)
   const system = useValue(ui$.system)
   const accounts = useValue(accounts$)
   const activeBoardId = useValue(kanban$.activeBoardId)
+  const tasksPanelOpen = useValue(ui$.tasksPanelOpen)
+  const calendarOpen = useValue(ui$.calendarOpen)
+  const activeTaskList = useValue(ui$.activeTaskList)
   const composeTabs = useValue(compose$.tabs)
   const activeComposeTab = useValue(compose$.activeTab)
   const threadListWidth = useValue(settings$.threadListWidth)
@@ -49,59 +56,82 @@ export default function App() {
   const editFeed = useValue(ui$.editFeed)
 
   useAppEffects()
+  // The side navigation (and Meron's title bar, when there is one) form a
+  // frame around the content, which sits on its own rounded surface (Slack,
+  // Discord, Teams). Under the system title bar the surface also stands clear
+  // of the top edge, so it looks the same in both modes.
+  const titleBar = useTitleBar()
 
   const showKanbanMessagePane = !!kanbanPaneThreadId || composeTabs.some((tab) => tab.id === activeComposeTab)
 
   if (system && accounts.length === 0) {
     return (
       <div className="flex h-full w-full flex-col bg-app text-primary">
-        <MacTitleBar />
+        <TitleBar tools={false} />
         <div className="min-h-0 flex-1">
           <SetupScreen />
         </div>
+        <QuitHotkey />
       </div>
     )
   }
 
   return (
     <div className="flex h-full w-full flex-col bg-app text-primary">
-      <MacTitleBar />
+      <TitleBar />
       <ConnectivityBanner />
       <UpdateBanner />
-      <main ref={mainRef} className="flex min-h-0 w-full flex-1 overflow-hidden">
+      <main className="flex min-h-0 w-full flex-1 bg-sidenav">
         <ErrorBoundary label="side navigation">
           <SideNav />
         </ErrorBoundary>
-        <ErrorBoundary label="thread list">
-          {activeBoardId ? (
-            <KanbanView boardId={activeBoardId} />
-          ) : (
-            <ThreadList width={threadListWidth} onResizeStart={startThreadListResize} />
-          )}
-        </ErrorBoundary>
-        {!activeBoardId ? (
-          <ErrorBoundary label="conversation">
-            <MessagePane />
+        <div className={titleBar ? 'app-frame-content' : 'app-frame-content app-frame-detached'}>
+          <ErrorBoundary label="thread list">
+            {calendarOpen ? (
+              <ErrorBoundary label="calendar">
+                <CalendarView />
+              </ErrorBoundary>
+            ) : activeBoardId ? (
+              <KanbanView
+                boardId={activeBoardId}
+                aside={
+                  <KanbanConversationPane
+                    open={showKanbanMessagePane}
+                    widthPercent={kanbanPaneWidth}
+                    resizeTitle={t('layout.resizeConversation')}
+                    onResizeStart={startKanbanResize}
+                  >
+                    <ErrorBoundary label="conversation">
+                      <MessagePane />
+                    </ErrorBoundary>
+                  </KanbanConversationPane>
+                }
+              />
+            ) : (
+              <ThreadList width={threadListWidth} onResizeStart={startThreadListResize} />
+            )}
           </ErrorBoundary>
-        ) : showKanbanMessagePane ? (
-          <div
-            className="relative flex shrink-0 overflow-hidden border-l border-border bg-chat max-[768px]:w-full"
-            style={{ width: `${kanbanPaneWidth}%`, minWidth: 320 }}
-          >
-            <div
-              className="absolute left-0 top-0 z-20 h-full w-2 -translate-x-1 cursor-col-resize"
-              onPointerDown={(event) => startKanbanResize(event, mainRef.current)}
-              title={t('layout.resizeConversation')}
-            >
-              <div className="mx-auto h-full w-px bg-transparent hover:bg-accent" />
-            </div>
+          {/* On a board the conversation opens inside KanbanView, under its
+          header; the calendar opens mail in a tab, over itself. */}
+          {!activeBoardId && !calendarOpen && (
             <ErrorBoundary label="conversation">
               <MessagePane />
             </ErrorBoundary>
-          </div>
-        ) : null}
+          )}
+
+          {/* Tasks is a panel, not a view: it sits to the right of whatever is
+          open so a list can be worked against the thread list beside it. */}
+          <TasksSlide open={tasksPanelOpen && !!activeTaskList}>
+            {activeTaskList ? (
+              <ErrorBoundary label="tasks">
+                <TasksPanel listId={activeTaskList} />
+              </ErrorBoundary>
+            ) : null}
+          </TasksSlide>
+        </div>
 
         <AppHotkeys />
+        <QuitHotkey />
         <CommandPalette />
         <ShortcutsDialog />
         <AboutDialog />
@@ -115,6 +145,7 @@ export default function App() {
         {editFeed && <FeedEditDialog />}
 
         <AppToast />
+        <EmlExportProgress />
         <AppConfirm />
         <McpApprovalDialog />
         <CertificateTrustDialog />

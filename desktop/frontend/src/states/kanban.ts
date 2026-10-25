@@ -2,7 +2,13 @@ import { observable } from '@legendapp/state'
 import type { ChatWallpaper, Folder, Message } from '../types'
 import { isFilterMode, pauseMailFolderPersist, persistMailFolder, ui$, showToast, type FilterMode } from './ui'
 import { mail$ } from './mail'
-import { folderMatches, refreshAccountFoldersCache, updateCachedFolderUnread } from './mailFolders'
+import {
+  captureFolderUnreadVersion,
+  holdFolderUnread,
+  folderMatches,
+  refreshAccountFoldersCache,
+  updateCachedFolderUnread,
+} from './mailFolders'
 import { accounts$ } from './accounts'
 import { filterThreads, isRssAccount } from '../lib/threadActions'
 import { isUnifiedStarredColumn } from '../lib/kanbanData'
@@ -10,14 +16,17 @@ import { accountFolderForRole, unifiedFolderRole } from '../lib/unifiedFolders'
 import { openMessageTab } from './compose'
 import { compose$ } from './composeState'
 import { persistedField } from '../lib/sessionPref'
-import { hasStoredKanbanBoards, settings$, type KanbanBoard } from './settings'
+import { hasStoredKanbanBoards, normalizeKanbanColumnQuery, settings$, type KanbanBoard } from './settings'
 import { invoke } from '../lib/bridge'
 import { thread$ } from './thread'
 import { t } from '../lib/i18n'
+import { boardWallpaper } from '../lib/wallpapers'
 
 export type KanbanColumn = {
   accountId: string
   folderId: string
+  /** Set on a saved search column: it always lists this folder's matches. */
+  query?: string
 }
 
 const DEFAULT_BOARD_NAME = 'Kanban board'
@@ -42,10 +51,19 @@ export const kanban$ = observable({
   // Board-wide filter from the header switch; the default for columns that don't
   // have their own filter set.
   globalFilter: 'all' as FilterMode,
+  // Per-column attachments toggle (keyed by kanbanColumnKey), overriding
+  // globalAttachmentsOnly for that column the same way `filters` does.
+  attachmentsOnly: {} as Record<string, boolean>,
+  // Board-wide attachments toggle, independent of the read-state filters above
+  // and the default for columns without their own toggle set.
+  globalAttachmentsOnly: false,
   searchQuery: '',
   searchScope: 'all',
   movingThread: '',
+  // The card conversation in the pane, behind any tabs (see kanbanPaneThreadId).
   paneThreadId: '',
+  // The column of the card last opened, as a conversation or in a tab: j/k
+  // steps through it first.
   paneColumnKey: '',
 })
 
@@ -76,16 +94,52 @@ export function activeKanbanBoard(): KanbanBoard | null {
 
 export function selectKanbanBoard(boardId: string) {
   if (!settings$.kanbanBoards.get().some((board) => board.id === boardId)) return
-  ui$.selectedThread.set('')
+  // An open tab carries over to the board's pane, and an active thread tab owns
+  // selectedThread (it renders only while the two match), so clearing it would
+  // blank the tab's conversation. Only the card conversation behind it resets.
+  const activeTab = compose$.activeTab.peek()
+  if (!compose$.tabs.peek().some((tab) => tab.id === activeTab)) ui$.selectedThread.set('')
   kanban$.paneThreadId.set('')
   kanban$.paneColumnKey.set('')
+  ui$.calendarOpen.set(false)
   kanban$.activeBoardId.set(boardId)
 }
 
-export function closeKanbanPane() {
-  ui$.selectedThread.set('')
+// The thread the board's conversation pane is showing: an active thread or
+// reader tab's own thread, else the card conversation behind the tabs. Tabs
+// opened from a card leave paneThreadId alone, so it alone would point
+// shortcuts at the wrong thread, or at none when the pane was closed.
+export function kanbanPaneThreadId(): string {
+  const activeTab = compose$.activeTab.peek()
+  const tab = compose$.tabs.peek().find((item) => item.id === activeTab)
+  if (tab && tab.kind !== 'compose') return tab.threadId
+  return kanban$.paneThreadId.peek()
+}
+
+// Close the conversation behind the tabs (the Current tab): a card opened in
+// the kanban pane, or the selected thread in the mail view. The kanban pane
+// itself only goes away when nothing else is left in it: tabs opened over the
+// conversation are rendered by this same pane, so hiding it with them still
+// open would strand them out of sight (and still in the strip when a card
+// reopens the pane).
+export function closeCurrentConversation() {
   kanban$.paneThreadId.set('')
   kanban$.paneColumnKey.set('')
+  // Nothing to return to once the card's conversation is closed, so the Current
+  // tab stops offering one (see ConversationTabs).
+  compose$.conversationThread.set('')
+  const tabs = compose$.tabs.peek()
+  const activeTab = compose$.activeTab.peek()
+  // A tab is on screen rather than the card's conversation: it owns the pane
+  // and selectedThread, which points at the thread it renders. Leave both be.
+  if (tabs.some((tab) => tab.id === activeTab)) return
+  ui$.selectedThread.set('')
+  const last = tabs[tabs.length - 1]
+  if (last) {
+    compose$.activeTab.set(last.id)
+    if (last.kind === 'thread') ui$.selectedThread.set(last.threadId)
+    return
+  }
   ui$.mobilePane.set('threads')
 }
 
@@ -130,6 +184,7 @@ export function openMailAccount(accountId: string, folderId = 'inbox', resumeCur
     pauseMailFolderPersist(false)
   }
   closeKanbanBoard()
+  ui$.calendarOpen.set(false)
   ui$.selectedAccount.set(accountId)
   if (resumesMailView) return
   ui$.selectedFolder.set(folderId)
@@ -194,13 +249,14 @@ export function setKanbanBoardAvatar(boardId: string, avatarUrl: string) {
   )
 }
 
-/** Set or clear (null clears) the background shown behind a board's columns. */
+/** Set or clear (null or Plain clears) the background shown behind a board's columns. */
 export function setKanbanBoardWallpaper(boardId: string, wallpaper: ChatWallpaper | null) {
+  const next = boardWallpaper(wallpaper)
   settings$.kanbanBoards.set(
     settings$.kanbanBoards.get().map((board) => {
       if (board.id !== boardId) return board
       const { wallpaper: _, ...rest } = board
-      return wallpaper ? { ...rest, wallpaper } : rest
+      return next ? { ...rest, wallpaper: next } : rest
     }),
   )
 }
@@ -237,8 +293,18 @@ export function setGlobalKanbanFilter(mode: FilterMode) {
   kanban$.globalFilter.set(mode)
 }
 
+// The board-wide attachments toggle; like setGlobalKanbanFilter, it clears the
+// per-column overrides so the latest choice applies to every column.
+export function setGlobalKanbanAttachmentsOnly(on: boolean) {
+  kanban$.attachmentsOnly.set({})
+  kanban$.globalAttachmentsOnly.set(on)
+}
+
 const globalFilterSession = persistedField(kanban$.globalFilter, 'session_kanban_filter', (raw) =>
   isFilterMode(raw) ? raw : undefined,
+)
+const attachmentsSession = persistedField(kanban$.globalAttachmentsOnly, 'session_kanban_attachments_only', (raw) =>
+  typeof raw === 'boolean' ? raw : undefined,
 )
 // Per-column filter overrides, keyed by kanbanBoardColumnKey. Persisted so a
 // column set to "all" while global is "unread" keeps that choice on restart.
@@ -250,6 +316,18 @@ const columnFiltersSession = persistedField(kanban$.filters, 'session_kanban_col
   }
   return out
 })
+const columnAttachmentsSession = persistedField(
+  kanban$.attachmentsOnly,
+  'session_kanban_column_attachments_only',
+  (raw) => {
+    if (!raw || typeof raw !== 'object') return undefined
+    const out: Record<string, boolean> = {}
+    for (const [colKey, on] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof on === 'boolean') out[colKey] = on
+    }
+    return out
+  },
+)
 const activeBoardSession = persistedField(kanban$.activeBoardId, 'session_kanban_board', (raw) => {
   if (typeof raw !== 'string') return undefined
   if (raw === '') return ''
@@ -257,17 +335,40 @@ const activeBoardSession = persistedField(kanban$.activeBoardId, 'session_kanban
 })
 
 /** Prefs keys this module owns; boot requests them in its single prefsGet. */
-export const KANBAN_SESSION_KEYS = [globalFilterSession.key, columnFiltersSession.key, activeBoardSession.key]
+export const KANBAN_SESSION_KEYS = [
+  globalFilterSession.key,
+  attachmentsSession.key,
+  columnFiltersSession.key,
+  columnAttachmentsSession.key,
+  activeBoardSession.key,
+]
 
 /** Seed kanban session state from persisted last session. Call once at boot. */
 export function restoreKanbanSession(prefs: Record<string, unknown>) {
   globalFilterSession.restore(prefs)
+  attachmentsSession.restore(prefs)
   columnFiltersSession.restore(prefs)
+  columnAttachmentsSession.restore(prefs)
   activeBoardSession.restore(prefs)
 }
 
+// A saved search is its own column beside the folder's plain one, so its query is
+// part of the key. Splitting a key on "\n" still yields account and folder first.
 export function kanbanColumnKey(column: KanbanColumn): string {
-  return `${column.accountId}\n${column.folderId}`
+  const base = `${column.accountId}\n${column.folderId}`
+  return column.query ? `${base}\n${column.query}` : base
+}
+
+// The board search inside a saved search column narrows it. The core reads each
+// side of an `AND` as its own query that must also match, so free text, dates
+// and read state narrow the saved query rather than merging into or replacing
+// its own. The search starts a line of its own, which no quote or group left
+// open in the saved query reaches into. A leading `OR` would be a stray word
+// there, so it is dropped.
+export function narrowKanbanQuery(saved: string | undefined, query: string): string {
+  if (!saved) return query.trim()
+  const extra = query.trim().replace(/^(?:OR(?:\s+|$))+/, '')
+  return extra ? `${saved}\nAND ${extra}` : saved
 }
 
 export function kanbanBoardColumnKey(boardId: string, column: KanbanColumn): string {
@@ -295,6 +396,27 @@ export function addKanbanColumn(boardId: string, column: KanbanColumn) {
     if (board.columns.some((item) => kanbanColumnKey(item) === entry)) return board
     return { ...board, columns: [...board.columns, column] }
   })
+}
+
+// Turn the board search on one column into a column of its own, placed right
+// after it. Returns the new column, or null when there is nothing to save or the
+// board already has it. A saved search narrowed by the board search isn't saved
+// again: its two queries would have to share one line.
+export function saveKanbanSearchColumn(boardId: string, column: KanbanColumn, query: string): KanbanColumn | null {
+  const saved = normalizeKanbanColumnQuery(query)
+  if (!boardId || !saved || column.query) return null
+  const target: KanbanColumn = { accountId: column.accountId, folderId: column.folderId, query: saved }
+  const entry = kanbanColumnKey(target)
+  const columns = getKanbanColumns(boardId)
+  if (columns.some((item) => kanbanColumnKey(item) === entry)) return null
+  const sourceEntry = kanbanColumnKey(column)
+  updateBoard(boardId, (board) => {
+    const next = [...board.columns]
+    const at = next.findIndex((item) => kanbanColumnKey(item) === sourceEntry)
+    next.splice(at === -1 ? next.length : at + 1, 0, target)
+    return { ...board, columns: next }
+  })
+  return target
 }
 
 export function reorderKanbanColumn(boardId: string, from: KanbanColumn, to: KanbanColumn) {
@@ -333,14 +455,14 @@ export function removeKanbanColumn(boardId: string, column: KanbanColumn) {
   kanban$.accountCursors.set(nextAccountCursors)
 }
 
-// Drop every column showing a folder, on all boards. Used once the folder is
-// gone from the server: a column left behind would only fail to load.
+// Drop every column showing a folder, saved searches in it included, on all
+// boards. Used once the folder is gone from the server: a column left behind
+// would only fail to load.
 export function removeKanbanColumnsForFolder(accountId: string, folderId: string) {
   if (!accountId || !folderId) return
-  const entry = kanbanColumnKey({ accountId, folderId })
   for (const board of settings$.kanbanBoards.get()) {
-    if (board.columns.some((item) => kanbanColumnKey(item) === entry)) {
-      removeKanbanColumn(board.id, { accountId, folderId })
+    for (const column of board.columns) {
+      if (column.accountId === accountId && column.folderId === folderId) removeKanbanColumn(board.id, column)
     }
   }
 }
@@ -350,7 +472,23 @@ export function removeKanbanColumnsForFolder(accountId: string, folderId: string
 // column, or the target folder already has a column here).
 export function switchKanbanColumnFolder(boardId: string, column: KanbanColumn, folderId: string): boolean {
   if (!boardId || !folderId || folderId === column.folderId) return false
-  const target: KanbanColumn = { accountId: column.accountId, folderId }
+  return replaceKanbanColumn(boardId, column, { ...column, folderId })
+}
+
+// Give a saved search column a new query, keeping its slot on the board. Returns
+// the edited column, or null when the query is empty, unchanged, or already has
+// a column of its own here.
+export function editKanbanSearchColumn(boardId: string, column: KanbanColumn, query: string): KanbanColumn | null {
+  const next = normalizeKanbanColumnQuery(query)
+  if (!boardId || !column.query || !next || next === column.query) return null
+  const target: KanbanColumn = { ...column, query: next }
+  return replaceKanbanColumn(boardId, column, target) ? target : null
+}
+
+// Swap `column` for `target` in place, carrying the column's state over so the
+// change feels like the same column. False when the board has no such column or
+// already shows the target.
+function replaceKanbanColumn(boardId: string, column: KanbanColumn, target: KanbanColumn): boolean {
   const fromEntry = kanbanColumnKey(column)
   const toEntry = kanbanColumnKey(target)
   const columns = getKanbanColumns(boardId)
@@ -380,8 +518,10 @@ export function switchKanbanColumnFolder(boardId: string, column: KanbanColumn, 
 
   const filter = kanban$.filters[fromEntry].get()
   if (filter !== undefined) kanban$.filters[toEntry].set(filter)
+  const attachmentsOnly = kanban$.attachmentsOnly[fromEntry].get()
+  if (attachmentsOnly !== undefined) kanban$.attachmentsOnly[toEntry].set(attachmentsOnly)
 
-  // Only discard the old folder's cached page when no other board still shows it.
+  // Only discard the old column's cached page when no other board still shows it.
   if (!getAllKanbanColumns().some((item) => kanbanColumnKey(item) === fromEntry)) {
     const nextThreads = { ...kanban$.threads.get() }
     delete nextThreads[fromEntry]
@@ -395,6 +535,9 @@ export function switchKanbanColumnFolder(boardId: string, column: KanbanColumn, 
     const nextFilters = { ...kanban$.filters.get() }
     delete nextFilters[fromEntry]
     kanban$.filters.set(nextFilters)
+    const nextAttachmentsOnly = { ...kanban$.attachmentsOnly.get() }
+    delete nextAttachmentsOnly[fromEntry]
+    kanban$.attachmentsOnly.set(nextAttachmentsOnly)
   }
   return true
 }
@@ -417,8 +560,11 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
   const unread = threads.filter((thread) => thread.unread)
   const accounts = accounts$.get()
   const starred = isUnifiedStarredColumn(column)
+  // A saved search marks only its matches read, never the whole folder, so it
+  // goes thread by thread like the starred aggregate.
+  const perItem = starred || !!column.query
   const columnAccount = accounts.find((account) => account.id === column.accountId)
-  const mailAccountIds = starred
+  const mailAccountIds = perItem
     ? []
     : column.accountId === 'unified'
       ? accounts
@@ -427,7 +573,7 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
       : !isRssAccount(columnAccount, column.accountId)
         ? [column.accountId]
         : []
-  const itemTargets = starred
+  const itemTargets = perItem
     ? unread
     : unread.filter((thread) =>
         isRssAccount(
@@ -489,13 +635,19 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
     ),
   )
   if (clearsBadge) kanban$.unreadCounts[key].set(0)
-  for (const target of folderTargets.values()) updateCachedFolderUnread(target.accountId, target.folderId, target.next)
+  for (const target of folderTargets.values())
+    updateCachedFolderUnread(target.accountId, target.folderId, target.next, 'local')
+  const settleCounts = new Map(
+    Array.from(folderTargets.values(), (target) => [target, holdFolderUnread(target.accountId, target.folderId)]),
+  )
   const results = await Promise.allSettled(writes.map((write) => write()))
   const refreshed = new Map<string, Folder[]>()
+  const refreshVersions = new Map<string, number>()
   await Promise.all(
     Array.from(new Set([...mailAccountIds, ...itemTargets.map((thread) => thread.account_id)]))
       .filter(Boolean)
       .map(async (accountId) => {
+        refreshVersions.set(accountId, captureFolderUnreadVersion())
         refreshed.set(accountId, await refreshAccountFoldersCache(accountId, false))
       }),
   )
@@ -516,9 +668,23 @@ async function markColumnRead(column: KanbanColumn, request: ReadRequest, baseli
       const server = refreshed
         .get(target.accountId)
         ?.find((folder) => folderMatches(folder, target.accountId, target.folderId))
-      updateCachedFolderUnread(target.accountId, target.folderId, server?.unread ?? target.previous)
+      settleCounts.get(target)!(
+        server?.unread ?? target.previous,
+        !!server,
+        server ? refreshVersions.get(target.accountId) : undefined,
+      )
     }
     throw failure.reason
+  }
+  for (const target of folderTargets.values()) {
+    const server = refreshed
+      .get(target.accountId)
+      ?.find((folder) => folderMatches(folder, target.accountId, target.folderId))
+    settleCounts.get(target)!(
+      server?.unread ?? target.next,
+      true,
+      server ? refreshVersions.get(target.accountId) : undefined,
+    )
   }
   // Reapply on success: a column reload that raced the write may have put the
   // pre-write rows and badge back over the optimistic clear.
@@ -545,13 +711,17 @@ export async function markBoardAllRead(boardId: string) {
   const requests = new Map<string, Promise<void>>()
   const request: ReadRequest = (command, payload) => {
     // Reuse a unified folder write for a concrete column covering the same folder.
+    // A saved unified search marks only its matches, so it never stands in.
     if (command === 'mail.markAllRead' && payload.account_id !== 'unified') {
       const account = accounts$.get().find((account) => account.id === payload.account_id)
       const folder = mail$.foldersByAccount[payload.account_id].get()?.find((folder) => folder.id === payload.folder_id)
       const role = folder?.role || (payload.folder_id.toLowerCase() === 'inbox' ? 'inbox' : '')
       const unified = columns.find(
         (column) =>
-          column.accountId === 'unified' && column.folderId.toLowerCase() === role && !isUnifiedStarredColumn(column),
+          column.accountId === 'unified' &&
+          !column.query &&
+          column.folderId.toLowerCase() === role &&
+          !isUnifiedStarredColumn(column),
       )
       if (account && account.included_in_unified !== false && unified) {
         payload = { account_id: 'unified', folder_id: unified.folderId }
@@ -573,11 +743,11 @@ export async function markBoardAllRead(boardId: string) {
 }
 
 // Open a card the keyboard moved onto, the same way clicking it would. Feed
-// rows in the starred column carry their full body and live in a reader tab;
-// everything else opens in the conversation pane, which means dropping any
-// reader tab a previous card left behind — MessagePane renders the active tab
-// over the conversation, so the old item would otherwise stay on screen while
-// only the card highlight moved.
+// rows in the starred column carry their full body and live in a reader tab,
+// leaving the card conversation behind the tabs alone; everything else opens in
+// the conversation pane, which means dropping any tab on screen — MessagePane
+// renders the active tab over the conversation, so the old item would otherwise
+// stay on screen while only the card highlight moved.
 function openAdjacentKanbanCard(thread: Message, column: KanbanColumn, boardKey: string) {
   if (
     isUnifiedStarredColumn(column) &&
@@ -591,21 +761,32 @@ function openAdjacentKanbanCard(thread: Message, column: KanbanColumn, boardKey:
     focusKanbanThreadFolder(thread.folder_id)
     compose$.activeTab.set('')
     ui$.selectedThread.set(thread.thread_id)
+    kanban$.paneThreadId.set(thread.thread_id)
   }
-  kanban$.paneThreadId.set(thread.thread_id)
   kanban$.paneColumnKey.set(boardKey)
   ui$.mobilePane.set('conversation')
 }
 
 // Move the open kanban conversation through the visible cards in its current
 // column. This mirrors chat-list adjacent navigation but uses the active board.
+// It starts from whatever the pane shows, a tab included.
 export function selectAdjacentKanbanThread(delta: number) {
-  const selected = kanban$.paneThreadId.get() || ui$.selectedThread.get()
+  const selected = kanbanPaneThreadId() || ui$.selectedThread.get()
+  // Items of one feed share a thread_id, so a reader tab's card is found by
+  // the item's own id first.
+  const activeTab = compose$.activeTab.get()
+  const selectedId = compose$.tabs.get().find((tab) => tab.id === activeTab && tab.kind === 'reader')?.messageId
+  const indexOfSelected = (list: Message[]) => {
+    const byId = selectedId ? list.findIndex((thread) => thread.id === selectedId) : -1
+    return byId !== -1 ? byId : list.findIndex((thread) => thread.thread_id === selected)
+  }
   const boardId = kanban$.activeBoardId.get()
   const columns = getKanbanColumns(boardId)
   const allThreads = kanban$.threads.get()
   const filters = kanban$.filters.get()
   const globalFilter = kanban$.globalFilter.get()
+  const columnAttachmentsOnly = kanban$.attachmentsOnly.get()
+  const globalAttachmentsOnly = kanban$.globalAttachmentsOnly.get()
   const preferredKey = kanban$.paneColumnKey.get()
   const orderedColumns = preferredKey
     ? [
@@ -620,18 +801,19 @@ export function selectAdjacentKanbanThread(delta: number) {
     const boardKey = kanbanBoardColumnKey(boardId, column)
     const rawThreads = allThreads[sourceKey] ?? []
     const filterMode = filters[sourceKey] ?? globalFilter
-    const list = filterThreads(rawThreads, filterMode, selected, mail$.readThreads.get())
+    const attachmentsOnly = columnAttachmentsOnly[sourceKey] ?? globalAttachmentsOnly
+    const list = filterThreads(rawThreads, filterMode, selected, mail$.readThreads.get(), attachmentsOnly)
     if (!fallback && list.length > 0) {
       fallback = { key: boardKey, thread: delta >= 0 ? list[0] : list[list.length - 1], column }
     }
     if (!selected || !rawThreads.some((thread) => thread.thread_id === selected)) continue
 
-    const current = list.findIndex((thread) => thread.thread_id === selected)
+    const current = indexOfSelected(list)
     if (current === -1) continue
 
     const next = Math.min(list.length - 1, Math.max(0, current + delta))
     const target = list[next]
-    if (!target || target.thread_id === selected) return
+    if (!target || next === current) return
 
     openAdjacentKanbanCard(target, column, boardKey)
     return

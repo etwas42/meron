@@ -18,14 +18,33 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::parse;
+use crate::search_query::{SearchQuery, close_open_terms};
 
 /// Connection stream: implicit TLS (port 993 etc.) or plaintext (e.g. a local
 /// test server on 3143). One enum so the async-imap `Session` type is uniform.
 /// STARTTLS upgrade is not yet supported.
 #[derive(Debug)]
 pub enum Stream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(TcpStream, ReadProgress),
+    Tls(Box<TlsStream<TcpStream>>, ReadProgress),
+}
+
+pub(crate) type ReadProgress = std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>;
+
+impl Stream {
+    pub fn plain(socket: TcpStream) -> Self {
+        Self::Plain(socket, Default::default())
+    }
+
+    pub fn tls(socket: Box<TlsStream<TcpStream>>) -> Self {
+        Self::Tls(socket, Default::default())
+    }
+
+    pub(crate) fn observe_reads(&mut self, progress: ReadProgress) {
+        match self {
+            Self::Plain(_, clock) | Self::Tls(_, clock) => *clock = progress,
+        }
+    }
 }
 
 impl AsyncRead for Stream {
@@ -34,10 +53,18 @@ impl AsyncRead for Stream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        let before = buf.filled().len();
+        let (result, progress) = match self.get_mut() {
+            Stream::Plain(s, progress) => (Pin::new(s).poll_read(cx, buf), progress),
+            Stream::Tls(s, progress) => (Pin::new(s.as_mut()).poll_read(cx, buf), progress),
+        };
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            let mut clock = progress.lock().unwrap();
+            if clock.is_some() {
+                *clock = Some(tokio::time::Instant::now());
+            }
         }
+        result
     }
 }
 
@@ -48,25 +75,50 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Stream::Plain(s, _) => Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_flush(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Stream::Plain(s, _) => Pin::new(s).poll_flush(cx),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Stream::Plain(s, _) => Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
 
 pub type Session = async_imap::Session<Stream>;
+
+/// Whether an idle session's socket still looks open. A server that drops an
+/// idle connection leaves its FIN (often behind a BYE or TLS close_notify)
+/// queued on the socket, and the runtime's reactor records that as read-closed
+/// readiness, so a dead pooled session can be spotted without a round trip.
+/// This cannot see a close that lands after the check; callers still need to
+/// handle a command failing on a dropped connection.
+pub fn session_looks_open(session: &Session) -> bool {
+    match session.get_ref() {
+        Stream::Plain(stream, _) => tcp_looks_open(stream),
+        Stream::Tls(stream, _) => tcp_looks_open(stream.get_ref().0),
+    }
+}
+
+fn tcp_looks_open(tcp: &TcpStream) -> bool {
+    use futures::FutureExt;
+    use tokio::io::Interest;
+
+    match tcp.ready(Interest::READABLE).now_or_never() {
+        Some(Ok(ready)) => !(ready.is_read_closed() || ready.is_error()),
+        Some(Err(_)) => false,
+        // Nothing pending on the socket: the connection is quiet, not closed.
+        None => true,
+    }
+}
 
 #[derive(Clone)]
 pub struct Creds {
@@ -104,6 +156,24 @@ pub struct Creds {
     /// different daemons with different certificates — a local bridge serves one
     /// certificate on both ports, but nothing guarantees that in general.
     pub smtp_cert_pin: Option<String>,
+    /// Fingerprint ([`grant_fingerprint`]) of a refresh token the provider
+    /// refused outright (an expired or revoked OAuth grant). Persisted, so the
+    /// account reads as needing a reconnect across restarts instead of failing
+    /// the same refresh on every sync. It names the token rather than the
+    /// account on purpose: once the account holds any other token — however
+    /// and whenever a reconnect's writes land — the verdict no longer applies.
+    /// See [`Creds::auth_rejected`].
+    pub rejected_grant: Option<String>,
+}
+
+/// A stable, non-reversible name for a refresh token, to remember which one a
+/// provider refused without storing the token outside the secret store.
+pub fn grant_fingerprint(refresh_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(refresh_token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Which settings a save left out of its parameters, and so must be carried
@@ -131,6 +201,20 @@ impl OmittedSettings {
 }
 
 impl Creds {
+    /// Whether the provider has refused the refresh token these credentials
+    /// hold, so that nothing short of signing in again will work.
+    pub fn auth_rejected(&self) -> bool {
+        match (
+            self.rejected_grant.as_deref(),
+            self.refresh_token.as_deref(),
+        ) {
+            (Some(rejected), Some(token)) if !token.is_empty() => {
+                rejected == grant_fingerprint(token)
+            }
+            _ => false,
+        }
+    }
+
     /// Copy the omitted settings across from the account as it is stored today.
     pub fn carry_over(&mut self, stored: &Creds, omitted: OmittedSettings) {
         if omitted.proxy {
@@ -178,6 +262,10 @@ pub struct Folder {
     /// UI role computed from `special_use` plus core name heuristics.
     #[serde(default)]
     pub role: String,
+    /// The user opted this folder in to live sync and new-mail notifications.
+    /// Populated by `store::get_folders`; INBOX is always watched regardless.
+    #[serde(default)]
+    pub notify: bool,
 }
 
 /// One addressee parsed from an envelope `To`/`Cc` list.
@@ -225,6 +313,9 @@ pub struct MessageHeader {
     /// number of *additional* recipients beyond the one shown, for a "+N" hint.
     #[serde(default)]
     pub recipient_overflow: u32,
+    /// Attachment names from BODYSTRUCTURE; None means metadata was not fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<crate::store::CardFile>>,
 }
 
 /// A batch of recent messages plus the folder's UID sync markers, so the caller
@@ -431,11 +522,11 @@ pub async fn connect_stream(
 ) -> Result<Stream> {
     let tcp = open_socket(host, port, proxy).await?;
     if tls {
-        Ok(Stream::Tls(Box::new(
+        Ok(Stream::tls(Box::new(
             upgrade_to_tls(host, tcp, cert_pin).await?,
         )))
     } else {
-        Ok(Stream::Plain(tcp))
+        Ok(Stream::plain(tcp))
     }
 }
 
@@ -520,7 +611,7 @@ impl async_imap::Authenticator for XOAuth2Simple {
 /// handshake, and hand back the raw socket. Used only by the certificate probe
 /// (see [`crate::tls::probe`]); no credentials are ever sent over it.
 pub(crate) async fn starttls_socket(tcp: TcpStream) -> Result<TcpStream> {
-    let mut client = async_imap::Client::new(Stream::Plain(tcp));
+    let mut client = async_imap::Client::new(Stream::plain(tcp));
     tokio::time::timeout(imap_protocol_timeout(), client.read_response())
         .await
         .map_err(|_| anyhow!("timed out"))
@@ -532,8 +623,8 @@ pub(crate) async fn starttls_socket(tcp: TcpStream) -> Result<TcpStream> {
         .await
         .context("STARTTLS")?;
     match client.into_inner() {
-        Stream::Plain(tcp) => Ok(tcp),
-        Stream::Tls(_) => Err(anyhow!("STARTTLS requested on an already-TLS stream")),
+        Stream::Plain(tcp, _) => Ok(tcp),
+        Stream::Tls(_, _) => Err(anyhow!("STARTTLS requested on an already-TLS stream")),
     }
 }
 
@@ -589,11 +680,13 @@ async fn connect_inner(creds: &Creds) -> Result<Session> {
             .await
             .context("STARTTLS")?;
         let tcp = match client.into_inner() {
-            Stream::Plain(tcp) => tcp,
-            Stream::Tls(_) => return Err(anyhow!("STARTTLS requested on an already-TLS stream")),
+            Stream::Plain(tcp, _) => tcp,
+            Stream::Tls(_, _) => {
+                return Err(anyhow!("STARTTLS requested on an already-TLS stream"));
+            }
         };
         let tls = upgrade_to_tls(&creds.host, tcp, creds.cert_pin.as_deref()).await?;
-        client = async_imap::Client::new(Stream::Tls(Box::new(tls)));
+        client = async_imap::Client::new(Stream::tls(Box::new(tls)));
     }
 
     let auth_started = std::time::Instant::now();
@@ -632,6 +725,72 @@ async fn connect_inner(creds: &Creds) -> Result<Session> {
 struct TokenResponse {
     access_token: String,
     expires_in: Option<i64>,
+    refresh_token: Option<String>,
+}
+
+/// What a successful [`refresh_oauth_token`] hands back.
+pub struct RefreshedToken {
+    pub access_token: String,
+    /// Seconds until `access_token` expires.
+    pub expires_in: i64,
+    /// A replacement refresh token, when the provider rotates them. Microsoft
+    /// issues one on every refresh and each has its own fixed lifetime, so the
+    /// caller must keep this one: holding on to the token it sent would see the
+    /// account's sign-in expire that long after it was first connected, however
+    /// often it refreshed. Google usually sends none.
+    pub refresh_token: Option<String>,
+}
+
+impl From<TokenResponse> for RefreshedToken {
+    fn from(response: TokenResponse) -> Self {
+        RefreshedToken {
+            access_token: response.access_token,
+            expires_in: response.expires_in.unwrap_or(3600),
+            refresh_token: response
+                .refresh_token
+                .filter(|token| !token.trim().is_empty()),
+        }
+    }
+}
+
+/// A token endpoint's refusal of the refresh token itself: its `error` field
+/// is `invalid_grant`, which RFC 6749 §5.2 reserves for a grant that is
+/// expired, revoked or otherwise no longer valid. Retrying cannot succeed.
+/// Displays like any other failed refresh.
+#[derive(Debug)]
+pub struct OAuthGrantRejected {
+    status: String,
+    body: String,
+}
+
+impl std::fmt::Display for OAuthGrantRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "oauth refresh failed ({}): {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for OAuthGrantRejected {}
+
+/// Whether a failed [`refresh_oauth_token`] means the grant itself is dead
+/// rather than the request having failed in transit or on the server's side.
+pub fn oauth_grant_rejected(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<OAuthGrantRejected>())
+}
+
+/// The error for a non-2xx token response. Only a body whose own `error` field
+/// says `invalid_grant` is a rejection; the text turning up anywhere else (a
+/// description, a gateway's error page) is not.
+fn oauth_refresh_error(status: &str, body: &str) -> anyhow::Error {
+    let code = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|json| json["error"].as_str().map(str::to_string));
+    if code.as_deref() == Some("invalid_grant") {
+        return anyhow::Error::new(OAuthGrantRejected {
+            status: status.to_string(),
+            body: body.to_string(),
+        });
+    }
+    anyhow!("oauth refresh failed ({status}): {body}")
 }
 
 /// Exchange a refresh token for a fresh access token via an OAuth token
@@ -651,7 +810,7 @@ pub async fn refresh_oauth_token(
     refresh_token: &str,
     scope: Option<&str>,
     proxy: Option<crate::proxy::ProxyConfig>,
-) -> Result<(String, i64)> {
+) -> Result<RefreshedToken> {
     let token_url = token_url.to_string();
     let client_id = client_id.to_string();
     let client_secret = client_secret.to_string();
@@ -687,14 +846,14 @@ pub async fn refresh_oauth_token(
             .read_to_string()
             .context("read oauth response")?;
         if !status.is_success() {
-            return Err(anyhow!("oauth refresh failed ({status}): {body}"));
+            return Err(oauth_refresh_error(&status.to_string(), &body));
         }
         serde_json::from_str(&body).context("parse oauth response JSON")
     })
     .await
     .context("oauth refresh task")??;
 
-    Ok((parsed.access_token, parsed.expires_in.unwrap_or(3600)))
+    Ok(parsed.into())
 }
 
 pub async fn list_folders(session: &mut Session) -> Result<Vec<Folder>> {
@@ -711,6 +870,7 @@ pub async fn list_folders(session: &mut Session) -> Result<Vec<Folder>> {
                 NameAttribute::Junk => Some("junk"),
                 NameAttribute::Archive => Some("archive"),
                 NameAttribute::All => Some("all"),
+                NameAttribute::Flagged => Some("flagged"),
                 _ => None,
             }
             .map(str::to_string)
@@ -722,6 +882,7 @@ pub async fn list_folders(session: &mut Session) -> Result<Vec<Folder>> {
             unread: 0,
             special_use,
             role: String::new(),
+            notify: false,
         });
     }
     Ok(out)
@@ -893,7 +1054,7 @@ pub async fn fetch_recent(session: &mut Session, folder: &str, limit: u32) -> Re
             subject: ef.subject,
             from_name: ef.from_name,
             from_addr: ef.from_addr,
-            date: ef.date,
+            date: message_date(ef.date, &fetch),
             seen,
             starred,
             thread_key,
@@ -904,6 +1065,7 @@ pub async fn fetch_recent(session: &mut Session, folder: &str, limit: u32) -> Re
             to: ef.to,
             cc: ef.cc,
             recipient_overflow: 0,
+            files: fetch.bodystructure().map(attachment_files),
         });
     }
     drop(stream);
@@ -917,20 +1079,26 @@ pub async fn fetch_recent(session: &mut Session, folder: &str, limit: u32) -> Re
 
 pub async fn search_uids(session: &mut Session, folder: &str, query: &str) -> Result<Vec<u32>> {
     session.select(folder).await.context("SELECT")?;
-    let gmail = supports_gmail_ext(session).await;
+    let caps = session.capabilities().await.ok();
+    let has = |name: &str| caps.as_ref().is_some_and(|caps| caps.has_str(name));
+    let gmail = has("X-GM-EXT-1");
     // SEARCH keys are US-ASCII unless the command names a charset (RFC 3501
     // §6.4.4), so anything non-ASCII — a CJK or accented query — has to be
-    // announced as UTF-8 or the server is entitled to answer BAD.
+    // announced as UTF-8 or the server is entitled to answer BAD. The octets
+    // themselves belong in a literal, since a quoted string is 7-bit only; a
+    // non-synchronizing one (LITERAL+ / LITERAL-) goes inline in the command.
+    // Servers with neither get the quoted form, which most accept anyway.
     let needs_charset = !query.is_ascii();
+    let literal = needs_charset && (has("LITERAL+") || has("LITERAL-"));
     let mut result = session
-        .uid_search(search_criteria(gmail, query, needs_charset))
+        .uid_search(search_criteria(gmail, query, needs_charset, literal))
         .await;
     if result.is_err() && needs_charset {
         // Servers that reject CHARSET outright (or that advertise UTF8=ACCEPT
         // and take the raw octets) get one retry with the bare criteria before
         // we give up and leave the caller with the cached hits.
         result = session
-            .uid_search(search_criteria(gmail, query, false))
+            .uid_search(search_criteria(gmail, query, false, false))
             .await;
     }
     let set: HashSet<u32> = result.context("UID SEARCH query")?;
@@ -943,20 +1111,119 @@ pub async fn search_uids(session: &mut Session, folder: &str, query: &str) -> Re
 ///
 /// On Gmail, defer to its own search engine via X-GM-RAW: it understands the
 /// full Gmail query syntax (operators like `from:`, `has:attachment`,
-/// `older_than:`, relevance) instead of our crude substring OR. Elsewhere fall
-/// back to plain SUBJECT/FROM/TEXT matching.
-fn search_criteria(gmail: bool, query: &str, charset: bool) -> String {
-    let q = imap_quote(query);
+/// `older_than:`, relevance) instead of our crude substring OR. Elsewhere the
+/// operators [`SearchQuery`] knows become their SEARCH keys, ANDed by
+/// juxtaposition, and the free text falls back to plain SUBJECT/FROM/TEXT
+/// matching. `literal` sends each string as a non-synchronizing literal instead
+/// of a quoted string.
+fn search_criteria(gmail: bool, query: &str, charset: bool, literal: bool) -> String {
+    let string = |value: &str| {
+        if literal {
+            imap_literal_plus(value)
+        } else {
+            imap_quote(value)
+        }
+    };
     let keys = if gmail {
-        format!("X-GM-RAW {q}")
+        format!("X-GM-RAW {}", string(&gmail_raw(query)))
     } else {
-        format!("OR OR SUBJECT {q} FROM {q} TEXT {q}")
+        let query = SearchQuery::parse(query);
+        let mut keys = Vec::new();
+        for text in &query.text {
+            let q = string(text);
+            keys.push(format!("OR OR SUBJECT {q} FROM {q} TEXT {q}"));
+        }
+        // A term's alternatives, ORed: IMAP's OR takes two keys, so nest it.
+        let any = |values: &[String], key: &dyn Fn(String) -> String| {
+            let mut keys = values.iter().rev().map(|v| key(string(v)));
+            let last = keys.next().unwrap_or_default();
+            keys.fold(last, |rest, key| format!("OR {key} {rest}"))
+        };
+        keys.extend(query.from.iter().map(|v| any(v, &|v| format!("FROM {v}"))));
+        keys.extend(
+            query
+                .to
+                .iter()
+                .map(|v| any(v, &|v| format!("OR TO {v} CC {v}"))),
+        );
+        keys.extend(
+            query
+                .subject
+                .iter()
+                .map(|v| any(v, &|v| format!("SUBJECT {v}"))),
+        );
+        if query.read {
+            keys.push("SEEN".to_string());
+        }
+        if query.unread {
+            keys.push("UNSEEN".to_string());
+        }
+        if query.starred {
+            keys.push("FLAGGED".to_string());
+        }
+        // The SENT* keys compare the Date header, which is what the cache
+        // dates messages by, rather than the internal (arrival) date.
+        if let Some(after) = query.after {
+            keys.push(format!("SENTSINCE {}", after.format("%d-%b-%Y")));
+        }
+        if let Some(before) = query.before {
+            keys.push(format!("SENTBEFORE {}", before.format("%d-%b-%Y")));
+        }
+        keys.join(" ")
     };
     if charset {
         format!("CHARSET UTF-8 {keys}")
     } else {
         keys
     }
+}
+
+/// `query` for Gmail's own search. Queries joined on separate lines (a saved
+/// search narrowed by another, the later lines led by `AND`) are each grouped in
+/// parentheses, with any quote or group they leave open closed, so Gmail keeps
+/// one from running into the next as well.
+fn gmail_raw(query: &str) -> String {
+    let lines: Vec<&str> = query
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            match line.strip_prefix("AND") {
+                Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+                    rest.trim_start()
+                }
+                _ => line,
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 2 {
+        return query.to_string();
+    }
+    lines
+        .iter()
+        .map(|line| format!("({})", close_open_terms(line)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `value` as a non-synchronizing literal (RFC 7888), normalized like
+/// [`imap_quote`]. LITERAL- caps these at 4096 octets, far above any query.
+fn imap_literal_plus(value: &str) -> String {
+    let value = value.trim().replace(['\r', '\n'], " ");
+    format!("{{{}+}}\r\n{value}", value.len())
+}
+
+/// Every UID in `folder` at or above `floor`. `UID SEARCH UID n:*` names the
+/// highest UID even when it is below `n`, so the result is filtered again.
+pub async fn uids_from(session: &mut Session, folder: &str, floor: u32) -> Result<Vec<u32>> {
+    session.select(folder).await.context("SELECT")?;
+    let set: HashSet<u32> = session
+        .uid_search(format!("UID {floor}:*"))
+        .await
+        .context("UID SEARCH UID range")?;
+    let mut uids: Vec<u32> = set.into_iter().filter(|uid| *uid >= floor).collect();
+    uids.sort_unstable();
+    Ok(uids)
 }
 
 /// Return every UID currently in the folder. Used to prune locally cached
@@ -967,11 +1234,19 @@ pub async fn list_all_uids(session: &mut Session, folder: &str) -> Result<HashSe
     Ok(set)
 }
 
-pub async fn search_starred_uids(
-    session: &mut Session,
-    folder: &str,
-    limit: u32,
-) -> Result<Vec<u32>> {
+/// Every unseen UID in `folder`. Sync keeps the ones outside the cached window
+/// so a folder's unread total matches the server, not just what is cached.
+pub async fn list_unseen_uids(session: &mut Session, folder: &str) -> Result<HashSet<u32>> {
+    session.select(folder).await.context("SELECT")?;
+    let set: HashSet<u32> = session
+        .uid_search("UNSEEN")
+        .await
+        .context("UID SEARCH UNSEEN")?;
+    Ok(set)
+}
+
+/// Every `\Flagged` UID in `folder`, newest (highest) first.
+pub async fn search_starred_uids(session: &mut Session, folder: &str) -> Result<Vec<u32>> {
     session.select(folder).await.context("SELECT")?;
     let set: HashSet<u32> = session
         .uid_search("FLAGGED")
@@ -979,7 +1254,6 @@ pub async fn search_starred_uids(
         .context("UID SEARCH FLAGGED")?;
     let mut uids: Vec<u32> = set.into_iter().collect();
     uids.sort_unstable_by(|a, b| b.cmp(a));
-    uids.truncate(limit as usize);
     Ok(uids)
 }
 
@@ -1016,66 +1290,72 @@ pub async fn fetch_by_message_ids(
     if set.is_empty() {
         return Ok(Vec::new());
     }
-    let uid_set = set.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let uids = set.into_iter().collect::<Vec<_>>();
     let gmail = supports_gmail_ext(session).await;
     let mut out = Vec::new();
-    let mut stream = session
-        .uid_fetch(uid_set, fetch_items(gmail, true))
-        .await
-        .context("UID FETCH Message-ID matches")?;
-    while let Some(item) = stream.next().await {
-        let fetch = item.context("UID FETCH item")?;
-        let uid = match fetch.uid {
-            Some(uid) => uid,
-            None => continue,
-        };
-        let raw = match fetch.body() {
-            Some(body) => body.to_vec(),
-            None => continue,
-        };
-        let seen = fetch
-            .flags()
-            .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
-        let starred = fetch
-            .flags()
-            .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
-        let ef = fetch.header().map(header_fields).unwrap_or_default();
-        let thread_key = thread_key(
-            fetch.gmail_thread_id().copied(),
-            &ef.message_id,
-            &ef.in_reply_to,
-            &ef.references_root,
-            uid,
-        );
-        let media = parse::MediaCtx {
-            root: media_root.to_path_buf(),
-            account: account.to_string(),
-            folder: folder.to_string(),
-            uid,
-        };
-        let message = parse::parse_message(&raw, Some(&media));
-        out.push(FetchedMessage {
-            header: MessageHeader {
+    for uid_set in uid_set_chunks(&uids, MAX_UID_SET_LEN) {
+        let mut stream = session
+            .uid_fetch(uid_set, fetch_items(gmail, true))
+            .await
+            .context("UID FETCH Message-ID matches")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH item")?;
+            let uid = match fetch.uid {
+                Some(uid) => uid,
+                None => continue,
+            };
+            let raw = match fetch.body() {
+                Some(body) => body.to_vec(),
+                None => continue,
+            };
+            let seen = fetch
+                .flags()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
+            let starred = fetch
+                .flags()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
+            let ef = fetch.header().map(header_fields).unwrap_or_default();
+            let thread_key = thread_key(
+                fetch.gmail_thread_id().copied(),
+                &ef.message_id,
+                &ef.in_reply_to,
+                &ef.references_root,
                 uid,
+            );
+            let media = parse::MediaCtx {
+                root: media_root.to_path_buf(),
+                account: account.to_string(),
                 folder: folder.to_string(),
-                subject: ef.subject,
-                from_name: ef.from_name,
-                from_addr: ef.from_addr,
-                date: ef.date,
-                seen,
-                starred,
-                thread_key,
-                message_id: ef.message_id,
-                gmail_msg_id: fetch.gmail_msg_id().copied(),
-                in_reply_to: ef.in_reply_to,
-                to: ef.to,
-                cc: ef.cc,
-                recipient_overflow: 0,
-            },
-            message,
-        });
+                uid,
+            };
+            let mut message = parse::parse_message(&raw, Some(&media));
+            let date = message_date(ef.date, &fetch);
+            if message.date == 0 {
+                message.date = date;
+            }
+            out.push(FetchedMessage {
+                header: MessageHeader {
+                    uid,
+                    folder: folder.to_string(),
+                    subject: ef.subject,
+                    from_name: ef.from_name,
+                    from_addr: ef.from_addr,
+                    date,
+                    seen,
+                    starred,
+                    thread_key,
+                    message_id: ef.message_id,
+                    gmail_msg_id: fetch.gmail_msg_id().copied(),
+                    in_reply_to: ef.in_reply_to,
+                    to: ef.to,
+                    cc: ef.cc,
+                    recipient_overflow: 0,
+                    files: fetch.bodystructure().map(attachment_files),
+                },
+                message,
+            });
+        }
     }
-    drop(stream);
     Ok(out)
 }
 
@@ -1101,57 +1381,93 @@ pub async fn fetch_headers_by_uid(
         return Ok(Vec::new());
     }
     session.select(folder).await.context("SELECT")?;
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
     let gmail = supports_gmail_ext(session).await;
     let mut out = Vec::new();
-    let mut stream = session
-        .uid_fetch(uid_set, fetch_items(gmail, false))
-        .await
-        .context("UID FETCH search headers")?;
-    while let Some(item) = stream.next().await {
-        let fetch = item.context("UID FETCH search header item")?;
-        let uid = match fetch.uid {
-            Some(uid) => uid,
-            None => continue,
-        };
-        let seen = fetch
-            .flags()
-            .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
-        let starred = fetch
-            .flags()
-            .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
-        let ef = fetch.header().map(header_fields).unwrap_or_default();
-        let thread_key = thread_key(
-            fetch.gmail_thread_id().copied(),
-            &ef.message_id,
-            &ef.in_reply_to,
-            &ef.references_root,
-            uid,
-        );
-        out.push(MessageHeader {
-            uid,
-            subject: ef.subject,
-            from_name: ef.from_name,
-            from_addr: ef.from_addr,
-            date: ef.date,
-            seen,
-            starred,
-            thread_key,
-            message_id: ef.message_id,
-            gmail_msg_id: fetch.gmail_msg_id().copied(),
-            in_reply_to: ef.in_reply_to,
-            folder: String::new(),
-            to: ef.to,
-            cc: ef.cc,
-            recipient_overflow: 0,
-        });
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        let mut stream = session
+            .uid_fetch(uid_set, fetch_items(gmail, false))
+            .await
+            .context("UID FETCH search headers")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH search header item")?;
+            let uid = match fetch.uid {
+                Some(uid) => uid,
+                None => continue,
+            };
+            let seen = fetch
+                .flags()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
+            let starred = fetch
+                .flags()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
+            let ef = fetch.header().map(header_fields).unwrap_or_default();
+            let thread_key = thread_key(
+                fetch.gmail_thread_id().copied(),
+                &ef.message_id,
+                &ef.in_reply_to,
+                &ef.references_root,
+                uid,
+            );
+            out.push(MessageHeader {
+                uid,
+                subject: ef.subject,
+                from_name: ef.from_name,
+                from_addr: ef.from_addr,
+                date: message_date(ef.date, &fetch),
+                seen,
+                starred,
+                thread_key,
+                message_id: ef.message_id,
+                gmail_msg_id: fetch.gmail_msg_id().copied(),
+                in_reply_to: ef.in_reply_to,
+                folder: String::new(),
+                to: ef.to,
+                cc: ef.cc,
+                recipient_overflow: 0,
+                files: fetch.bodystructure().map(attachment_files),
+            });
+        }
     }
-    drop(stream);
     out.sort_unstable_by(|a, b| b.uid.cmp(&a.uid));
+    Ok(out)
+}
+
+/// Each of `uids`' Date header as epoch seconds (INTERNALDATE when absent or
+/// unparseable), the same date [`fetch_headers_by_uid`] reports. Fetches only
+/// that one header field, so a search can order a large hit set by date without
+/// downloading every header. UIDs the server no longer has are left out.
+pub async fn fetch_dates_by_uid(
+    session: &mut Session,
+    folder: &str,
+    uids: &[u32],
+) -> Result<Vec<(u32, i64)>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    session.select(folder).await.context("SELECT")?;
+    let mut out = Vec::with_capacity(uids.len());
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        let mut stream = session
+            .uid_fetch(
+                uid_set,
+                "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (DATE)])",
+            )
+            .await
+            .context("UID FETCH search dates")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH search date item")?;
+            let Some(uid) = fetch.uid else {
+                continue;
+            };
+            let date = fetch
+                .header()
+                .and_then(|header| mailparse::parse_headers(header).ok())
+                .and_then(|(headers, _)| headers.get_first_value("Date"))
+                .map(|raw| parse::parse_date_to_epoch(&raw))
+                .unwrap_or_default();
+            out.push((uid, message_date(date, &fetch)));
+        }
+    }
     Ok(out)
 }
 
@@ -1234,41 +1550,65 @@ pub async fn sync_flags(
     })
 }
 
-pub async fn read_message(
-    session: &mut Session,
-    folder: &str,
-    uid: u32,
-    media: &parse::MediaCtx,
-) -> Result<parse::Message> {
-    session.select(folder).await.context("SELECT")?;
-    // Opening a thread should not mark it read until the reader reaches the
-    // bottom. Use PEEK here and let the explicit mark-read path set \Seen.
-    fetch_full_message(session, uid, media, true)
-        .await?
-        .ok_or_else(|| anyhow!("message uid {uid} not found in {folder}"))
-}
-
 /// SELECT `folder` as the preflight of a flag update. Pooled sessions die
 /// silently, and the SELECT is the first command that notices, so running it
 /// as a separate phase lets a stale connection be replaced before any STORE
-/// reaches the server (see `Engine::with_preflighted_write_session`).
+/// reaches the server (see `Engine::with_flag_write_session`).
 pub async fn prepare_flag_update(session: &mut Session, folder: &str) -> Result<()> {
     session.select(folder).await.context("SELECT")?;
     Ok(())
 }
 
+/// Longest UID set sent in one command. RFC 7162 asks clients to keep command
+/// lines under 8192 octets; this leaves room for the tag and the flag list.
+const MAX_UID_SET_LEN: usize = 7000;
+
+/// Compact `uids` into IMAP sequence sets (`1:5,9,12:20`), split so no set is
+/// longer than `max_len`. A folder-wide "mark all read" can cover tens of
+/// thousands of UIDs, which as a flat list overruns server line limits.
+fn uid_set_chunks(uids: &[u32], max_len: usize) -> Vec<String> {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+        while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+            i += 1;
+            end = sorted[i];
+        }
+        i += 1;
+        let range = if start == end {
+            start.to_string()
+        } else {
+            format!("{start}:{end}")
+        };
+        if !current.is_empty() && current.len() + 1 + range.len() > max_len {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(',');
+        }
+        current.push_str(&range);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 async fn store_flag(session: &mut Session, uids: &[u32], op: &str) -> Result<()> {
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut stream = session
-        .uid_store(uid_set, op)
-        .await
-        .context("UID STORE FLAGS.SILENT")?;
-    while let Some(item) = stream.next().await {
-        item.context("UID STORE item")?;
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        let mut stream = session
+            .uid_store(uid_set, op)
+            .await
+            .context("UID STORE FLAGS.SILENT")?;
+        while let Some(item) = stream.next().await {
+            item.context("UID STORE item")?;
+        }
     }
     Ok(())
 }
@@ -1301,21 +1641,26 @@ pub async fn store_starred(session: &mut Session, uids: &[u32], starred: bool) -
     store_flag(session, uids, op).await
 }
 
+/// Move `uids` from `source_folder` to `dest_folder`. Returns the target's
+/// UIDNEXT from just before the move, when the server reported it.
 pub async fn move_to_folder(
     session: &mut Session,
     source_folder: &str,
     dest_folder: &str,
     uids: &[u32],
-) -> Result<()> {
+) -> Result<Option<u32>> {
     if uids.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
+    // The target's UIDNEXT before the move: every copy the move creates lands
+    // at or above it, which is how a caller finds them again — async-imap
+    // drops the COPYUID response code. Best-effort; None if STATUS fails.
+    let target_uid_next = session
+        .status(dest_folder, "(UIDNEXT)")
+        .await
+        .ok()
+        .and_then(|mailbox| mailbox.uid_next);
     session.select(source_folder).await.context("SELECT")?;
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
     // UID MOVE is the RFC 6851 MOVE extension; servers that don't advertise it
     // (e.g. mailo) reject it with "Unknown command". Fall back to the classic
     // COPY + \Deleted + EXPUNGE sequence, which every IMAP server supports.
@@ -1323,23 +1668,31 @@ pub async fn move_to_folder(
         Ok(caps) => caps.has_str("MOVE"),
         Err(_) => false,
     };
-    if supports_move {
-        session
-            .uid_mv(&uid_set, dest_folder)
-            .await
-            .context("UID MOVE")?;
-    } else {
-        session
-            .uid_copy(&uid_set, dest_folder)
-            .await
-            .context("UID COPY")?;
-        expunge_uids(session, source_folder, uids).await?;
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        if supports_move {
+            session
+                .uid_mv(&uid_set, dest_folder)
+                .await
+                .context("UID MOVE")?;
+        } else {
+            session
+                .uid_copy(&uid_set, dest_folder)
+                .await
+                .context("UID COPY")?;
+        }
     }
-    Ok(())
+    if !supports_move {
+        expunge_uids(session, source_folder, uids)
+            .await
+            .context("Move copied messages but could not confirm removal from the source folder")?;
+    }
+    Ok(target_uid_next)
 }
 
 #[derive(Clone)]
 pub struct RawMessageCopy {
+    /// The source UID, or 0 when the server left it out of the FETCH reply.
+    pub uid: u32,
     pub raw: Vec<u8>,
     pub seen: bool,
     pub starred: bool,
@@ -1357,33 +1710,100 @@ pub async fn fetch_raw_messages_for_copy(
         return Ok(Vec::new());
     }
     session.select(folder).await.context("SELECT")?;
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut stream = session
-        .uid_fetch(uid_set, "(FLAGS BODY.PEEK[])")
-        .await
-        .context("UID FETCH raw copy")?;
     let mut out = Vec::new();
-    while let Some(item) = stream.next().await {
-        let fetch = item.context("UID FETCH raw copy item")?;
-        if let Some(body) = fetch.body() {
-            let seen = fetch
-                .flags()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
-            let starred = fetch
-                .flags()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
-            out.push(RawMessageCopy {
-                raw: body.to_vec(),
-                seen,
-                starred,
-            });
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        let mut stream = session
+            .uid_fetch(uid_set, "(FLAGS BODY.PEEK[])")
+            .await
+            .context("UID FETCH raw copy")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH raw copy item")?;
+            if let Some(body) = fetch.body() {
+                let seen = fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen));
+                let starred = fetch
+                    .flags()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged));
+                out.push(RawMessageCopy {
+                    uid: fetch.uid.unwrap_or(0),
+                    raw: body.to_vec(),
+                    seen,
+                    starred,
+                });
+            }
         }
     }
     Ok(out)
+}
+
+/// async-imap's APPEND expects the first response to be a continuation, but
+/// selected pooled sessions may receive unsolicited mailbox updates first.
+/// Drain those updates while waiting for the continuation and tagged completion.
+/// Cache reconciliation uses separate sync/IDLE sessions, so these updates do
+/// not need to be applied here.
+async fn append_message(
+    session: &mut Session,
+    folder: &str,
+    flags: Option<&str>,
+    raw: &[u8],
+) -> Result<()> {
+    use async_imap::imap_proto::{Response, Status};
+    use tokio::io::AsyncWriteExt;
+
+    anyhow::ensure!(
+        !folder.contains(['\r', '\n', '\0']),
+        "Invalid APPEND mailbox name"
+    );
+    let mailbox = format!("\"{}\"", folder.replace('\\', "\\\\").replace('"', "\\\""));
+    let flags = flags.map(|flags| format!(" {flags}")).unwrap_or_default();
+    let id = session
+        .run_command(format!("APPEND {mailbox}{flags} {{{}}}", raw.len()))
+        .await?;
+    let mut sent = false;
+    loop {
+        let response = session
+            .read_response()
+            .await?
+            .ok_or(async_imap::error::Error::ConnectionLost)?;
+        match response.parsed() {
+            Response::Continue { .. } if !sent => {
+                session.as_mut().write_all(raw).await?;
+                session.as_mut().write_all(b"\r\n").await?;
+                session.as_mut().flush().await?;
+                sent = true;
+            }
+            Response::Done {
+                tag,
+                status,
+                code,
+                information,
+            } if tag == &id => match status {
+                Status::Ok if sent => return Ok(()),
+                Status::No => {
+                    return Err(async_imap::error::Error::No(format!(
+                        "code: {code:?}, info: {information:?}"
+                    ))
+                    .into());
+                }
+                Status::Bad => {
+                    return Err(async_imap::error::Error::Bad(format!(
+                        "code: {code:?}, info: {information:?}"
+                    ))
+                    .into());
+                }
+                _ => anyhow::bail!("Unexpected APPEND completion: {:?}", response.parsed()),
+            },
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => {
+                return Err(async_imap::error::Error::ConnectionLost.into());
+            }
+            Response::Continue { .. } => anyhow::bail!("Unexpected APPEND continuation"),
+            _ => {}
+        }
+    }
 }
 
 pub async fn append_copied_message(
@@ -1397,10 +1817,30 @@ pub async fn append_copied_message(
         (false, true) => Some("(\\Flagged)"),
         (false, false) => None,
     };
-    session
-        .append(folder, flags, None, &message.raw)
+    append_message(session, folder, flags, &message.raw)
         .await
         .context("IMAP APPEND copied message")?;
+    Ok(())
+}
+
+/// Copy sequentially so a failure retains the number of acknowledged APPENDs.
+/// The failing APPEND may have landed if its completion response was lost.
+pub async fn append_copied_messages(
+    session: &mut Session,
+    folder: &str,
+    messages: &[RawMessageCopy],
+) -> Result<()> {
+    for (copied, message) in messages.iter().enumerate() {
+        append_copied_message(session, folder, message)
+            .await
+            .with_context(|| {
+                format!(
+                    "Copy progress: {copied}/{} confirmed; message size: {} bytes",
+                    messages.len(),
+                    message.raw.len(),
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -1412,19 +1852,8 @@ pub async fn expunge_uids(session: &mut Session, folder: &str, uids: &[u32]) -> 
         return Ok(());
     }
     session.select(folder).await.context("SELECT")?;
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut stream = session
-        .uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")
-        .await
-        .context("UID STORE Deleted")?;
-    while let Some(item) = stream.next().await {
-        item.context("UID STORE item")?;
-    }
-    drop(stream);
+    let uid_sets = uid_set_chunks(uids, MAX_UID_SET_LEN);
+    store_deleted(session, &uid_sets).await?;
 
     let supports_uidplus = match session.capabilities().await {
         Ok(caps) => caps.has_str("UIDPLUS"),
@@ -1432,11 +1861,7 @@ pub async fn expunge_uids(session: &mut Session, folder: &str, uids: &[u32]) -> 
     };
 
     if supports_uidplus {
-        let estream = session.uid_expunge(&uid_set).await.context("UID EXPUNGE")?;
-        futures::pin_mut!(estream);
-        while let Some(item) = estream.next().await {
-            item.context("UID EXPUNGE item")?;
-        }
+        uid_expunge(session, &uid_sets).await?;
     } else {
         let estream = session.expunge().await.context("EXPUNGE")?;
         futures::pin_mut!(estream);
@@ -1478,8 +1903,7 @@ pub async fn empty_folder(session: &mut Session, folder: &str) -> Result<u32> {
 /// own sent reply appears in Sent without being marked unread. Used after SMTP
 /// send so the message threads back into the conversation on next sync.
 pub async fn append_to_sent(session: &mut Session, folder: &str, raw: &[u8]) -> Result<()> {
-    session
-        .append(folder, Some("(\\Seen)"), None, raw)
+    append_message(session, folder, Some("(\\Seen)"), raw)
         .await
         .context("IMAP APPEND")?;
     Ok(())
@@ -1497,8 +1921,7 @@ pub async fn replace_draft(
     raw: &[u8],
     message_id: &str,
 ) -> Result<()> {
-    session
-        .append(folder, Some("(\\Draft \\Seen)"), None, raw)
+    append_message(session, folder, Some("(\\Draft \\Seen)"), raw)
         .await
         .context("IMAP APPEND to Drafts")?;
     if message_id.trim().is_empty() {
@@ -1710,55 +2133,132 @@ pub async fn fetch_full_message(
     media: &parse::MediaCtx,
     peek: bool,
 ) -> Result<Option<parse::Message>> {
-    let item = if peek { "(BODY.PEEK[])" } else { "(RFC822)" };
+    let item = if peek {
+        "(INTERNALDATE BODY.PEEK[])"
+    } else {
+        "(INTERNALDATE RFC822)"
+    };
     let mut stream = session
         .uid_fetch(uid.to_string(), item)
         .await
         .context("UID FETCH")?;
-    let mut raw: Option<Vec<u8>> = None;
+    let mut message: Option<parse::Message> = None;
     while let Some(item) = stream.next().await {
         let fetch = item.context("UID FETCH item")?;
         if let Some(body) = fetch.body() {
-            raw = Some(body.to_vec());
+            let mut parsed = parse::parse_message(body, Some(media));
+            parsed.date = message_date(parsed.date, &fetch);
+            message = Some(parsed);
             break;
         }
     }
     drop(stream);
-    Ok(raw.map(|bytes| parse::parse_message(&bytes, Some(media))))
+    Ok(message)
 }
 
+/// How many messages one `UID FETCH` pulls. One round trip per message dominates
+/// when the bodies themselves are small; a short batch still bounds how long a
+/// caller holds the connection before an interactive read can use it.
+pub const BODY_FETCH_BATCH: usize = 4;
+
 /// Select `folder` and fetch full bodies for `uids`, parsing each into a
-/// `Message`. Used by the mobile thread reader, which (unlike desktop) does not
-/// warm bodies during sync, so opening a thread fetches its bodies on demand.
-/// `peek` so reading doesn't flip server-side `\Seen`.
+/// `Message`. Used by the thread reader and the body prefetcher. `peek` so
+/// reading doesn't flip server-side `\Seen`.
+///
+/// Each message goes to `on_message` as it arrives rather than into a returned
+/// list, so a caller keeps what was downloaded before an error or a deadline
+/// cut the rest short.
 pub async fn fetch_bodies(
     session: &mut Session,
     folder: &str,
     uids: &[u32],
     media_root: std::path::PathBuf,
     account: &str,
-) -> Result<Vec<(u32, parse::Message)>> {
-    session.select(folder).await.context("SELECT")?;
-    let mut out = Vec::new();
-    for &uid in uids {
-        let media = parse::MediaCtx {
-            root: media_root.clone(),
-            account: account.to_string(),
-            folder: folder.to_string(),
-            uid,
-        };
-        if let Some(message) = fetch_full_message(session, uid, &media, true).await? {
-            out.push((uid, message));
-        }
+    on_message: &mut (dyn FnMut(u32, parse::Message) + Send),
+) -> Result<()> {
+    // One recursive walk per batch, including one cut short by an error, a
+    // deadline or cancellation: what arrived before that is already on disk.
+    let mut prune = PruneMediaOnDrop(Some(media_root.clone()));
+    let result =
+        fetch_bodies_unpruned(session, folder, uids, media_root, account, on_message).await;
+    // A fetch that ran to its end waits for the prune, so a caller counting
+    // attachment files afterwards sees the ones that are going to stay.
+    if let Some(root) = prune.0.take() {
+        let _ = tokio::task::spawn_blocking(move || parse::prune_media_cache(&root)).await;
     }
-    Ok(out)
+    result
 }
 
-/// UIDs worth prefetching full bodies for in `folder`: messages that are both
-/// unread *and* received within the last `days` days. The two criteria are ANDed
-/// (IMAP SEARCH semantics). Uses server-side SEARCH so the set isn't limited to
-/// the recent-envelope window and doesn't depend on locally-parsed date strings.
-/// Selects the folder.
+/// Prunes the media cache when a body fetch is dropped where it stands, by a
+/// caller's timeout or cancellation, and so never reaches its own prune.
+struct PruneMediaOnDrop(Option<std::path::PathBuf>);
+
+impl Drop for PruneMediaOnDrop {
+    fn drop(&mut self) {
+        let Some(root) = self.0.take() else {
+            return;
+        };
+        // On a blocking worker when there is a runtime to lend one.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || parse::prune_media_cache(&root))),
+            Err(_) => parse::prune_media_cache(&root),
+        }
+    }
+}
+
+async fn fetch_bodies_unpruned(
+    session: &mut Session,
+    folder: &str,
+    uids: &[u32],
+    media_root: std::path::PathBuf,
+    account: &str,
+    on_message: &mut (dyn FnMut(u32, parse::Message) + Send),
+) -> Result<()> {
+    session.select(folder).await.context("SELECT")?;
+    for chunk in uids.chunks(BODY_FETCH_BATCH) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let set = chunk
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stream = session
+            .uid_fetch(set, "(UID INTERNALDATE BODY.PEEK[])")
+            .await
+            .context("UID FETCH")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH item")?;
+            let Some(uid) = fetch.uid else { continue };
+            let Some(body) = fetch.body() else { continue };
+            let media = parse::MediaCtx {
+                root: media_root.clone(),
+                account: account.to_string(),
+                folder: folder.to_string(),
+                uid,
+            };
+            let mut parsed = parse::parse_message_unpruned(body, Some(&media));
+            parsed.date = message_date(parsed.date, &fetch);
+            on_message(uid, parsed);
+        }
+        drop(stream);
+    }
+    Ok(())
+}
+
+/// IMAP SEARCH key for the body prefetcher: every message received since
+/// `since` (`dd-Mon-yyyy`), read or not. `UNSEEN SINCE` left already-read recent
+/// mail cold, so opening it always waited on a full download. Older unread mail
+/// stays with the on-demand reader: a mailbox can hold years of it, attachments
+/// included.
+pub fn prefetch_search_criteria(since: &str) -> String {
+    format!("SINCE {since}")
+}
+
+/// UIDs worth prefetching full bodies for in `folder`. Uses server-side SEARCH
+/// so the set isn't limited to the recent-envelope window and doesn't depend on
+/// locally-parsed date strings. Selects the folder.
 pub async fn search_prefetch_uids(
     session: &mut Session,
     folder: &str,
@@ -1766,10 +2266,11 @@ pub async fn search_prefetch_uids(
 ) -> Result<Vec<u32>> {
     session.select(folder).await.context("SELECT")?;
     let since = imap_date_days_ago(days);
+    let criteria = prefetch_search_criteria(&since);
     let set: HashSet<u32> = session
-        .uid_search(format!("UNSEEN SINCE {since}"))
+        .uid_search(&criteria)
         .await
-        .context("UID SEARCH UNSEEN SINCE")?;
+        .with_context(|| format!("UID SEARCH {criteria}"))?;
     let mut uids: Vec<u32> = set.into_iter().collect();
     uids.sort_unstable();
     Ok(uids)
@@ -1891,7 +2392,7 @@ fn header_addrs(headers: &[mailparse::MailHeader<'_>], key: &str) -> Vec<Recipie
     let Some(header) = headers.get_first_header(key) else {
         return Vec::new();
     };
-    let Ok(list) = mailparse::addrparse_header(header) else {
+    let Some(list) = parse::addrparse_lenient(header) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1918,14 +2419,90 @@ fn push_recipient(out: &mut Vec<Recipient>, info: &mailparse::SingleInfo) {
     });
 }
 
+/// The message's send time: its `Date` header when that parses, otherwise the
+/// server's INTERNALDATE (arrival time). Some senders omit the header or write
+/// one chrono rejects; without the fallback such a message is dated 1970 and
+/// sinks to the bottom of every date-ordered list.
+fn message_date(header_date: i64, fetch: &async_imap::types::Fetch) -> i64 {
+    if header_date != 0 {
+        return header_date;
+    }
+    fetch
+        .internal_date()
+        .map(|date| date.timestamp())
+        .unwrap_or_default()
+}
+
+/// Attachment metadata without downloading the MIME payload. Inline CID images
+/// are left to the cached body's more precise HTML-reference check.
+fn attachment_files(
+    body: &async_imap::imap_proto::types::BodyStructure<'_>,
+) -> Vec<crate::store::CardFile> {
+    use async_imap::imap_proto::types::BodyStructure;
+    let (common, other) = match body {
+        BodyStructure::Multipart { bodies, .. } => {
+            return bodies.iter().flat_map(attachment_files).collect();
+        }
+        BodyStructure::Basic { common, other, .. }
+        | BodyStructure::Text { common, other, .. }
+        | BodyStructure::Message { common, other, .. } => (common, other),
+    };
+    let disposition = common.disposition.as_ref();
+    let explicit_attachment = disposition.is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"));
+    let filename = disposition
+        .and_then(|d| body_parameter(&d.params, "filename"))
+        .or_else(|| body_parameter(&common.ty.params, "name"));
+    if !explicit_attachment && common.ty.ty.eq_ignore_ascii_case("image") && other.id.is_some() {
+        return Vec::new();
+    }
+    let mime = format!("{}/{}", common.ty.ty, common.ty.subtype).to_ascii_lowercase();
+    if !parse::is_attachment_part(&mime, explicit_attachment, filename.is_some()) {
+        return Vec::new();
+    }
+    vec![crate::store::CardFile {
+        filename: filename.unwrap_or_else(|| "attachment".to_string()),
+        mime,
+    }]
+}
+
+/// Reuse the MIME parser's RFC 2231 charset/continuation handling, and decode
+/// the RFC 2047 words some servers return in otherwise ordinary name params.
+fn body_parameter(
+    params: &async_imap::imap_proto::types::BodyParams<'_>,
+    name: &str,
+) -> Option<String> {
+    let params = params.as_ref()?;
+    if let Some((_, value)) = params
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+    {
+        return Some(parse::decode_words(&format!(" {value}")));
+    }
+    let prefix = format!("{name}*");
+    let mut header = String::from("attachment");
+    for (key, value) in params {
+        if key.to_ascii_lowercase().starts_with(&prefix) {
+            header.push_str(&format!("; {key}=\"{value}\""));
+        }
+    }
+    mailparse::parse_content_disposition(&header)
+        .params
+        .get(name)
+        .map(|value| parse::decode_words(&format!(" {value}")))
+}
+
 /// FETCH item list. Adds `X-GM-THRID` on Gmail so messages thread by Gmail's
 /// server-side thread id, and `BODY.PEEK[]` when the full message is wanted.
 fn fetch_items(gmail: bool, body: bool) -> &'static str {
     match (gmail, body) {
-        (true, true) => "(UID FLAGS RFC822.HEADER X-GM-MSGID X-GM-THRID BODY.PEEK[])",
-        (true, false) => "(UID FLAGS RFC822.HEADER X-GM-MSGID X-GM-THRID)",
-        (false, true) => "(UID FLAGS RFC822.HEADER BODY.PEEK[])",
-        (false, false) => "(UID FLAGS RFC822.HEADER)",
+        (true, true) => {
+            "(UID FLAGS INTERNALDATE RFC822.HEADER BODYSTRUCTURE X-GM-MSGID X-GM-THRID BODY.PEEK[])"
+        }
+        (true, false) => {
+            "(UID FLAGS INTERNALDATE RFC822.HEADER BODYSTRUCTURE X-GM-MSGID X-GM-THRID)"
+        }
+        (false, true) => "(UID FLAGS INTERNALDATE RFC822.HEADER BODYSTRUCTURE BODY.PEEK[])",
+        (false, false) => "(UID FLAGS INTERNALDATE RFC822.HEADER BODYSTRUCTURE)",
     }
 }
 
@@ -2019,11 +2596,251 @@ fn first_message_id(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::tcp_looks_open;
+
+    #[test]
+    fn a_rotated_refresh_token_is_kept_and_an_absent_one_is_not_invented() {
+        let rotated: super::TokenResponse = serde_json::from_str(
+            r#"{"access_token":"a2","expires_in":1800,"refresh_token":"r2","scope":"x"}"#,
+        )
+        .unwrap();
+        let rotated = super::RefreshedToken::from(rotated);
+        assert_eq!(rotated.access_token, "a2");
+        assert_eq!(rotated.expires_in, 1800);
+        assert_eq!(rotated.refresh_token.as_deref(), Some("r2"));
+
+        let plain: super::TokenResponse = serde_json::from_str(r#"{"access_token":"a2"}"#).unwrap();
+        let plain = super::RefreshedToken::from(plain);
+        assert_eq!(plain.expires_in, 3600);
+        assert_eq!(plain.refresh_token, None);
+
+        let blank: super::TokenResponse =
+            serde_json::from_str(r#"{"access_token":"a2","refresh_token":" "}"#).unwrap();
+        assert_eq!(super::RefreshedToken::from(blank).refresh_token, None);
+    }
+
+    #[test]
+    fn only_a_refused_grant_counts_as_rejected() {
+        let refused = super::oauth_refresh_error(
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","error_description":"expired"}"#,
+        );
+        assert!(super::oauth_grant_rejected(&refused));
+        assert!(
+            refused
+                .to_string()
+                .starts_with("oauth refresh failed (400 Bad Request)")
+        );
+        // Wrapped the way callers add context.
+        assert!(super::oauth_grant_rejected(&refused.context("sync INBOX")));
+
+        // The text alone is not the verdict: it has to be the error code.
+        let mentioned = super::oauth_refresh_error(
+            "500 Internal Server Error",
+            r#"{"error":"server_error","error_description":"invalid_grant lookup failed"}"#,
+        );
+        assert!(!super::oauth_grant_rejected(&mentioned));
+        let gateway = super::oauth_refresh_error("502 Bad Gateway", "<html>invalid_grant</html>");
+        assert!(!super::oauth_grant_rejected(&gateway));
+        let offline = anyhow::anyhow!("oauth refresh request: connection refused");
+        assert!(!super::oauth_grant_rejected(&offline));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tcp_looks_open_spots_a_connection_the_peer_closed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        assert!(tcp_looks_open(&client));
+
+        drop(server);
+        // The reactor records the FIN asynchronously.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tcp_looks_open(&client) {
+            assert!(std::time::Instant::now() < deadline, "close never observed");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     use super::{
-        MIN_PROTOCOL_TIMEOUT, civil_from_days, first_message_id, header_fields, imap_quote,
-        interleave_address_families, looks_like_drafts, message_id_search_criteria,
-        normalize_message_id, protocol_timeout_for, search_criteria, thread_key,
+        MIN_PROTOCOL_TIMEOUT, attachment_files, civil_from_days, fetch_items, first_message_id,
+        gmail_raw, header_fields, imap_quote, interleave_address_families, looks_like_drafts,
+        message_id_search_criteria, normalize_message_id, prefetch_search_criteria,
+        protocol_timeout_for, search_criteria, thread_key, uid_set_chunks,
     };
+
+    #[test]
+    fn prefetch_search_includes_recent_read_mail() {
+        assert_eq!(prefetch_search_criteria("01-Oct-2026"), "SINCE 01-Oct-2026");
+    }
+
+    #[test]
+    fn bodystructure_attachments_include_unopened_nested_files() {
+        use async_imap::imap_proto::{
+            parser::parse_response,
+            types::{AttributeValue, Response},
+        };
+        let response = br#"* 1 FETCH (BODYSTRUCTURE (("TEXT" "PLAIN" NIL NIL NIL "7BIT" 10 1)(("IMAGE" "PNG" ("NAME" "logo.png") "<logo>" NIL "BASE64" 10 NIL ("INLINE" ("FILENAME" "logo.png")))("APPLICATION" "PDF" ("NAME" "report.pdf") NIL NIL "BASE64" 20 NIL ("ATTACHMENT" ("FILENAME" "report.pdf"))) "RELATED")("TEXT" "PLAIN" ("NAME" "notes.txt") NIL NIL "7BIT" 10 1 NIL ("ATTACHMENT" ("FILENAME" "notes.txt"))) "MIXED"))
+"#;
+        // IMAP responses use CRLF, including the mock response here.
+        let response = String::from_utf8_lossy(response).replace('\n', "\r\n");
+        let (_, Response::Fetch(_, attributes)) = parse_response(response.as_bytes()).unwrap()
+        else {
+            panic!("expected FETCH")
+        };
+        let body = attributes
+            .iter()
+            .find_map(|attr| match attr {
+                AttributeValue::BodyStructure(body) => Some(body),
+                _ => None,
+            })
+            .unwrap();
+        let files = attachment_files(body);
+        assert_eq!(
+            files,
+            vec![
+                crate::store::CardFile {
+                    filename: "report.pdf".into(),
+                    mime: "application/pdf".into()
+                },
+                crate::store::CardFile {
+                    filename: "notes.txt".into(),
+                    mime: "text/plain".into()
+                },
+            ]
+        );
+        assert!(fetch_items(false, false).contains("BODYSTRUCTURE"));
+        assert!(fetch_items(true, false).contains("BODYSTRUCTURE"));
+    }
+
+    #[test]
+    fn bodystructure_filenames_decode_words_and_extended_parameters() {
+        use std::borrow::Cow;
+        let check = |pairs: &[(&str, &str)], name, expected| {
+            let params = Some(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (Cow::Borrowed(*key), Cow::Borrowed(*value)))
+                    .collect(),
+            );
+            assert_eq!(
+                super::body_parameter(&params, name).as_deref(),
+                Some(expected)
+            );
+        };
+        check(
+            &[("FILENAME", "=?UTF-8?B?6KuL5rGC5pu4LnBkZg==?=")],
+            "filename",
+            "請求書.pdf",
+        );
+        check(
+            &[("filename*", "UTF-8'ja'%E8%AB%8B%E6%B1%82%E6%9B%B8.pdf")],
+            "filename",
+            "請求書.pdf",
+        );
+        check(
+            &[
+                ("name*1*", "%E6%9B%B8.pdf"),
+                ("name*0*", "UTF-8''%E8%AB%8B%E6%B1%82"),
+            ],
+            "name",
+            "請求書.pdf",
+        );
+        check(
+            &[("filename*", "iso-8859-1''caf%E9.pdf")],
+            "filename",
+            "café.pdf",
+        );
+        check(
+            &[("filename", "quote\";literal.pdf")],
+            "filename",
+            "quote\";literal.pdf",
+        );
+    }
+
+    #[test]
+    fn provisional_files_match_mime_reader_for_named_and_unnamed_parts() {
+        use async_imap::imap_proto::{
+            parser::parse_response,
+            types::{AttributeValue, Response},
+        };
+        for (structure, mime_headers, file_count) in [
+            (
+                r#"("APPLICATION" "PDF" ("NAME*" "utf-8''caf%C3%A9.pdf") NIL NIL "BASE64" 4)"#,
+                "Content-Type: application/pdf; name*=utf-8''caf%C3%A9.pdf\r\nContent-Transfer-Encoding: base64\r\n",
+                1,
+            ),
+            (
+                r#"("TEXT" "PLAIN" ("NAME" "notes.txt") NIL NIL "7BIT" 4 1)"#,
+                "Content-Type: text/plain; name=notes.txt\r\n",
+                0,
+            ),
+            (
+                r#"("TEXT" "HTML" ("NAME" "body.html") NIL NIL "7BIT" 4 1 NIL ("INLINE" ("FILENAME" "body.html")))"#,
+                "Content-Type: text/html; name=body.html\r\nContent-Disposition: inline; filename=body.html\r\n",
+                0,
+            ),
+            (
+                r#"("IMAGE" "PNG" NIL NIL NIL "BASE64" 4)"#,
+                "Content-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n",
+                1,
+            ),
+            (
+                r#"("TEXT" "CALENDAR" ("NAME" "invite.ics") NIL NIL "7BIT" 4 1 NIL ("INLINE" ("FILENAME" "invite.ics")))"#,
+                "Content-Type: text/calendar; name=invite.ics\r\nContent-Disposition: inline; filename=invite.ics\r\n",
+                0,
+            ),
+            (
+                r#"("TEXT" "CALENDAR" ("NAME" "invite.ics") NIL NIL "7BIT" 4 1 NIL ("ATTACHMENT" ("FILENAME" "invite.ics")))"#,
+                "Content-Type: text/calendar; name=invite.ics\r\nContent-Disposition: attachment; filename=invite.ics\r\n",
+                1,
+            ),
+        ] {
+            let response = format!("* 1 FETCH (BODYSTRUCTURE {structure})\r\n");
+            let (_, Response::Fetch(_, attributes)) = parse_response(response.as_bytes()).unwrap()
+            else {
+                panic!("expected FETCH")
+            };
+            let body = attributes
+                .iter()
+                .find_map(|attr| match attr {
+                    AttributeValue::BodyStructure(body) => Some(body),
+                    _ => None,
+                })
+                .unwrap();
+            let raw = format!("{mime_headers}\r\nYQ==");
+            let message = crate::parse::parse_message(raw.as_bytes(), None);
+            let expected: Vec<_> = message
+                .file_attachments()
+                .map(|file| crate::store::CardFile {
+                    filename: file.filename.clone(),
+                    mime: file.mime.clone(),
+                })
+                .collect();
+            assert_eq!(expected.len(), file_count, "{structure}");
+            assert_eq!(attachment_files(body), expected, "{structure}");
+        }
+    }
+
+    #[test]
+    fn uid_set_chunks_compacts_runs_and_splits_long_sets() {
+        assert_eq!(
+            uid_set_chunks(&[5, 1, 2, 3, 9, 3, 11, 12], 100),
+            vec!["1:3,5,9,11:12"]
+        );
+        assert!(uid_set_chunks(&[], 100).is_empty());
+        let scattered = (1..=20_000).map(|n| n * 2).collect::<Vec<u32>>();
+        let chunks = uid_set_chunks(&scattered, 7000);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 7000));
+        let rejoined = chunks
+            .join(",")
+            .split(',')
+            .map(|uid| uid.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rejoined, scattered);
+    }
 
     #[test]
     fn protocol_stage_timeout_leaves_room_for_a_slow_but_healthy_login() {
@@ -2092,6 +2909,32 @@ mod tests {
         assert!(header_fields(b"From: x@y\r\n\r\n").subject.is_empty());
         assert!(header_fields(b"Subject:\r\n\r\n").subject.is_empty());
         assert!(header_fields(b"").subject.is_empty());
+    }
+
+    #[test]
+    fn header_fields_decodes_encoded_word_glued_to_from_name() {
+        // "GyRCJUYlOSVIGyhC" is ISO-2022-JP "テスト".
+        let ef = header_fields(
+            b"From: Acme=?iso-2022-jp?B?GyRCJUYlOSVIGyhC?= <news@example.com>\r\n\r\n",
+        );
+        assert_eq!(ef.from_name, "Acme\u{30c6}\u{30b9}\u{30c8}");
+        assert_eq!(ef.from_addr, "news@example.com");
+
+        // Every entry of a list, with non-ASCII before a glued name.
+        let ef = header_fields(
+            "From: x@example.com\r\nTo: \"Zo\u{eb}\" <z@example.com>, Acme=?UTF-8?Q?Foo?= <a@example.com>, Team: Bob=?UTF-8?Q?_Jr?= <b@example.com>;\r\n\r\n".as_bytes(),
+        );
+        assert_eq!(
+            ef.to
+                .iter()
+                .map(|r| (r.name.as_str(), r.addr.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Zo\u{eb}", "z@example.com"),
+                ("AcmeFoo", "a@example.com"),
+                ("Bob Jr", "b@example.com")
+            ]
+        );
     }
 
     #[test]
@@ -2166,7 +3009,7 @@ mod tests {
         tokio::spawn(serve_canned(listener, fetch_reply));
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client = async_imap::Client::new(super::Stream::Plain(tcp));
+        let mut client = async_imap::Client::new(super::Stream::plain(tcp));
         client.read_response().await.unwrap().unwrap();
         let mut session = client.login("u", "p").await.map_err(|(e, _)| e).unwrap();
         match super::fetch_recent(&mut session, "INBOX", 50).await {
@@ -2268,20 +3111,89 @@ mod tests {
     }
 
     #[test]
+    fn search_criteria_ors_a_terms_alternatives() {
+        assert_eq!(
+            search_criteria(false, "from:{a b c} to:d", false, false),
+            "OR FROM \"a\" OR FROM \"b\" FROM \"c\" OR TO \"d\" CC \"d\""
+        );
+        assert_eq!(
+            search_criteria(false, "to:a OR to:b", false, false),
+            "OR OR TO \"a\" CC \"a\" OR TO \"b\" CC \"b\""
+        );
+    }
+
+    #[test]
     fn search_criteria_announces_utf8_only_when_asked() {
         assert_eq!(
-            search_criteria(false, "plan", false),
+            search_criteria(false, "plan", false, false),
             "OR OR SUBJECT \"plan\" FROM \"plan\" TEXT \"plan\""
         );
-        assert_eq!(search_criteria(true, "plan", false), "X-GM-RAW \"plan\"");
+        assert_eq!(
+            search_criteria(true, "plan", false, false),
+            "X-GM-RAW \"plan\""
+        );
         // Non-ASCII queries need the charset; the retry drops it again.
         assert_eq!(
-            search_criteria(true, "会議", true),
+            search_criteria(true, "会議", true, false),
             "CHARSET UTF-8 X-GM-RAW \"会議\""
         );
         assert_eq!(
-            search_criteria(false, "会議", true),
+            search_criteria(false, "会議", true, false),
             "CHARSET UTF-8 OR OR SUBJECT \"会議\" FROM \"会議\" TEXT \"会議\""
+        );
+    }
+
+    #[test]
+    fn gmail_groups_queries_joined_on_separate_lines() {
+        assert_eq!(gmail_raw("from:a budget"), "from:a budget");
+        assert_eq!(
+            gmail_raw("subject:\"Q3\nAND ANDROID paid"),
+            "(subject:\"Q3\") (ANDROID paid)"
+        );
+        assert_eq!(gmail_raw("from:a\nAND "), "from:a\nAND ");
+        assert_eq!(
+            gmail_raw("from:{a \"b\nAND 27\" x"),
+            "(from:{a \"b\"}) (27\" x\")"
+        );
+    }
+
+    #[test]
+    fn search_criteria_compiles_operators_off_gmail() {
+        assert_eq!(
+            search_criteria(false, "from:a@b.c to:d@e.f plan", false, false),
+            "OR OR SUBJECT \"plan\" FROM \"plan\" TEXT \"plan\" FROM \"a@b.c\" \
+             OR TO \"d@e.f\" CC \"d@e.f\""
+        );
+        assert_eq!(
+            search_criteria(
+                false,
+                r#"subject:"Q3 plan" is:unread is:starred after:2026/01/02 before:2026-02-03"#,
+                false,
+                false
+            ),
+            "SUBJECT \"Q3 plan\" UNSEEN FLAGGED SENTSINCE 02-Jan-2026 SENTBEFORE 03-Feb-2026"
+        );
+        // Gmail gets the query untouched, operators and all.
+        assert_eq!(
+            search_criteria(true, "from:a@b.c has:attachment", false, false),
+            "X-GM-RAW \"from:a@b.c has:attachment\""
+        );
+        assert_eq!(
+            search_criteria(false, "from:安娜", true, true),
+            "CHARSET UTF-8 FROM {6+}\r\n安娜"
+        );
+    }
+
+    #[test]
+    fn search_criteria_sends_non_ascii_as_literal_plus() {
+        // "会議" is 6 UTF-8 octets; the count is bytes, not chars.
+        assert_eq!(
+            search_criteria(true, " 会議 ", true, true),
+            "CHARSET UTF-8 X-GM-RAW {6+}\r\n会議"
+        );
+        assert_eq!(
+            search_criteria(false, "é\r\nx", true, true),
+            "CHARSET UTF-8 OR OR SUBJECT {5+}\r\né  x FROM {5+}\r\né  x TEXT {5+}\r\né  x"
         );
     }
 
@@ -2351,23 +3263,34 @@ async fn expunge_selected_uids(session: &mut Session, uids: &[u32]) -> Result<()
     if uids.is_empty() {
         return Ok(());
     }
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut stream = session
-        .uid_store(&uid_set, "+FLAGS.SILENT (\\Deleted)")
-        .await
-        .context("UID STORE Deleted")?;
-    while let Some(item) = stream.next().await {
-        item.context("UID STORE item")?;
+    let uid_sets = uid_set_chunks(uids, MAX_UID_SET_LEN);
+    store_deleted(session, &uid_sets).await?;
+    uid_expunge(session, &uid_sets).await
+}
+
+/// Flag every UID in `uid_sets` `\Deleted` in the selected mailbox.
+async fn store_deleted(session: &mut Session, uid_sets: &[String]) -> Result<()> {
+    for uid_set in uid_sets {
+        let mut stream = session
+            .uid_store(uid_set, "+FLAGS.SILENT (\\Deleted)")
+            .await
+            .context("UID STORE Deleted")?;
+        while let Some(item) = stream.next().await {
+            item.context("UID STORE item")?;
+        }
     }
-    drop(stream);
-    let stream = session.uid_expunge(&uid_set).await.context("UID EXPUNGE")?;
-    futures::pin_mut!(stream);
-    while let Some(item) = stream.next().await {
-        item.context("UID EXPUNGE item")?;
+    Ok(())
+}
+
+/// UID EXPUNGE (RFC 4315) exactly the UIDs in `uid_sets`, leaving any other
+/// `\Deleted` message in the mailbox alone.
+async fn uid_expunge(session: &mut Session, uid_sets: &[String]) -> Result<()> {
+    for uid_set in uid_sets {
+        let stream = session.uid_expunge(uid_set).await.context("UID EXPUNGE")?;
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            item.context("UID EXPUNGE item")?;
+        }
     }
     Ok(())
 }
@@ -2386,21 +3309,211 @@ pub async fn move_to_folder_checked(
         "Moving through MCP requires IMAP MOVE or UIDPLUS; no messages were changed"
     );
     session.select(folder).await.context("SELECT")?;
-    let uid_set = uids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    if supports_move {
-        session.uid_mv(&uid_set, target).await.context("UID MOVE")?;
-    } else {
-        session
-            .uid_copy(&uid_set, target)
-            .await
-            .context("UID COPY")?;
+    for uid_set in uid_set_chunks(uids, MAX_UID_SET_LEN) {
+        if supports_move {
+            session.uid_mv(&uid_set, target).await.context("UID MOVE")?;
+        } else {
+            session
+                .uid_copy(&uid_set, target)
+                .await
+                .context("UID COPY")?;
+        }
+    }
+    if !supports_move {
         expunge_selected_uids(session, uids).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn copy_failure_reports_only_confirmed_appends_and_keeps_server_reason() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+            for command in 0..3 {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                let tag = line.split_whitespace().next().unwrap();
+                let response = match command {
+                    0 => format!("{tag} OK logged in\r\n"),
+                    1 => {
+                        assert!(line.contains("APPEND"));
+                        writer.write_all(b"+ ready\r\n").await.unwrap();
+                        let mut literal = [0; 6];
+                        reader.read_exact(&mut literal).await.unwrap();
+                        assert_eq!(&literal, b"body\r\n");
+                        format!("{tag} OK copied\r\n")
+                    }
+                    _ => {
+                        assert!(line.contains("APPEND"));
+                        format!(
+                            "{tag} NO [LIMIT] Mail size is larger than the maximum size allowed by server configuration\r\n"
+                        )
+                    }
+                };
+                writer.write_all(response.as_bytes()).await.unwrap();
+            }
+            let mut remainder = Vec::new();
+            reader.read_to_end(&mut remainder).await.unwrap();
+            assert!(remainder.is_empty(), "must stop after the rejected APPEND");
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut client = async_imap::Client::new(Stream::plain(tcp));
+        client.read_response().await.unwrap().unwrap();
+        let mut session = client
+            .login("test", "test")
+            .await
+            .map_err(|(err, _)| err)
+            .unwrap();
+        let messages = vec![
+            RawMessageCopy {
+                uid: 7,
+                raw: b"body".to_vec(),
+                seen: false,
+                starred: false,
+            };
+            3
+        ];
+        let error = append_copied_messages(&mut session, "INBOX", &messages)
+            .await
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("Copy progress: 1/3 confirmed; message size: 4 bytes"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("Mail size is larger"), "{diagnostic}");
+        drop(session);
+        task.await.unwrap();
+    }
+
+    async fn server(reply: &'static str) -> (Session, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let tag = line.split_whitespace().next().unwrap();
+            writer
+                .write_all(format!("{tag} OK logged in\r\n").as_bytes())
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let tag = line.split_whitespace().next().unwrap().to_string();
+            assert!(
+                line.contains("APPEND \"a\\\"b\\\\c\" (\\Seen \\Flagged)"),
+                "{line}"
+            );
+            let size: usize = line
+                .split('{')
+                .last()
+                .unwrap()
+                .trim()
+                .trim_end_matches('}')
+                .parse()
+                .unwrap();
+            writer
+                .write_all(reply.replace("{tag}", &tag).as_bytes())
+                .await
+                .unwrap();
+            if !reply.contains("+ ready") {
+                // A rejected APPEND must not send the literal, and the session
+                // must still be usable for the next command.
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.contains("NOOP"), "{line}");
+                let tag = line.split_whitespace().next().unwrap();
+                writer
+                    .write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                return Vec::new();
+            }
+            let mut literal = vec![0; size + 2];
+            reader.read_exact(&mut literal).await.unwrap();
+            writer
+                .write_all(format!("* 3 EXISTS\r\n{tag} OK [APPENDUID 42 7] done\r\n").as_bytes())
+                .await
+                .unwrap();
+            literal
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut client = async_imap::Client::new(Stream::plain(tcp));
+        client.read_response().await.unwrap().unwrap();
+        let session = client
+            .login("u", "p")
+            .await
+            .map_err(|(err, _)| err)
+            .unwrap();
+        (session, task)
+    }
+
+    #[tokio::test]
+    async fn append_waits_past_mailbox_updates_for_continuation() {
+        for reply in [
+            "+ ready\r\n",
+            "* 2 EXISTS\r\n* 1 EXPUNGE\r\n* 1 FETCH (FLAGS (\\Seen))\r\n* OK update\r\n+ ready\r\n",
+        ] {
+            let (mut session, task) = server(reply).await;
+            let raw = b"Subject: copy\r\n\r\nbody\x00\xff";
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                append_copied_message(
+                    &mut session,
+                    "a\"b\\c",
+                    &RawMessageCopy {
+                        uid: 0,
+                        raw: raw.to_vec(),
+                        seen: true,
+                        starred: true,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(task.await.unwrap(), [raw.as_slice(), b"\r\n"].concat());
+        }
+    }
+
+    #[tokio::test]
+    async fn append_preserves_rejection_without_sending_literal() {
+        for status in ["NO", "BAD"] {
+            let reply = if status == "NO" {
+                "* 2 EXISTS\r\n{tag} NO [TRYCREATE] missing mailbox\r\n"
+            } else {
+                "{tag} BAD invalid append\r\n"
+            };
+            let (mut session, task) = server(reply).await;
+            let err = append_message(&mut session, "a\"b\\c", Some("(\\Seen \\Flagged)"), b"body")
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(if status == "NO" {
+                    "missing mailbox"
+                } else {
+                    "invalid append"
+                }),
+                "{err}"
+            );
+            session.noop().await.unwrap();
+            assert!(task.await.unwrap().is_empty());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2445,7 +3558,7 @@ mod mcp_mutation_tests {
             }
         });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client = async_imap::Client::new(Stream::Plain(tcp));
+        let mut client = async_imap::Client::new(Stream::plain(tcp));
         client.read_response().await.unwrap().unwrap();
         let session = client
             .login("test", "test")
@@ -2510,6 +3623,38 @@ mod mcp_mutation_tests {
                 assert!(calls.iter().any(|c| c == "UID EXPUNGE 7"), "{calls:?}");
             } else {
                 assert!(!calls.iter().any(|c| c.starts_with("UID ")), "{calls:?}");
+            }
+            task.abort();
+        }
+    }
+    #[tokio::test]
+    async fn large_uid_sets_are_sent_in_bounded_commands() {
+        for caps in ["MOVE", "UIDPLUS"] {
+            let (mut session, commands, task) = server(caps).await;
+            let uids = (1..=20_000).map(|n| n * 2).collect::<Vec<u32>>();
+            move_to_folder(&mut session, "INBOX", "Archive", &uids)
+                .await
+                .unwrap();
+            let calls = commands.lock().unwrap().clone();
+            let uid_calls = calls
+                .iter()
+                .filter(|c| c.starts_with("UID "))
+                .collect::<Vec<_>>();
+            assert!(uid_calls.len() > 3, "{}", uid_calls.len());
+            assert!(uid_calls.iter().all(|c| c.len() < 8192));
+            let verb = if caps == "MOVE" {
+                "UID MOVE "
+            } else {
+                "UID COPY "
+            };
+            let moved = uid_calls
+                .iter()
+                .filter_map(|c| c.strip_prefix(verb))
+                .flat_map(|c| c.split_once(' ').unwrap().0.split(','))
+                .count();
+            assert_eq!(moved, uids.len());
+            if caps == "UIDPLUS" {
+                assert!(uid_calls.iter().any(|c| c.starts_with("UID EXPUNGE ")));
             }
             task.abort();
         }

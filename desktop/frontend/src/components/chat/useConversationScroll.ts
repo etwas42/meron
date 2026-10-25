@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
+import { createContext, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { markMessagesRead } from '../../states/mailFlags'
 import { thread$ } from '../../states/thread'
@@ -7,6 +7,7 @@ import {
   ANCHOR_GAP_PX,
   anchorScrollTop,
   collectManualUnreadIds,
+  COMPOSER_OVERLAP_VAR,
   isAtBottom,
   isMessageRead,
   isUserScroll,
@@ -14,8 +15,10 @@ import {
   pinnedScrollTop,
   resolveOpenScroll,
   resolveResizeScrollTop,
+  scrollReleasesPin,
   type ScrollAnchor,
   type ScrollMetrics,
+  visibleBounds,
 } from './conversationScroll'
 
 /** How long an assignment of ours waits for its scroll event before we stop
@@ -69,7 +72,6 @@ export function useConversationScroll(
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null)
   const messagesWrapperRef = useRef<HTMLDivElement | null>(null)
-  const lastScrollHeightRef = useRef(0)
   // Content height as of the last position we know the reader's view was
   // measured against — their own scrolling, or our own anchoring. A message
   // arriving is judged against this rather than against the height it just
@@ -87,6 +89,7 @@ export function useConversationScroll(
   // arrived" apart from "read state changed" so we don't yank the user's scroll.
   const positionedThreadRef = useRef('')
   const messageCountRef = useRef(0)
+  const newestMessageIdRef = useRef('')
   // Message the last positioning landed on. While set, the ResizeObserver below
   // re-anchors to it (instead of snapping to the bottom) so bodies growing from
   // their placeholder height don't push it out of view. Thread-open and direct-
@@ -111,11 +114,16 @@ export function useConversationScroll(
   // already had).
   const ownScrollPendingRef = useRef(false)
   const ownScrollForgetTimerRef = useRef(0)
+  // The view as of the last positioning, resize pass or scroll event — what a
+  // scroll event is measured against (scrollReleasesPin) and where the reader
+  // left the view before a resize (resolveResizeScrollTop).
+  const settledGeometryRef = useRef<ScrollMetrics | null>(null)
 
   const applyScrollTop = useCallback((container: HTMLElement, scrollTop: number) => {
     const previousScrollTop = container.scrollTop
     container.scrollTop = scrollTop
     viewedScrollHeightRef.current = container.scrollHeight
+    settledGeometryRef.current = readScrollMetrics(container)
     // Read it back: the browser clamps to the scrollable range, and the clamped
     // value is what the scroll event will report.
     expectedScrollTopRef.current = container.scrollTop
@@ -187,6 +195,33 @@ export function useConversationScroll(
     [],
   )
 
+  /** Keeps the reader's place through every message expanding or collapsing at
+   *  once: called before the change, it pins the message at the top of the
+   *  viewport where it is, until the reader scrolls. Collapsing, a position
+   *  deep inside that message no longer exists, so its summary is brought to
+   *  the top instead. A reader at the end of the thread is reading the newest
+   *  message, which no menu action collapses, so that one is held instead:
+   *  holding whatever summary line happened to sit at the top would carry a
+   *  short thread off to its beginning as everything above the newest opens. */
+  const holdTopMessage = useCallback(
+    (collapsing: boolean) => {
+      const container = scrollRef.current
+      if (!container) return
+      if (isAtBottom(readScrollMetrics(container))) {
+        const elements = container.querySelectorAll<HTMLElement>('[data-message-id]')
+        const newest = elements.item(elements.length - 1)
+        if (newest?.dataset.messageId) {
+          pinMessage(newest.dataset.messageId, container.scrollTop - (newest.offsetTop - container.offsetTop), true)
+          return
+        }
+      }
+      const anchor = readScrollAnchor(container)
+      if (!anchor) return
+      pinMessage(anchor.messageId, collapsing ? Math.min(anchor.offset, -ANCHOR_GAP_PX) : anchor.offset, true)
+    },
+    [pinMessage],
+  )
+
   /** Brings a message's header to the top of the viewport, pinned so a body
    *  still growing from its placeholder height doesn't push it back out of
    *  view. Used when the reader expands a collapsed message: expanding in place
@@ -208,6 +243,7 @@ export function useConversationScroll(
   )
 
   const pendingScrollMessageId = useValue(thread$.pendingScrollMessageId)
+  const pendingOwnSendId = useValue(thread$.pendingOwnSendId)
 
   // Messages the reader turned unread by hand while the thread was open, and the
   // unread flags of the last render they were derived from. Declared as a layout
@@ -253,10 +289,21 @@ export function useConversationScroll(
   const maybeMarkRead = useCallback(() => {
     const container = scrollRef.current
     if (!container || !activeThreadId) return
+    // Mail arriving in the open thread while the window sits in the background
+    // has not been seen yet; the focus listener below catches up on return.
+    if (document.visibilityState === 'hidden' || !document.hasFocus()) return
     const hasUnread = messages.some((message) => message.thread_id === activeThreadId && message.unread)
     if (!hasUnread) return
+    // A message whose body is still loading (or failed to) shows only a short
+    // placeholder, which fits the viewport without having been read. It is
+    // marked once the body arrives and resizes the list.
+    const bodyMissingIds = new Set(messages.filter((message) => message.body_missing).map((message) => message.id))
 
-    const containerRect = container.getBoundingClientRect()
+    // Messages behind the floating composer are not in view yet.
+    const containerRect = visibleBounds(
+      container.getBoundingClientRect(),
+      parseFloat(getComputedStyle(container).getPropertyValue(COMPOSER_OVERLAP_VAR)) || 0,
+    )
     const isVisible = (element: HTMLElement) => {
       const rect = element.getBoundingClientRect()
       return rect.top < containerRect.bottom && rect.bottom > containerRect.top
@@ -274,7 +321,10 @@ export function useConversationScroll(
     const visibleMessageIds = Array.from(container.querySelectorAll<HTMLElement>('[data-unread="true"]'))
       .filter(isRead)
       .map((element) => element.dataset.messageId)
-      .filter((id): id is string => !!id && !markingMessageIdsRef.current.has(id) && !heldUnreadIdsRef.current.has(id))
+      .filter(
+        (id): id is string =>
+          !!id && !bodyMissingIds.has(id) && !markingMessageIdsRef.current.has(id) && !heldUnreadIdsRef.current.has(id),
+      )
 
     if (visibleMessageIds.length === 0) return
     for (const id of visibleMessageIds) {
@@ -293,16 +343,22 @@ export function useConversationScroll(
     const ours = ownScrollPendingRef.current
     ownScrollPendingRef.current = false
     // The reader moving the view — including by dragging the scrollbar, which
-    // dispatches no mouse events here — outranks the settle-window anchor.
+    // dispatches no mouse events here — outranks the pin.
+    const metrics = container ? readScrollMetrics(container) : null
     if (
-      container &&
+      metrics &&
       pinnedRef.current &&
-      !pinnedRef.current.persistent &&
       !ours &&
-      isUserScroll(container.scrollTop, expectedScrollTopRef.current)
+      scrollReleasesPin({
+        persistent: pinnedRef.current.persistent,
+        metrics,
+        expectedScrollTop: expectedScrollTopRef.current,
+        settledGeometry: settledGeometryRef.current,
+      })
     ) {
       releasePin()
     }
+    if (metrics) settledGeometryRef.current = metrics
     if (container) viewedScrollHeightRef.current = container.scrollHeight
     saveConversationScroll()
     maybeMarkRead()
@@ -320,6 +376,22 @@ export function useConversationScroll(
     markingMessageIdsRef.current.clear()
   }, [activeThreadId, unreadKey])
 
+  // Back in the window: mark what is on screen now, including anything that
+  // arrived while it was in the background.
+  useEffect(() => {
+    if (activeTab !== '') return
+    const onFocus = () => maybeMarkRead()
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') maybeMarkRead()
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [activeTab, maybeMarkRead])
+
   // Attach before paint and before child HtmlFrame effects begin reporting their
   // measured heights. On a cold open, attaching in a passive effect can miss the
   // first placeholder-to-content resize and leave a fully read thread at the top
@@ -329,7 +401,7 @@ export function useConversationScroll(
     const wrapper = messagesWrapperRef.current
     if (activeTab !== '' || !container || !wrapper || !activeThreadId) return
 
-    lastScrollHeightRef.current = container.scrollHeight
+    settledGeometryRef.current = readScrollMetrics(container)
 
     const observer = new ResizeObserver(() => {
       const pin = pinnedRef.current
@@ -338,7 +410,7 @@ export function useConversationScroll(
         : null
       const scrollTop = resolveResizeScrollTop({
         metrics: readScrollMetrics(container),
-        previousScrollHeight: lastScrollHeightRef.current,
+        previous: settledGeometryRef.current ?? readScrollMetrics(container),
         containerOffsetTop: container.offsetTop,
         pinned: pinned && pin ? { offsetTop: pinned.offsetTop, offset: pin.offset } : null,
       })
@@ -346,8 +418,8 @@ export function useConversationScroll(
         applyScrollTop(container, scrollTop)
       }
       if (pinned && !pin?.persistent) armPinRelease()
-      lastScrollHeightRef.current = container.scrollHeight
       viewedScrollHeightRef.current = container.scrollHeight
+      settledGeometryRef.current = readScrollMetrics(container)
       maybeMarkRead()
     })
 
@@ -360,6 +432,15 @@ export function useConversationScroll(
     if (activeTab !== '' || !container || !activeThreadId || messages.length === 0) return
     if (messages.some((message) => message.thread_id !== activeThreadId)) return
 
+    // The reader's own send, consumed exactly once like the jump below. A
+    // bubble that is not here — its send was aborted, or the reader has moved
+    // to another thread — has nothing to follow.
+    let ownSend = false
+    if (pendingOwnSendId) {
+      thread$.pendingOwnSendId.set('')
+      ownSend = !!container.querySelector(`[data-message-id="${CSS.escape(pendingOwnSendId)}"]`)
+    }
+
     // A direct jump (for example, from starred items or shared media): scroll
     // to the requested message and flash its ring.
     // Consumed exactly once; if the message isn't in the loaded page (older than
@@ -370,6 +451,7 @@ export function useConversationScroll(
       if (target) {
         positionedThreadRef.current = activeThreadId
         messageCountRef.current = messages.length
+        newestMessageIdRef.current = messages[messages.length - 1]?.id ?? ''
         pendingScrollRestoreRef.current.delete(activeThreadId)
         pinMessage(pendingScrollMessageId)
         applyScrollTop(container, anchorScrollTop(target.offsetTop, container.offsetTop))
@@ -385,8 +467,13 @@ export function useConversationScroll(
     }
 
     const isNewThread = positionedThreadRef.current !== activeThreadId
-    const grew = messages.length > messageCountRef.current
+    // Only a new newest message is mail arriving. Older history prepended by
+    // scrolling towards the top grows the count too, and following it would
+    // throw the reader who just scrolled up back to the bottom.
+    const newestMessageId = messages[messages.length - 1]?.id ?? ''
+    const grew = messages.length > messageCountRef.current && newestMessageId !== newestMessageIdRef.current
     messageCountRef.current = messages.length
+    newestMessageIdRef.current = newestMessageId
     let savedAnchor: SavedScrollAnchor | null = null
     let savedScrollTop: number | null = null
     if (pendingScrollRestoreRef.current.delete(activeThreadId)) {
@@ -406,6 +493,7 @@ export function useConversationScroll(
     const plan = resolveOpenScroll({
       isNewThread,
       grew,
+      ownSend,
       savedScrollTop,
       savedAtBottom: savedAnchor?.atBottom ?? false,
       metrics: readScrollMetrics(container),
@@ -450,19 +538,43 @@ export function useConversationScroll(
     unreadKey,
     maybeMarkRead,
     pendingScrollMessageId,
+    pendingOwnSendId,
     pinMessage,
     releasePin,
     applyScrollTop,
   ])
 
-  return {
-    scrollRef,
-    bottomAnchorRef,
-    messagesWrapperRef,
-    handleConversationScroll,
-    maybeMarkRead,
-    setScrollTop,
-    scrollMessageToTop,
-    releasePinForUserScroll,
-  }
+  return useMemo(
+    () => ({
+      scrollRef,
+      bottomAnchorRef,
+      messagesWrapperRef,
+      handleConversationScroll,
+      maybeMarkRead,
+      setScrollTop,
+      scrollMessageToTop,
+      holdTopMessage,
+      releasePinForUserScroll,
+    }),
+    [
+      handleConversationScroll,
+      maybeMarkRead,
+      setScrollTop,
+      scrollMessageToTop,
+      holdTopMessage,
+      releasePinForUserScroll,
+    ],
+  )
 }
+
+export type ConversationScroll = ReturnType<typeof useConversationScroll>
+
+// The open conversation's scroll controller, provided by MessagePane. These are
+// callbacks bound to the scroll container's refs, so they travel by context
+// rather than through thread$. Null outside a conversation pane.
+export const ConversationScrollContext = createContext<ConversationScroll | null>(null)
+
+// Just releasePinForUserScroll, for the message bodies. It never changes
+// identity, whereas the controller above is rebuilt as messages change — bodies
+// subscribed to that would re-render with every one.
+export const ConversationScrollIntentContext = createContext<(() => void) | undefined>(undefined)

@@ -47,10 +47,39 @@ func TestAccountSetSaveSentCopyMapsNullableValue(t *testing.T) {
 	assertCall(t, writer.calls[1], "account.setSaveSentCopy", map[string]any{"account": "acc", "value": nil})
 }
 
+func TestAccountAddPasswordReconnectKeepsExistingID(t *testing.T) {
+	app, writer := newMailHandlerTestApp(t,
+		sidecarResponsePlan{Result: map[string]any{"accounts": []any{map[string]any{
+			"id": "legacy-user1-mail-localhost", "email": "user1@mail.localhost",
+		}}}},
+		sidecarResponsePlan{Result: map[string]any{"ok": true}},
+		sidecarResponsePlan{Result: map[string]any{"ok": true}},
+	)
+	result, err := app.accountAddPassword(map[string]any{
+		"id": "legacy-user1-mail-localhost", "email": "user1@mail.localhost",
+		"imap_host": "127.0.0.1", "smtp_host": "127.0.0.1",
+		"username": "user1@mail.localhost", "password": "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "legacy-user1-mail-localhost"
+	if got := writer.calls[1].Params["id"]; got != want {
+		t.Fatalf("account.connect id = %#v, want %q", got, want)
+	}
+	if got := writer.calls[2].Params["account"]; got != want {
+		t.Fatalf("watch.start account = %#v, want %q", got, want)
+	}
+	if got := result.(map[string]any)["account"].(Account).ID; got != want {
+		t.Fatalf("returned account ID = %q, want %q", got, want)
+	}
+}
+
 // An account whose server certificate the user accepted only stays reachable if
 // the pin reaches the core with the connection settings.
 func TestAccountAddPasswordForwardsAcceptedCertificate(t *testing.T) {
 	app, writer := newMailHandlerTestApp(t,
+		sidecarResponsePlan{Result: map[string]any{"accounts": []any{}}},
 		sidecarResponsePlan{Result: map[string]any{"ok": true}}, // account.connect
 		sidecarResponsePlan{Result: map[string]any{"ok": true}}, // watch.start
 	)
@@ -68,10 +97,10 @@ func TestAccountAddPasswordForwardsAcceptedCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if writer.calls[0].Method != "account.connect" {
-		t.Fatalf("first call = %q, want account.connect", writer.calls[0].Method)
+	if writer.calls[1].Method != "account.connect" {
+		t.Fatalf("second call = %q, want account.connect", writer.calls[1].Method)
 	}
-	if got := writer.calls[0].Params["cert_pin"]; got != "AB12" {
+	if got := writer.calls[1].Params["cert_pin"]; got != "AB12" {
 		t.Fatalf("cert_pin = %#v, want the trimmed pin", got)
 	}
 }
@@ -80,6 +109,7 @@ func TestAccountAddPasswordForwardsAcceptedCertificate(t *testing.T) {
 // an empty one would be persisted and read back as "pinned to nothing".
 func TestAccountAddPasswordOmitsEmptyCertificatePin(t *testing.T) {
 	app, writer := newMailHandlerTestApp(t,
+		sidecarResponsePlan{Result: map[string]any{"accounts": []any{}}},
 		sidecarResponsePlan{Result: map[string]any{"ok": true}},
 		sidecarResponsePlan{Result: map[string]any{"ok": true}},
 	)
@@ -95,8 +125,8 @@ func TestAccountAddPasswordOmitsEmptyCertificatePin(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok := writer.calls[0].Params["cert_pin"]; ok {
-		t.Fatalf("params = %#v, want no cert_pin key", writer.calls[0].Params)
+	if _, ok := writer.calls[1].Params["cert_pin"]; ok {
+		t.Fatalf("params = %#v, want no cert_pin key", writer.calls[1].Params)
 	}
 }
 
@@ -150,5 +180,134 @@ func TestAccountProbeCertForwardsTheAccountProxy(t *testing.T) {
 	}
 	if params["protocol"] != "smtp" || params["starttls"] != true {
 		t.Fatalf("params = %#v, want the submission server with STARTTLS", params)
+	}
+}
+
+func TestAccountAddPasswordOmittedPassword(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		id        string
+		email     string
+		blank     bool
+		wantError bool
+	}{
+		{"existing account keeps secret", "legacy", "user@example.com", false, false},
+		{"new account requires secret", "", "user@example.com", false, true},
+		{"changed email requires secret", "legacy", "other@example.com", false, true},
+		{"explicit blank requires secret", "legacy", "user@example.com", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app, writer := newMailHandlerTestApp(t,
+				sidecarResponsePlan{Result: map[string]any{"accounts": []any{map[string]any{"id": "legacy", "email": "user@example.com"}}}},
+				sidecarResponsePlan{Result: map[string]any{"ok": true}},
+				sidecarResponsePlan{Result: map[string]any{"ok": true}},
+			)
+			payload := map[string]any{"id": tc.id, "email": tc.email, "imap_host": "imap.example.com", "smtp_host": "smtp.example.com", "username": tc.email}
+			if tc.blank {
+				payload["password"] = ""
+			}
+			_, err := app.accountAddPassword(payload)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("error = %v, wantError %v", err, tc.wantError)
+			}
+			for _, call := range writer.calls {
+				if call.Method == "account.connect" {
+					if tc.wantError {
+						t.Fatal("invalid edit reached account.connect")
+					}
+					if _, ok := call.Params["password"]; ok {
+						t.Fatal("omitted password must remain omitted")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAccountOAuthReconnectID(t *testing.T) {
+	for _, provider := range []string{"gmail", "outlook"} {
+		for _, email := range []string{" USER@example.com ", "other@example.com"} {
+			t.Run(provider+"/"+email, func(t *testing.T) {
+				app, writer := newMailHandlerTestApp(t,
+					sidecarResponsePlan{Result: map[string]any{"accounts": []any{map[string]any{"id": "legacy", "email": "user@example.com"}}}},
+					sidecarResponsePlan{Result: map[string]any{"ok": true}},
+					sidecarResponsePlan{Result: map[string]any{"ok": true}},
+				)
+				payload := map[string]any{"id": "legacy", "email": email, "avatar_url": "/media/avatar.png", "access_token": "test-access", "refresh_token": "test-refresh"}
+				var result any
+				var err error
+				if provider == "gmail" {
+					result, err = app.accountAddGmailOAuth(payload)
+				} else {
+					result, err = app.accountAddOutlookOAuth(payload)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := "legacy"
+				if accountID(email) != "user@example.com" {
+					want = accountID(email)
+				}
+				if got := writer.calls[1].Params["id"]; got != want {
+					t.Fatalf("connect id = %v, want %v", got, want)
+				}
+				if got := writer.calls[2].Params["account"]; got != want {
+					t.Fatalf("watch account = %v, want %v", got, want)
+				}
+				if got := result.(map[string]any)["account"].(Account).ID; got != want {
+					t.Fatalf("returned id = %v, want %v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestAccountReconnectUnavailableEngine(t *testing.T) {
+	for _, provider := range []string{"password", "gmail", "outlook"} {
+		for _, state := range []string{"nil", "stopped"} {
+			t.Run(provider+"/"+state, func(t *testing.T) {
+				app := &App{}
+				if state == "stopped" {
+					app.sidecar = &Sidecar{}
+				}
+				payload := map[string]any{"id": "legacy", "email": "user@example.com", "imap_host": "imap.example.com", "smtp_host": "smtp.example.com", "username": "user@example.com", "password": "secret", "avatar_url": "/media/avatar.png", "access_token": "access", "refresh_token": "refresh"}
+				_, err := addAccountForTest(app, provider, payload)
+				if err == nil || err.Error() != app.engineUnavailable().Error() {
+					t.Fatalf("error = %v, want engine unavailable", err)
+				}
+			})
+		}
+	}
+}
+
+func TestAccountSaveRejectsAnotherExistingMailbox(t *testing.T) {
+	for _, provider := range []string{"password", "gmail", "outlook"} {
+		for _, existingID := range []string{"", "account-a"} {
+			t.Run(provider+"/"+existingID, func(t *testing.T) {
+				app, writer := newMailHandlerTestApp(t, sidecarResponsePlan{Result: map[string]any{"accounts": []any{
+					map[string]any{"id": "account-a", "email": "a@example.com"},
+					map[string]any{"id": "legacy-b", "email": "b@example.com"},
+				}}})
+				payload := map[string]any{"id": existingID, "email": " B@example.com ", "imap_host": "imap.example.com", "smtp_host": "smtp.example.com", "username": "b@example.com", "password": "secret", "avatar_url": "/media/avatar.png", "access_token": "access", "refresh_token": "refresh"}
+				_, err := addAccountForTest(app, provider, payload)
+				if err == nil || err.Error() != "email belongs to an existing account; edit or reconnect that account instead" {
+					t.Fatalf("error = %v, want duplicate account rejection", err)
+				}
+				if len(writer.calls) != 1 || writer.calls[0].Method != "account.list" {
+					t.Fatalf("calls = %#v, want only account.list", writer.calls)
+				}
+			})
+		}
+	}
+}
+
+func addAccountForTest(app *App, provider string, payload map[string]any) (any, error) {
+	switch provider {
+	case "gmail":
+		return app.accountAddGmailOAuth(payload)
+	case "outlook":
+		return app.accountAddOutlookOAuth(payload)
+	default:
+		return app.accountAddPassword(payload)
 	}
 }

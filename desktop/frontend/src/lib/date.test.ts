@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:test'
-import { formatThreadDate } from './date'
+import { formatEventRange, formatThreadDate, taskIsOverdue, fromDateInputValue } from './date'
 
 // Fixed reference: Wednesday 2026-06-10 15:30 local time.
 const NOW = new Date(2026, 5, 10, 15, 30, 0)
@@ -39,5 +39,42 @@ describe('formatThreadDate', () => {
 
   it('includes the year for prior-year dates', () => {
     expect(formatThreadDate(sec(new Date(2025, 11, 31, 9, 0)))).toMatch(/2025/)
+  })
+})
+
+describe('taskIsOverdue', () => {
+  it('only marks dates before today overdue', () => {
+    expect(taskIsOverdue(fromDateInputValue('2026-06-09'))).toBe(true)
+    expect(taskIsOverdue(fromDateInputValue('2026-06-10'))).toBe(false)
+    expect(taskIsOverdue(fromDateInputValue('2026-06-11'))).toBe(false)
+    expect(taskIsOverdue(0)).toBe(false)
+  })
+
+  it('becomes overdue at the next local midnight', () => {
+    const due = fromDateInputValue('2026-03-08')
+    expect(taskIsOverdue(due, new Date(2026, 2, 8, 23, 59, 59).getTime())).toBe(false)
+    expect(taskIsOverdue(due, new Date(2026, 2, 9).getTime())).toBe(true)
+  })
+})
+
+describe('formatEventRange', () => {
+  it('an all-day event shows its UTC dates whatever the local zone', () => {
+    const christmasEve = Date.UTC(2026, 11, 24) / 1000
+    const oneDay = formatEventRange(christmasEve, christmasEve + 86_400, true)
+    expect(oneDay).toMatch(/\b24\b/)
+    expect(oneDay).not.toMatch(/\b25\b/)
+    const twoDays = formatEventRange(christmasEve, christmasEve + 2 * 86_400, true)
+    expect(twoDays).toMatch(/\b24\b/)
+    expect(twoDays).toMatch(/\b25\b/)
+    expect(twoDays).not.toMatch(/\b26\b/)
+  })
+
+  it('a timed event spans its start and end, and an unknown start shows nothing', () => {
+    const start = new Date(2026, 9, 22, 10, 0).getTime() / 1000
+    const range = formatEventRange(start, start + 3600, false)
+    expect(range).toMatch(/\b10:00\b/)
+    expect(range).toMatch(/\b11:00\b/)
+    expect(formatEventRange(start, start, false)).not.toMatch(/[–-]\s*\d/)
+    expect(formatEventRange(0, 0, false)).toBe('')
   })
 })

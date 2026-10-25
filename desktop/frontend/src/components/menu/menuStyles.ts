@@ -10,7 +10,7 @@ const menuItemBase =
   'flex h-8 w-full items-center gap-2 whitespace-nowrap rounded-lg px-2 text-left text-[0.8125rem] font-normal leading-normal cursor-pointer transition-colors'
 
 /** Standard menu item. */
-export const menuItemClass = `${menuItemBase} text-primary hover:bg-hover`
+export const menuItemClass = `${menuItemBase} text-primary aria-expanded:not-hover:bg-hover/60 hover:bg-hover`
 
 /** Destructive menu item (delete / trash). */
 export const menuItemDangerClass = `${menuItemBase} text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/25`

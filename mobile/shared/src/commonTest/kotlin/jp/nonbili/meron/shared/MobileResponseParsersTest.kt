@@ -9,6 +9,23 @@ import kotlin.test.assertTrue
 
 class MobileResponseParsersTest {
     @Test
+    fun parsesSearchFieldsAndBuiltQuery() {
+        val fields =
+            parseSearchFieldsResponse(
+                """{"id":1,"result":{"from":"Ann Lee","to":"","subject":"plan","words":"budget","after":"2026-01-02","before":"","unread":true,"starred":false}}""",
+            )
+        assertEquals(
+            SearchFields(from = "Ann Lee", subject = "plan", words = "budget", after = "2026-01-02", unread = true),
+            fields,
+        )
+        assertEquals(
+            """{"from":"Ann Lee","to":"","subject":"plan","words":"budget","after":"2026-01-02","before":"","unread":true,"starred":false}""",
+            fields.toJson(),
+        )
+        assertEquals("from:a@b.c", parseSearchBuildResponse("""{"id":2,"result":{"query":"from:a@b.c"}}"""))
+    }
+
+    @Test
     fun parsesStarredPageAndAllocatedIdentity() {
         val page =
             parseStarredItemsPage(
@@ -181,6 +198,20 @@ class MobileResponseParsersTest {
     }
 
     @Test
+    fun parsesThreadFilesFromTopLevelKeysOnly() {
+        val threads =
+            parseThreadListResponse(
+                """{"result":{"threads":[{"id":"acc#INBOX#t","subject":"\"files\":[{\"filename\":\"forged.exe\"}]","has_attachments":true,"files":[{"filename":"plan.pdf","mime":"application/pdf"},{"filename":"photo.jpg","mime":"image/jpeg"}]},{"id":"acc#INBOX#u","subject":"Plain"}]}}""",
+            )
+
+        assertTrue(threads[0].hasAttachments)
+        assertEquals(listOf("plan.pdf", "photo.jpg"), threads[0].files.map { it.filename })
+        assertEquals("image/jpeg", threads[0].files[1].mimeType)
+        assertFalse(threads[1].hasAttachments)
+        assertTrue(threads[1].files.isEmpty())
+    }
+
+    @Test
     fun parsesThreadSendersFromTopLevelKeysOnly() {
         val threads =
             parseThreadListResponse(
@@ -215,6 +246,17 @@ class MobileResponseParsersTest {
         assertEquals("1700000000:1", page.nextCursor)
         assertEquals(7, page.folderUnread)
         assertTrue(page.folderSynced == true)
+        assertFalse(page.searchIncomplete)
+    }
+
+    @Test
+    fun parsesIncompleteSearchFlag() {
+        val page =
+            parseThreadListPage(
+                """{"id":2,"result":{"threads":[],"search_incomplete":true}}""",
+            )
+
+        assertTrue(page.searchIncomplete)
     }
 
     @Test
@@ -261,6 +303,36 @@ class MobileResponseParsersTest {
         assertEquals("Ada <ada@example.com>", reply?.to)
         assertEquals("alice@example.com, bob@example.com", reply?.allCc)
         assertEquals(true, reply?.allAddsRecipients)
+        // Absent on older cores: a message is assumed to take replies.
+        assertEquals(true, reply?.acceptsReplies)
+    }
+
+    @Test
+    fun readsWhetherAMessageAcceptsReplies() {
+        val page =
+            parseThreadReadPage(
+                """{"id":6,"result":{"messages":[{"id":"m1","body":"hi","reply":{"to":"noreply@github.com","cc":"","all_to":"noreply@github.com","all_cc":"","all_adds_recipients":false,"accepts_replies":false}}]}}""",
+            )
+
+        assertEquals(
+            false,
+            page.messages
+                .single()
+                .reply
+                ?.acceptsReplies,
+        )
+    }
+
+    @Test
+    fun readsMessageRecipientsRatherThanTheReplyTargetsSortedAheadOfThem() {
+        val page =
+            parseThreadReadPage(
+                """{"id":8,"result":{"messages":[{"bcc":"","body":"hi","cc":"","from_addr":"ada@example.com","id":"m1","reply":{"all_adds_recipients":false,"all_cc":"","all_to":"ada@example.com","cc":"","to":"ada@example.com"},"subject":"Hi","to":"me@example.com"}]}}""",
+            )
+
+        val message = page.messages.single()
+        assertEquals("me@example.com", message.to)
+        assertEquals("ada@example.com", message.reply?.to)
     }
 
     @Test
@@ -271,6 +343,16 @@ class MobileResponseParsersTest {
             )
 
         assertEquals(listOf(5, null, null), page.messages.map { it.bodyQuoteStart })
+    }
+
+    @Test
+    fun readsAnRssItemLinkFromTheTopLevelOnly() {
+        val page =
+            parseThreadReadPage(
+                """{"id":8,"result":{"messages":[{"id":"i1","body":"see \"link\":\"https://evil.example\"","link":"https://example.com/post"},{"id":"m2","body":"forged \"link\":\"https://evil.example\""}]}}""",
+            )
+
+        assertEquals(listOf("https://example.com/post", ""), page.messages.map { it.link })
     }
 
     @Test
@@ -326,10 +408,14 @@ class MobileResponseParsersTest {
     fun parsesFolderListEnvelopeAndRssFolderShape() {
         val folders =
             parseFolderListResponse(
-                """{"id":4,"result":{"folders":[{"id":"INBOX","account_id":"acc","name":"INBOX","unread":3,"delimiter":"."},{"id":"inbox","role":"inbox","unread":2}]}}""",
+                """{"id":4,"result":{"folders":[{"id":"INBOX","account_id":"acc","name":"INBOX","unread":3,"delimiter":"."},{"id":"inbox","role":"inbox","unread":2},{"id":"Work","name":"Work","notify":true,"notify_live":true}]}}""",
             )
 
-        assertEquals(2, folders.size)
+        assertEquals(3, folders.size)
+        assertEquals(false, folders[0].notify)
+        assertEquals(true, folders[2].notify)
+        assertEquals(true, folders[2].notifyLive)
+        assertEquals(false, folders[0].notifyLive)
         assertEquals("acc", folders[0].accountId)
         assertEquals("INBOX", folders[0].name)
         assertEquals(3, folders[0].unread)
@@ -449,7 +535,7 @@ class MobileResponseParsersTest {
     fun parsesThreadReadEnvelope() {
         val messages =
             parseThreadReadResponse(
-                """{"id":3,"result":{"messages":[{"id":"acc#INBOX#t#9","from_name":"Ada","from_addr":"ada@example.com","to":"Me <me@example.com>","cc":"Copy <copy@example.com>","bcc":"Hidden <hidden@example.com>","subject":"Cached subject","body":"Hello from cache","body_html":"<p>Hello from cache</p>","date":300,"unread":true,"starred":true,"reply_to":"Team <team@example.com>","message_id":"m1@example.com","in_reply_to":"parent@example.com","references":"<root@example.com>","outgoing":true,"has_attachments":true,"attachments":[{"filename":"note.txt","mime":"text/plain","size":2,"key":"acc/INBOX/9/1.txt"},{"filename":"remote.jpg","mime":"image/jpeg","size":0,"url":"https://example.com/remote.jpg"}]}]}}""",
+                """{"id":3,"result":{"messages":[{"id":"acc#INBOX#t#9","from_name":"Ada","from_addr":"ada@example.com","to":"Me <me@example.com>","cc":"Copy <copy@example.com>","bcc":"Hidden <hidden@example.com>","subject":"Cached subject","body":"Hello from cache","body_html":"<p>Hello from cache</p>","media_missing":2,"date":300,"unread":true,"starred":true,"reply_to":"Team <team@example.com>","message_id":"m1@example.com","in_reply_to":"parent@example.com","references":"<root@example.com>","outgoing":true,"has_attachments":true,"attachments":[{"filename":"note.txt","mime":"text/plain","size":2,"key":"acc/INBOX/9/1.txt"},{"filename":"remote.jpg","mime":"image/jpeg","size":0,"url":"https://example.com/remote.jpg"}]}]}}""",
             )
 
         assertEquals(1, messages.size)
@@ -461,6 +547,7 @@ class MobileResponseParsersTest {
         assertEquals("Cached subject", messages[0].subject)
         assertEquals("Hello from cache", messages[0].body)
         assertEquals("<p>Hello from cache</p>", messages[0].bodyHtml)
+        assertEquals(2, messages[0].mediaMissing)
         assertEquals(300, messages[0].dateEpochSeconds)
         assertEquals("ada@example.com", messages[0].fromAddr)
         assertEquals("Team <team@example.com>", messages[0].replyTo)
@@ -571,6 +658,42 @@ class MobileResponseParsersTest {
     }
 
     @Test
+    fun threadActionLocationUsesTopLevelFieldsWhenChangeComesFirst() {
+        val location =
+            parseThreadActionLocationResponse(
+                """{"change":{"folder":"INBOX","permanent":true,"thread_id":"a#INBOX#t1"},"folder":"Archive","moved":1,"ok":true,"permanent":false,"thread_id":"a#Archive#t1"}""",
+            )
+
+        assertEquals("a#Archive#t1", location.threadId)
+        assertEquals("Archive", location.folder)
+        assertFalse(location.permanent)
+    }
+
+    @Test
+    fun permanentDeleteHasNoDestinationDespiteTheSourceIdInsideChange() {
+        val location =
+            parseThreadActionLocationResponse(
+                """{"change":{"source_folder":"Trash","thread_id":"a#Trash#t1"},"deleted":1,"ok":true,"permanent":true}""",
+            )
+
+        assertEquals("", location.threadId)
+        assertEquals("", location.folder)
+        assertTrue(location.permanent)
+    }
+
+    @Test
+    fun nestedLocationFieldsAndEscapedStringsAreSkipped() {
+        val location =
+            parseThreadActionLocationResponse(
+                """ {"change":{"nested":[{"trash":"Wrong","thread_id":"a#Wrong#t1"}],"text":"escaped \\\" } , \\\"thread_id\\\": \\\"wrong\\\""},"ok":true,"trash":"Trash"} """,
+            )
+
+        assertEquals("", location.threadId)
+        assertEquals("Trash", location.folder)
+        assertFalse(location.permanent)
+    }
+
+    @Test
     fun parsesThreadActionLocationFromDeleteTrashResponse() {
         val location =
             parseThreadActionLocationResponse(
@@ -592,5 +715,48 @@ class MobileResponseParsersTest {
         assertEquals("", location.threadId)
         assertEquals("", location.folder)
         assertTrue(location.permanent)
+    }
+
+    @Test
+    fun parsesAThreadMessagesInviteFromItsOwnKeys() {
+        val message =
+            parseThreadReadPage(
+                """{"id":9,"result":{"messages":[{"body":"\"summary\":\"Forged\"","id":"acct#INBOX#7","invite":{"all_day":false,"attendees":[{"addr":"sam@example.org","name":"Sam, \"S\"","partstat":"needs-action"}],"can_respond":true,"cancelled":false,"description":"\"summary\":\"Forged\"","end":1792692000,"location":"Room 4","method":"request","organizer":{"addr":"maya@example.com","name":"Maya Chen"},"recurring":true,"response":"tentative","start":1792688400,"summary":"Launch review","uid":"u-1"}}]}}""",
+            ).messages.single()
+        val invite = message.invite!!
+        assertEquals("request", invite.method)
+        assertEquals("u-1", invite.uid)
+        assertEquals("Launch review", invite.summary)
+        assertEquals("Room 4", invite.location)
+        assertEquals(1_792_688_400L, invite.start)
+        assertEquals(1_792_692_000L, invite.end)
+        assertTrue(invite.recurring)
+        assertTrue(invite.canRespond)
+        assertEquals("tentative", invite.response)
+        assertEquals("Maya Chen", invite.organizerName)
+        assertEquals("maya@example.com", invite.organizerAddr)
+        assertEquals(listOf(InviteAttendee("Sam, \"S\"", "sam@example.org", "needs-action")), invite.attendees)
+    }
+
+    @Test
+    fun aMessageWithoutAnInviteHasNone() {
+        val message = parseThreadReadPage("""{"id":10,"result":{"messages":[{"body":"\"invite\":{}","id":"m1"}]}}""").messages.single()
+        assertEquals(null, message.invite)
+    }
+
+    @Test
+    fun parsesCalendarItemsAndTheirRestorePayload() {
+        val items =
+            parseCalendarEventsResponse(
+                """{"events":[{"account":"","all_day":true,"end":1790899200,"id":"task-1","key":"task:task-1","list_id":"l1","notes":"\"id\":\"forged\"","recurring":false,"repeat":"","response":"","source":"task","start":1790812800,"thread_id":"","title":"File report"},{"account":"acct","all_day":false,"end":1790816400,"id":"event-1","key":"event-1@1790812800","location":"Room 4","recurring":true,"repeat":"","response":"tentative","source":"invite","start":1790812800,"thread_id":"acct#INBOX#t.x","title":"Review"},{"title":"no id"}]}""",
+            )
+        assertEquals(2, items.size)
+        assertEquals(CalendarItem(id = "task-1", key = "task:task-1", source = "task", title = "File report", notes = "\"id\":\"forged\"", start = 1_790_812_800, end = 1_790_899_200, allDay = true, listId = "l1"), items[0])
+        assertEquals("invite", items[1].source)
+        assertEquals("tentative", items[1].response)
+        assertEquals("acct#INBOX#t.x", items[1].threadId)
+        assertTrue(items[1].recurring)
+        assertEquals("""{"id":"event-1"}""", parseCalendarRestorePayload("""{"ok":true,"restore":{"id":"event-1"}}"""))
+        assertEquals(null, parseCalendarRestorePayload("""{"ok":true,"restore":null}"""))
     }
 }

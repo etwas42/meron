@@ -53,7 +53,7 @@ func (a *App) exportBackup(payload map[string]any) (any, error) {
 		return nil, errors.New("nothing to back up")
 	}
 
-	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+	dest, err := saveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:                "Export backup",
 		DefaultFilename:      backupFilename(time.Now()),
 		CanCreateDirectories: true,
@@ -89,7 +89,7 @@ func (a *App) importBackup(payload map[string]any) (any, error) {
 
 	src, _ := payload["path"].(string)
 	if src == "" {
-		chosen, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		chosen, err := openFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 			Title: "Restore backup",
 			Filters: []wailsRuntime.FileFilter{
 				{DisplayName: "Meron backup (*.json)", Pattern: "*.json"},

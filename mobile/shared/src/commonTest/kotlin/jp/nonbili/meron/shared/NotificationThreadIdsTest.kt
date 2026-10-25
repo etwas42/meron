@@ -2,8 +2,6 @@ package jp.nonbili.meron.shared
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 
 class NotificationThreadIdsTest {
     @Test
@@ -62,12 +60,34 @@ class NotificationThreadIdsTest {
     }
 
     @Test
-    fun onlyHeaderDerivedKeysSurviveAMove() {
-        // A uid names a different message in the target mailbox, so an undo
-        // keyed on it would move whatever now holds that uid.
-        assertFalse(notificationThreadKeyIsStableAcrossMove("uid:4821"))
-        assertFalse(notificationThreadKeyIsStableAcrossMove(""))
-        assertTrue(notificationThreadKeyIsStableAcrossMove("topic"))
-        assertTrue(notificationThreadKeyIsStableAcrossMove("<abc@example.com>#Re: lunch"))
+    fun aCompositeIdSplitsBackIntoTheFieldsItWasBuiltFrom() {
+        for (threadKey in listOf("topic", "uid:4821", "<msg@example.com>", "a/b+c")) {
+            val id = notificationThreadId("me@example.com", "INBOX", threadKey)
+            val parsed = parseNotificationThreadId(id)
+            assertEquals("me@example.com", parsed?.accountId)
+            assertEquals("INBOX", parsed?.folder)
+            assertEquals(threadKey, parsed?.threadKey)
+        }
+    }
+
+    @Test
+    fun anIdWithNoFolderOrKeyIsRejected() {
+        assertEquals(null, parseNotificationThreadId("me@example.com"))
+        assertEquals(null, parseNotificationThreadId("me@example.com#INBOX"))
+        assertEquals(null, parseNotificationThreadId(""))
+    }
+
+    @Test
+    fun foldersContainingHashAndHeaderKeysRoundTrip() {
+        val key = "<abc@example.com>#日本語 & subject"
+        val id = notificationThreadId("a", "Folder with # sign", key)
+        assertEquals(ParsedThreadId("a", "Folder with # sign", key), parseNotificationThreadId(id))
+    }
+
+    @Test
+    fun feedIdsKeepSubscriptionKeysAndEmptyEncodedKeysAreRejected() {
+        assertEquals(ParsedThreadId("rss-a", "rss", "subscription"), parseNotificationThreadId("rss-a#rss#subscription"))
+        assertEquals(null, parseNotificationThreadId("a#INBOX#t."))
+        assertEquals(null, parseNotificationThreadId("a#INBOX#t.!!!"))
     }
 }

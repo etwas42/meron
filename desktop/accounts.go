@@ -17,7 +17,8 @@ func (a *App) accountAddPassword(payload map[string]any) (any, error) {
 	if req.IMAPHost == "" || req.SMTPHost == "" {
 		return nil, errors.New("server required")
 	}
-	if req.Username == "" || req.Password == "" {
+	_, passwordProvided := payload["password"]
+	if req.Username == "" || (passwordProvided && req.Password == "") || (!passwordProvided && req.ID == "") {
 		return nil, errors.New("credentials required")
 	}
 	if req.IMAPPort == 0 {
@@ -26,11 +27,17 @@ func (a *App) accountAddPassword(payload map[string]any) (any, error) {
 	if req.SMTPPort == 0 {
 		req.SMTPPort = 465
 	}
-	id := accountID(req.Email)
-	a.logf("account.addPassword: connecting account=%s imap=%s:%d smtp=%s:%d", id, req.IMAPHost, req.IMAPPort, req.SMTPHost, req.SMTPPort)
 	if a.sidecar == nil || !a.sidecar.Started() {
 		return nil, a.engineUnavailable()
 	}
+	id, err := a.accountSaveID(req.ID, req.Email)
+	if err != nil {
+		return nil, err
+	}
+	if !passwordProvided && id != strings.TrimSpace(req.ID) {
+		return nil, errors.New("credentials required")
+	}
+	a.logf("account.addPassword: connecting account=%s imap=%s:%d smtp=%s:%d", id, req.IMAPHost, req.IMAPPort, req.SMTPHost, req.SMTPPort)
 	legacyTLS := true
 	if req.TLS != nil {
 		legacyTLS = *req.TLS
@@ -46,7 +53,6 @@ func (a *App) accountAddPassword(payload map[string]any) (any, error) {
 		"host":          req.IMAPHost,
 		"port":          req.IMAPPort,
 		"user":          req.Username,
-		"password":      req.Password,
 		"tls":           imapTLS,
 		"starttls":      imapStartTLS,
 		"smtp_host":     req.SMTPHost,
@@ -57,6 +63,10 @@ func (a *App) accountAddPassword(payload map[string]any) (any, error) {
 		"display_name":  req.DisplayName,
 		"sender_name":   req.SenderName,
 		"provider":      "custom",
+	}
+	// Omission lets account.connect hydrate the existing keychain password.
+	if passwordProvided {
+		connect["password"] = req.Password
 	}
 	if pin := strings.TrimSpace(req.CertPin); pin != "" {
 		connect["cert_pin"] = pin
@@ -87,6 +97,39 @@ func (a *App) accountAddPassword(payload map[string]any) (any, error) {
 		SMTPStartTLS:      smtpStartTLS,
 	}
 	return map[string]any{"account": account}, nil
+}
+
+// Reuse an existing ID only for the same mailbox. A different sign-in or an
+// edited email creates a separate account, without inheriting cached state.
+func (a *App) accountSaveID(existingID, email string) (string, error) {
+	existingID = strings.TrimSpace(existingID)
+	result, err := a.accountList()
+	if err != nil {
+		return "", err
+	}
+	accounts := result.(map[string]any)["accounts"].([]Account)
+	if existingID != "" {
+		found := false
+		for _, account := range accounts {
+			if account.ID == existingID {
+				found = true
+				if accountID(account.Email) == accountID(email) {
+					return existingID, nil
+				}
+				break
+			}
+		}
+		if !found {
+			return "", errors.New("account to reconnect not found")
+		}
+	}
+	id := accountID(email)
+	for _, account := range accounts {
+		if accountID(account.Email) == id || account.ID == id {
+			return "", errors.New("email belongs to an existing account; edit or reconnect that account instead")
+		}
+	}
+	return id, nil
 }
 
 // accountProbeCert fetches the certificate a mail server presents so the

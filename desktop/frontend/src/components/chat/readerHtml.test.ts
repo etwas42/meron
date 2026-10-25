@@ -1,10 +1,18 @@
 import { describe, expect, it } from 'bun:test'
-import { applyReaderLayout, applyReaderTheme } from './readerHtml'
 import {
+  applyReaderFont,
+  applyReaderLayout,
+  applyReaderTheme,
+  DEFAULT_READER_FONT,
+  pinViewportHeights,
+} from './readerHtml'
+import {
+  DARKENED_ATTR,
   DEFAULT_READER_THEME,
   frameVar,
   frameVarPrefix,
   colorTone,
+  darkenedFloor,
   declaredBodyBackground,
   messageIsSelfStyled,
   readerThemeFromTokens,
@@ -59,6 +67,25 @@ describe('messageIsSelfStyled', () => {
     expect(messageIsSelfStyled(parse('<style>td { border-color: #eee; -webkit-text-size-adjust: none }</style>'))).toBe(
       false,
     )
+  })
+})
+
+describe('applyReaderFont', () => {
+  const fontCss = (doc: Document) => doc.getElementById('meron-reader-font')?.textContent ?? ''
+
+  it('gives mail the bubble base size at a specificity any email rule beats', () => {
+    const doc = parse('<p>hi</p>')
+    applyReaderFont(doc, DEFAULT_READER_FONT)
+    expect(fontCss(doc)).toBe(':where(html) { font-size: 14px; line-height: 1.45; }')
+  })
+
+  it('leaves a feed article at the engine size', () => {
+    const doc = parse('<p>hi</p>')
+    applyReaderFont(doc, DEFAULT_READER_FONT, true)
+    expect(doc.getElementById('meron-reader-font')).toBeNull()
+
+    applyReaderFont(doc, { family: 'Georgia', zoom: 1.2 }, true)
+    expect(fontCss(doc)).toBe('body { font-family: Georgia; zoom: 1.2; }')
   })
 })
 
@@ -422,5 +449,105 @@ describe('applyReaderTheme', () => {
       .map((style) => style.textContent ?? '')
       .find((css) => css.includes('max-width: 760px'))
     expect(sheet?.slice(sheet.indexOf('body {'), sheet.indexOf('*, *::before'))).not.toContain('background')
+  })
+})
+
+describe('dark message bodies', () => {
+  const DARKENING: ReaderTheme = { ...DARK, darkenStyled: true }
+  const darkened = (doc: Document) => doc.documentElement.hasAttribute(DARKENED_ATTR)
+
+  it('inverts a self-styled message that would otherwise sit on a light card', () => {
+    const doc = parse('<meta name="meron-body-bg" content="#f5f4f2"><p style="color:#333">hi</p>')
+    applyReaderTheme(doc, DARKENING)
+    expect(darkened(doc)).toBe(true)
+  })
+
+  it('leaves alone what the theme already paints dark, and stays off unless asked', () => {
+    const bare = parse('<p>hi</p>')
+    applyReaderTheme(bare, DARKENING)
+    expect(darkened(bare)).toBe(false)
+
+    const darkCanvas = parse('<meta name="meron-body-bg" content="#111111"><p style="color:#eee">hi</p>')
+    applyReaderTheme(darkCanvas, DARKENING)
+    expect(darkened(darkCanvas)).toBe(false)
+
+    const styled = parse('<meta name="meron-body-bg" content="#f5f4f2"><p style="color:#333">hi</p>')
+    applyReaderTheme(styled, DARK)
+    expect(darkened(styled)).toBe(false)
+  })
+
+  // Inverted white turns black; capped first at the color that inverts to the
+  // tab background, the message becomes that background, one continuous page.
+  it('caps the darkened message at the color that inverts to the tab background', () => {
+    const doc = parse('<meta name="meron-body-bg" content="#f5f4f2"><p style="color:#333">hi</p>')
+    applyReaderLayout(doc, undefined, DARKENING)
+    expect(darkened(doc)).toBe(true)
+    const css = [...doc.querySelectorAll('style')].map((style) => style.textContent ?? '').join('\n')
+    expect(css).toMatch(new RegExp(`html\\[${DARKENED_ATTR}\\] body::before\\s*\\{[^}]*mix-blend-mode: darken`))
+    expect(vars(doc).getPropertyValue('page-bg')).toBe(DARK.pageBg)
+    expect(vars(doc).getPropertyValue('darkened-floor')).toBe(darkenedFloor(DARK.pageBg))
+  })
+
+  it('undoes the inversion when the theme turns light', () => {
+    const doc = parse('<meta name="meron-body-bg" content="#f5f4f2"><p style="color:#333">hi</p>')
+    applyReaderTheme(doc, DARKENING)
+    applyReaderTheme(doc, DEFAULT_READER_THEME)
+    expect(darkened(doc)).toBe(false)
+  })
+})
+
+describe('pinViewportHeights', () => {
+  it("takes the email's vh lengths as the window's, in its stylesheets and inline styles", () => {
+    const doc = document.implementation.createHTMLDocument('Mail')
+    doc.head.innerHTML = '<style>.hero { min-height: 100vh; } @media screen { .half { height: 50vh; } }</style>'
+    doc.body.innerHTML = '<div style="height: 25vh; width: 10vw">x</div>'
+    pinViewportHeights(doc, 800)
+
+    const rules = Array.from((doc.styleSheets[0] as CSSStyleSheet).cssRules)
+    expect((rules[0] as CSSStyleRule).style.getPropertyValue('min-height')).toBe('800px')
+    const nested = (rules[1] as CSSMediaRule).cssRules[0] as CSSStyleRule
+    expect(nested.style.getPropertyValue('height')).toBe('400px')
+    const inline = doc.querySelector<HTMLElement>('div')!.style
+    expect(inline.getPropertyValue('height')).toBe('200px')
+    expect(inline.getPropertyValue('width')).toBe('10vw')
+  })
+})
+
+describe('reader column', () => {
+  it("holds the body to the header's column over the email's own rules", () => {
+    const doc = document.implementation.createHTMLDocument('Mail')
+    doc.body.innerHTML = '<p>Hi</p><style>body { padding: 0 !important; max-width: none !important }</style>'
+    applyReaderLayout(doc)
+
+    // Inline and important: no stylesheet rule of the email's can beat it.
+    const style = doc.body.style
+    expect(style.getPropertyValue('padding-left')).toBe('20px')
+    expect(style.getPropertyPriority('padding-left')).toBe('important')
+    expect(style.getPropertyValue('max-width')).toBe('760px')
+    expect(style.getPropertyPriority('max-width')).toBe('important')
+  })
+
+  it('keeps the column its on-screen size under a larger text size', () => {
+    const doc = document.implementation.createHTMLDocument('Mail')
+    doc.body.innerHTML = '<p>Hi</p>'
+    applyReaderLayout(doc, { family: null, zoom: 1.25 })
+
+    // The body's zoom scales these back up to 760px and 20px.
+    expect(doc.body.style.getPropertyValue('max-width')).toBe('608px')
+    expect(doc.body.style.getPropertyValue('padding-left')).toBe('16px')
+  })
+})
+
+describe('reader media', () => {
+  it('keeps the width an email draws a picture at, only capping it', () => {
+    const doc = document.implementation.createHTMLDocument('Mail')
+    doc.body.innerHTML = '<img src="/media/avatar" width="20" height="20" alt="">'
+    applyReaderLayout(doc)
+
+    const img = doc.querySelector('img')!
+    expect(img.getAttribute('width')).toBe('20')
+    expect(img.style.getPropertyValue('width')).toBe('')
+    expect(img.style.getPropertyValue('max-width')).toBe('100%')
+    expect(img.style.getPropertyValue('height')).toBe('auto')
   })
 })

@@ -58,15 +58,18 @@ func (a *App) accountAddGmailOAuth(payload map[string]any) (any, error) {
 		return nil, errors.New("invalid email")
 	}
 
-	id := accountID(req.Email)
+	if a.sidecar == nil || !a.sidecar.Started() {
+		return nil, a.engineUnavailable()
+	}
+	id, err := a.accountSaveID(req.ID, req.Email)
+	if err != nil {
+		return nil, err
+	}
 	if req.AvatarURL != "" {
 		req.AvatarURL = a.downloadAndSaveAvatar(id, req.AvatarURL)
 	}
 	expiresAt := time.Now().Unix() + req.ExpiresIn
 	a.logf("account.addGmailOAuth: connecting account=%s email=%s token_present=%t refresh_present=%t", id, req.Email, req.AccessToken != "", req.RefreshToken != "")
-	if a.sidecar == nil || !a.sidecar.Started() {
-		return nil, a.engineUnavailable()
-	}
 	if _, err := a.sidecar.Call("account.connect", map[string]any{
 		"id":               id,
 		"host":             "imap.gmail.com",
@@ -149,12 +152,15 @@ func (a *App) accountAddOutlookOAuth(payload map[string]any) (any, error) {
 		return nil, errors.New("invalid email")
 	}
 
-	id := accountID(req.Email)
-	expiresAt := time.Now().Unix() + req.ExpiresIn
-	a.logf("account.addOutlookOAuth: connecting account=%s email=%s token_present=%t refresh_present=%t", id, req.Email, req.AccessToken != "", req.RefreshToken != "")
 	if a.sidecar == nil || !a.sidecar.Started() {
 		return nil, a.engineUnavailable()
 	}
+	id, err := a.accountSaveID(req.ID, req.Email)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := time.Now().Unix() + req.ExpiresIn
+	a.logf("account.addOutlookOAuth: connecting account=%s email=%s token_present=%t refresh_present=%t", id, req.Email, req.AccessToken != "", req.RefreshToken != "")
 	if _, err := a.sidecar.Call("account.connect", map[string]any{
 		"id":               id,
 		"host":             "outlook.office365.com",

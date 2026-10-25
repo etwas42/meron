@@ -3,7 +3,6 @@ import type { Folder } from '../types'
 export type AccountGroup = {
   accountId: string
   label: string
-  email?: string
   avatarUrl?: string
   isRSS: boolean
   folders: Folder[]
@@ -24,6 +23,16 @@ export function pickDelimiter(folders: Folder[]): string {
   if (folders.some((folder) => folder.name.includes('/'))) return '/'
   if (folders.some((folder) => folder.name.includes('.'))) return '.'
   return '/'
+}
+
+/** A folder's own name, without the parent path it is nested under ("Now" for
+ *  "[Gmail]/Now"), as the folder tree labels it. Only the folder's own
+ *  server-reported delimiter splits it: without one the server exposed no
+ *  hierarchy, so a "/" or "." in the name is ordinary punctuation. */
+export function folderLeafName(folder: Folder): string {
+  if (!folder.delimiter) return folder.name
+  const segments = folder.name.split(folder.delimiter).filter(Boolean)
+  return segments[segments.length - 1] ?? folder.name
 }
 
 export function buildFolderTree(folders: Folder[]): TreeNode[] {

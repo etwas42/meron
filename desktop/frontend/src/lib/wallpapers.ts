@@ -141,6 +141,17 @@ export function sanitizeChatWallpaper(raw: unknown): ChatWallpaper | null {
   return null
 }
 
+/**
+ * A kanban board's own background, or null for none. Plain is the board's
+ * unset state, not a layer of its own: the picker shows it selected when
+ * nothing is set, and a board with a wallpaper restyles its columns to sit on
+ * it, so a stored Plain would leave no way back to the default board.
+ */
+export function boardWallpaper(raw: unknown): ChatWallpaper | null {
+  const clean = sanitizeChatWallpaper(raw)
+  return clean?.kind === 'preset' && clean.presetId === 'plain' ? null : clean
+}
+
 export function wallpaperCss(wallpaper: ChatWallpaper | null | undefined): {
   className: string
   style?: CSSProperties

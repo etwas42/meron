@@ -2,11 +2,24 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 
 	"fyne.io/systray"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+)
+
+// First-run default; saved style is restored natively before publication and
+// supplied to the frontend by tray.getStyle.
+var trayMonochromeDefault = runtime.GOOS != "windows"
+
+// Routed through package vars so tests can see which icon was set.
+var (
+	traySetIcon           = systray.SetIcon
+	trayApplyPlatformIcon = applyPlatformTrayIcon
+	trayIconNeedsRepair   = platformTrayIconNeedsRepair
+	trayOnTapped          = systray.SetOnTapped
 )
 
 var (
@@ -21,6 +34,17 @@ func (a *App) startTrayPhysical() {
 		return
 	}
 
+	// Establish click semantics before the Linux ItemIsMenu snapshot.
+	trayOnTapped(a.showMainWindow)
+	if runtime.GOOS == "linux" {
+		// The tray item is published while trayReady already runs, from what
+		// was set before: a title or icon name set in between is lost. So set
+		// them up front; trayReady sets them again for the other platforms.
+		a.applyTrayIcon()
+		a.waitForTrayIcon()
+		systray.SetTitle(appTitle())
+		systray.SetTooltip(appTitle())
+	}
 	start, stop := trayLoop(a.trayReady, func() {
 		a.logf("tray stopped")
 	})
@@ -29,6 +53,7 @@ func (a *App) startTrayPhysical() {
 }
 
 func (a *App) stopTray() {
+	a.tray.stop()
 	if a.trayStop == nil {
 		return
 	}
@@ -44,15 +69,14 @@ func (a *App) stopTray() {
 }
 
 func (a *App) trayReady() {
-	systray.SetIcon(trayIcon(a.currentTrayUnread()))
+	// Linux already has the pre-publication icon; other native backends need
+	// their first write after creating the status item/window.
+	a.requestTrayIcon(runtime.GOOS != "linux")
 	if runtime.GOOS != "darwin" {
 		// On macOS the title renders as text beside the menu bar icon.
-		systray.SetTitle("Meron")
+		systray.SetTitle(appTitle())
 	}
-	systray.SetTooltip("Meron")
-	systray.SetOnTapped(func() {
-		a.showMainWindow()
-	})
+	systray.SetTooltip(appTitle())
 
 	// Held across the reads and the AddMenuItem calls: the frontend pushes its
 	// localized labels while this goroutine is starting, and a setNativeLabels
@@ -93,6 +117,8 @@ func (a *App) showMainWindow() {
 	if ctx == nil {
 		return
 	}
+	a.windowHidden.Store(false)
+	a.revealWindow(true)
 	showAndRaiseMainWindow(ctx)
 }
 
@@ -101,15 +127,13 @@ func (a *App) hideMainWindow() {
 	if ctx == nil {
 		return
 	}
-	wailsRuntime.WindowHide(ctx)
+	a.rememberWindowState(ctx)
+	a.windowHidden.Store(true)
+	windowHide(ctx)
 }
 
 func (a *App) quitFromTray() {
-	ctx := a.runtimeContext()
-	if ctx == nil {
-		return
-	}
-	wailsRuntime.Quit(ctx)
+	a.quit()
 }
 
 func (a *App) runtimeContext() context.Context {
@@ -134,23 +158,32 @@ func (a *App) traySetUnread(payload map[string]any) (any, error) {
 	return map[string]any{"ok": true}, nil
 }
 
-func (a *App) setTrayUnread(unread bool) {
-	a.trayMu.Lock()
-	if a.trayHasUnread == unread {
-		a.trayMu.Unlock()
-		return
+func (a *App) setTrayUnread(unread bool) { a.trayState().setUnread(unread) }
+
+func (a *App) traySetStyle(payload map[string]any) (any, error) {
+	monochrome, ok := payload["monochrome"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("tray.setStyle: monochrome must be a boolean")
 	}
-	a.trayHasUnread = unread
-	a.trayMu.Unlock()
-
-	systray.SetIcon(trayIcon(unread))
+	a.trayStyleMu.Lock()
+	defer a.trayStyleMu.Unlock()
+	// Apply the live choice even if native storage is temporarily read-only.
+	a.trayState().setMonochrome(monochrome)
+	persisted := true
+	if a.trayStylePath != "" {
+		if err := saveTrayStyle(a.trayStylePath, monochrome); err != nil {
+			persisted = false
+			a.logf("tray: cannot save style (live choice still applied): %v", err)
+		}
+	}
+	return map[string]any{"ok": true, "persisted": persisted}, nil
 }
 
-func (a *App) currentTrayUnread() bool {
-	a.trayMu.Lock()
-	defer a.trayMu.Unlock()
-	return a.trayHasUnread
-}
+func (a *App) applyTrayIcon()             { a.requestTrayIcon(true) }
+func (a *App) requestTrayIcon(force bool) { a.trayState().request(force) }
+
+// Linux pre-publication waiting is outside the renderer's state lock.
+func (a *App) waitForTrayIcon() { a.trayState().wait() }
 
 func trayIcon(unread bool) []byte {
 	if runtime.GOOS == "windows" {

@@ -6,45 +6,43 @@ import { formatThreadDate } from '../../lib/date'
 import { clsx } from '../../lib/utils'
 import { useTranslation } from '../../lib/i18n'
 import { isDraftFolder } from '../../states/mailFolders'
+import { AttachmentChips } from './AttachmentChips'
 
 export function ThreadListItem({
   thread,
-  accounts,
-  selectedAccount,
-  selectedThread,
-  active,
+  active = false,
+  badgeAccount,
   onSelect,
+  onOpenInNewTab,
   onContextMenu,
+  contextMenuOpen = false,
   draggable,
   onDragStart,
   onDragEnd,
   className = '',
   rootRef,
-  showAccountBadge,
   bulkSelectable = false,
   bulkSelected = false,
 }: {
   thread: Message
-  accounts: Account[]
-  selectedAccount: string
-  selectedThread: string
   active?: boolean
+  // The account the thread belongs to, badged on the avatar in lists that mix
+  // accounts; omitted elsewhere.
+  badgeAccount?: Account
   onSelect: (event: MouseEvent<HTMLButtonElement>) => void
+  // Double-click opens the row in its own tab (single click previews it).
+  onOpenInNewTab?: () => void
   onContextMenu?: (event: MouseEvent) => void
+  contextMenuOpen?: boolean
   draggable?: boolean
   onDragStart?: (event: DragEvent<HTMLDivElement>) => void
   onDragEnd?: (event: DragEvent<HTMLDivElement>) => void
   className?: string
   rootRef?: Ref<HTMLDivElement>
-  showAccountBadge?: boolean
   bulkSelectable?: boolean
   bulkSelected?: boolean
 }) {
   const { t } = useTranslation()
-  const isActive = active ?? thread.thread_id === selectedThread
-  const threadAccount = accounts.find((acc) => acc.id === thread.account_id)
-  const badgeLabel = threadAccount ? threadAccount.display_name || threadAccount.email : ''
-  const accountBadgeVisible = showAccountBadge ?? selectedAccount === 'unified'
   const threadTitle = thread.subject || '(no subject)'
   // RSS feed rows carry a feed_url (and, once cached, a feed_icon). For those,
   // skip the email-based gravatar/favicon resolution and use the feed's icon.
@@ -58,32 +56,24 @@ export function ThreadListItem({
       draggable={draggable}
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
-      className={clsx(
-        'group relative border-b border-border/50 last:border-b-0',
-        draggable && 'cursor-grab active:cursor-grabbing',
-        className,
-      )}
+      className={clsx('group relative', draggable && 'cursor-grab active:cursor-grabbing', className)}
     >
       <button
         className={clsx(
-          'relative w-full px-2 py-3 transition-all duration-150 flex items-center gap-2 cursor-pointer select-none text-left',
-          bulkSelectable
-            ? bulkSelected
-              ? 'bg-accent/[0.13] text-primary'
-              : 'bg-chats hover:bg-hover text-primary'
-            : isActive
-              ? 'bg-accent/20 dark:bg-accent/30 text-primary'
-              : unread
-                ? 'bg-accent/[0.07] hover:bg-accent/[0.12] text-primary'
-                : 'bg-chats hover:bg-hover text-primary',
+          // Rows are inset pills, told apart by spacing rather than divider
+          // lines; unread weight and the count badge mark unread, not a tint.
+          'relative w-full rounded-lg px-2.5 py-2.5 text-primary transition-colors duration-150 flex items-center gap-2.5 cursor-pointer select-none text-left',
+          (bulkSelectable ? bulkSelected : active)
+            ? 'bg-accent/[0.13] dark:bg-accent/20'
+            : contextMenuOpen
+              ? 'bg-hover'
+              : 'hover:bg-hover',
         )}
         onClick={onSelect}
+        onDoubleClick={onOpenInNewTab}
         onContextMenu={onContextMenu}
         title={threadTitle}
       >
-        {!bulkSelectable && isActive && (
-          <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-accent" />
-        )}
         {bulkSelectable ? (
           <span aria-hidden="true" className="flex h-10 w-10 shrink-0 items-center justify-center">
             <span
@@ -104,9 +94,13 @@ export function ThreadListItem({
               email={isRSS ? undefined : thread.from_addr}
               src={isRSS && thread.feed_icon ? `/media/${thread.feed_icon}` : undefined}
             />
-            {accountBadgeVisible && threadAccount && (
+            {badgeAccount && (
               <div className="absolute -bottom-1 -left-1 rounded-full ring-2 ring-chats overflow-hidden">
-                <Avatar name={badgeLabel} src={threadAccount.avatar_url} size={16} />
+                <Avatar
+                  name={badgeAccount.display_name || badgeAccount.email}
+                  src={badgeAccount.avatar_url}
+                  size={16}
+                />
               </div>
             )}
           </div>
@@ -116,7 +110,10 @@ export function ThreadListItem({
           <div className="flex items-center gap-2 min-w-0">
             <div className="flex min-w-0 items-center gap-1">
               <span
-                className={clsx('text-[0.8125rem] font-semibold truncate', unread ? 'text-primary' : 'text-primary/85')}
+                className={clsx(
+                  'text-[0.8125rem] truncate',
+                  unread ? 'font-semibold text-primary' : 'font-medium text-primary/80',
+                )}
               >
                 {thread.senders && thread.senders.length > 1
                   ? thread.senders
@@ -171,6 +168,7 @@ export function ThreadListItem({
               </span>
             ) : null}
           </div>
+          {!!thread.files?.length && <AttachmentChips files={thread.files} />}
         </div>
       </button>
     </div>

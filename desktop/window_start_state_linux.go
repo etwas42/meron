@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !bindings
 
 package main
 
@@ -10,6 +10,18 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+// Keep the window mapped so GTK/WebKit can render and the window manager can
+// record its restore geometry. The realize hook conceals it with zero opacity.
+const startWindowHidden = false
+
+func revealStartupWindow(ctx context.Context) {
+	nativeRevealStartupWindow(false)
+}
+
+func forceRevealStartupWindow(ctx context.Context) {
+	nativeRevealStartupWindow(true)
+}
+
 // startWindowState leaves the window in its normal state on Linux.
 //
 // Maximising through WindowStartState happens in the same main loop turn that
@@ -18,19 +30,24 @@ import (
 // title bar) drops the window at the monitor origin, with its title bar under
 // the GNOME top bar. Mapping normal first and maximising from DomReady gives the
 // window manager a real restore geometry.
-func startWindowState() options.WindowStartState {
+func startWindowState(maximised bool) options.WindowStartState {
+	nativeExpectStartupMaximise(maximised)
 	return options.Normal
 }
 
 var maximiseOnce sync.Once
 
 // maximiseOnDomReady maximises the window once the page is up, which is the
-// earliest point where the window is guaranteed to be mapped.
+// earliest point where the window is guaranteed to be mapped, when the last
+// session ended maximised.
 //
 // DomReady fires on every completed navigation, not only the first one - an
 // error boundary reload, the OAuth flow, a dev server reload - so the maximise
 // is guarded: a window the user has since unmaximised has to stay that way.
-func maximiseOnDomReady(ctx context.Context) {
+func maximiseOnDomReady(ctx context.Context, maximised bool) {
+	if !maximised {
+		return
+	}
 	maximiseOnce.Do(func() {
 		wailsRuntime.WindowMaximise(ctx)
 	})

@@ -4,12 +4,15 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
@@ -17,14 +20,19 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -34,47 +42,185 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
 
+/**
+ * Theme picker page: the "match system" switch over light and dark sections of
+ * preview swatches, mirroring the desktop ThemeDialog grid. While the theme
+ * follows the system each section holds its own pick. Custom themes sit after
+ * the built-ins; there is no editor, so they arrive through Import as the
+ * one-line string desktop shares.
+ */
 @Composable
-internal fun ThemePickerDialog(
-    current: AppAppearanceMode,
-    onSelect: (AppAppearanceMode) -> Unit,
+internal fun ThemePickerPage(
+    choice: ThemeChoice,
+    systemDark: Boolean,
+    onChange: (ThemeChoice) -> Unit,
+    customThemes: List<CustomTheme>,
+    onImportCustomTheme: (CustomTheme) -> Unit,
+    onDeleteCustomTheme: (CustomTheme) -> Unit,
+    onShareCustomTheme: (CustomTheme) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val builtins: List<AppTheme> = AppAppearanceMode.entries.filter { dynamicColorSupported || !it.isDynamic }
+    val (darkModes, lightModes) = (builtins + customThemes).partition { it.isDark }
+    val onSelect: (AppTheme) -> Unit = { mode -> onChange(choice.select(mode)) }
+    var importing by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf<CustomTheme?>(null) }
+    val swatchActions = SwatchActions(onShare = onShareCustomTheme, onDelete = { deleting = it })
+    val lightLabel = tr("theme.light")
+    val darkLabel = tr("theme.dark")
+    val listState = rememberLazyListState()
+    LazyColumn(
+        modifier = modifier.appScrollbar(listState),
+        state = listState,
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { onChange(choice.withFollowSystem(!choice.followSystem, systemDark)) }
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(tr("theme.matchSystem"), style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        tr("theme.matchSystemHint"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = choice.followSystem,
+                    onCheckedChange = { onChange(choice.withFollowSystem(it, systemDark)) },
+                )
+            }
+        }
+        themeSwatchSection(lightLabel, lightModes, choice.chosen, onSelect, swatchActions)
+        themeSwatchSection(darkLabel, darkModes, choice.chosen, onSelect, swatchActions)
+        item {
+            OutlinedButton(onClick = { importing = true }, modifier = Modifier.padding(top = 4.dp)) {
+                Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(tr("theme.import"))
+            }
+        }
+    }
+    if (importing) {
+        ImportThemeDialog(
+            onImport = { theme ->
+                importing = false
+                onImportCustomTheme(theme)
+            },
+            onDismiss = { importing = false },
+        )
+    }
+    deleting?.let { theme ->
+        AlertDialog(
+            onDismissRequest = { deleting = null },
+            title = { Text(tr("theme.delete")) },
+            text = { Text(tr("theme.deleteMessage", mapOf("name" to theme.name))) },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleting = null
+                    onDeleteCustomTheme(theme)
+                }) { Text(tr("buttons.delete"), color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = { TextButton(onClick = { deleting = null }) { Text(tr("buttons.cancel")) } },
+        )
+    }
+}
+
+private class SwatchActions(
+    val onShare: (CustomTheme) -> Unit,
+    val onDelete: (CustomTheme) -> Unit,
+)
+
+/**
+ * Import a shared theme string: pasted, or taken from the clipboard when it
+ * already holds one. The preview shows the theme as soon as the text parses.
+ */
+@Composable
+private fun ImportThemeDialog(
+    onImport: (CustomTheme) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    // Light and dark sections of preview swatches, mirroring the desktop
-    // ThemeDialog grid.
-    val selectableModes = AppAppearanceMode.entries.filterNot { it == AppAppearanceMode.System }
-    val (darkModes, lightModes) = selectableModes.partition { themePreviewColors(it).dark }
+    val clipboardManager = LocalClipboardManager.current
+    var text by remember {
+        mutableStateOf(
+            clipboardManager
+                .getText()
+                ?.text
+                ?.trim()
+                ?.takeIf { parseThemeSource(it) != null }
+                .orEmpty(),
+        )
+    }
+    var name by remember { mutableStateOf("") }
+    val source = parseThemeSource(text)
+    val fallbackName = tr("theme.customTheme")
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(tr("common.theme")) },
+        title = { Text(tr("theme.import")) },
         text = {
-            val lightLabel = tr("theme.light")
-            val darkLabel = tr("theme.dark")
-            val listState = rememberLazyListState()
-            LazyColumn(
-                modifier = Modifier.heightIn(max = 480.dp).appScrollbar(listState),
-                state = listState,
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                themeSwatchSection(lightLabel, lightModes, current, onSelect, onDismiss)
-                themeSwatchSection(darkLabel, darkModes, current, onSelect, onDismiss)
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    placeholder = { Text(tr("theme.importPlaceholder")) },
+                    isError = source == null && text.isNotBlank(),
+                    supportingText =
+                        if (source == null && text.isNotBlank()) {
+                            { Text(tr("theme.importInvalid")) }
+                        } else {
+                            null
+                        },
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    placeholder = { Text(tr("theme.namePlaceholder")) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (source != null) {
+                    ThemePreviewMock(
+                        themePreviewColors(CustomTheme(id = "", name = "", source = source)),
+                        modifier = Modifier.clip(RoundedCornerShape(12.dp)),
+                    )
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text(tr("buttons.done")) } },
+        confirmButton = {
+            TextButton(
+                enabled = source != null,
+                onClick = {
+                    if (source != null) onImport(CustomTheme(newCustomThemeId(), name.trim().ifEmpty { fallbackName }, source))
+                },
+            ) { Text(tr("theme.save")) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text(tr("buttons.cancel")) } },
     )
 }
 
 /** A labelled section of theme swatches, laid out two per row. */
 private fun LazyListScope.themeSwatchSection(
     label: String,
-    modes: List<AppAppearanceMode>,
-    current: AppAppearanceMode,
-    onSelect: (AppAppearanceMode) -> Unit,
-    onDismiss: () -> Unit,
+    modes: List<AppTheme>,
+    chosen: Set<AppTheme>,
+    onSelect: (AppTheme) -> Unit,
+    actions: SwatchActions,
 ) {
     item {
         Text(
@@ -89,12 +235,11 @@ private fun LazyListScope.themeSwatchSection(
             row.forEach { mode ->
                 ThemeSwatch(
                     mode = mode,
-                    selected = mode == current,
-                    onSelect = {
-                        onSelect(mode)
-                        onDismiss()
-                    },
+                    selected = mode in chosen,
+                    onSelect = { onSelect(mode) },
                     modifier = Modifier.weight(1f),
+                    onShare = (mode as? CustomTheme)?.let { { actions.onShare(it) } },
+                    onDelete = (mode as? CustomTheme)?.let { { actions.onDelete(it) } },
                 )
             }
             if (row.size == 1) Spacer(Modifier.weight(1f))

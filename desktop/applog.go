@@ -105,7 +105,7 @@ func (a *App) logExport() (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+	dest, err := saveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:                "Export log",
 		DefaultFilename:      "meron-log.txt",
 		CanCreateDirectories: true,

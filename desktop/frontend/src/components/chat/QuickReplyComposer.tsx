@@ -31,50 +31,67 @@ export function QuickReplyComposer() {
   const canSend = !sendingReply && !isQuickReplyBlank()
 
   return (
-    <footer className="p-3.5 bg-header border-t border-border z-10 flex flex-col items-center justify-center">
-      <div className="flex flex-col gap-2 w-full bg-hover p-2 rounded-2xl border border-border/50 shadow-sm focus-within:ring-1 focus-within:ring-accent focus-within:bg-chats transition-all duration-150">
-        {/* One line, not two: From and To are both single-address disclosures,
-            and stacking them pushed the box itself down the window. Recipients
-            lead — they are what changes from thread to thread — and the send-as
-            address sits out of the way at the right edge. */}
-        <div className="flex w-full min-w-0 items-center gap-2 empty:hidden">
-          <QuickReplyRecipients />
-          <QuickReplyFrom />
-        </div>
+    // The footer floats over the message list (MessagePane) and paints nothing
+    // of its own, so the conversation runs on behind it and messages scroll off
+    // under the box; MessagePane fades what shows around it.
+    <footer className="px-3 pb-3 pt-1 flex flex-col items-center justify-center">
+      <div
+        onMouseDown={(event) => {
+          // A press on the box's bare padding or the gaps of the control row
+          // goes to the text, keeping its caret; controls, and the menus and
+          // previews portalled out of the box, keep their own presses.
+          const target = event.target as HTMLElement
+          if (!event.currentTarget.contains(target)) return
+          if (target.closest('button, a, input, textarea, select, [role], [tabindex]')) return
+          event.preventDefault()
+          textareaRef.current?.focus()
+        }}
+        className="pointer-events-auto flex flex-col gap-1 w-full bg-chats p-2 rounded-2xl border border-border/40 shadow-float focus-within:ring-1 focus-within:ring-accent transition-all duration-150"
+      >
         <QuickReplyAttachments attachments={composerAttachments} />
 
-        <div className="flex items-end gap-2 w-full">
+        {/* The text leads and has the box's full width; everything else shares
+            the one line under it, so a growing reply never strands a control
+            beside it and a narrow pane gives no text width to buttons. */}
+        <textarea
+          ref={textareaRef}
+          value={composer}
+          onChange={(event) => compose$.composer.set(event.target.value)}
+          placeholder={t('composer.placeholders.quickMessage')}
+          rows={1}
+          spellCheck={spellCheck}
+          className="w-full px-1.5 max-h-[254px] bg-transparent text-[calc(0.9375rem*var(--me-message-scale))] text-primary resize-none placeholder-secondary border-none outline-none leading-[1.3333]"
+          onKeyDown={handleComposerKeyDown}
+          onPaste={handleComposerPaste}
+        />
+
+        {/* From and To are both single-address disclosures, kept to one line:
+            the recipients sit against the send button, and the send-as address
+            follows the buttons on the left, where it is the first to truncate
+            when the pane narrows — recipients change from thread to thread. */}
+        <div className="-mb-1 flex w-full min-w-0 items-center gap-1">
           <button
             onClick={() => void pickAttachmentFiles()}
-            className="flex h-8.5 w-8.5 shrink-0 items-center justify-center rounded-xl text-secondary hover:bg-active transition-colors cursor-pointer"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary hover:bg-active hover:text-primary transition-colors cursor-pointer"
             title={t('composer.actions.attachFiles')}
           >
-            <Paperclip size={16} />
+            <Paperclip size={15} />
           </button>
           <button
             onClick={() => openReplyInFullEditor()}
-            className="flex h-8.5 w-8.5 shrink-0 items-center justify-center rounded-xl text-secondary hover:bg-active transition-colors cursor-pointer"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-secondary hover:bg-active hover:text-primary transition-colors cursor-pointer"
             title={t('composer.actions.openFullEditor')}
           >
-            <Maximize2 size={15} />
+            <Maximize2 size={14} />
           </button>
-
-          <textarea
-            ref={textareaRef}
-            value={composer}
-            onChange={(event) => compose$.composer.set(event.target.value)}
-            placeholder={t('composer.placeholders.quickMessage')}
-            rows={1}
-            spellCheck={spellCheck}
-            className="flex-1 py-[7px] px-1 max-h-[254px] min-h-8.5 bg-transparent text-[0.9375rem] text-primary resize-none placeholder-secondary border-none outline-none leading-5"
-            onKeyDown={handleComposerKeyDown}
-            onPaste={handleComposerPaste}
-          />
-
+          <QuickReplyFrom />
+          <div className="ml-auto flex min-w-0 shrink items-center">
+            <QuickReplyRecipients />
+          </div>
           <button
             onClick={handleSendReply}
             disabled={!canSend}
-            className={`flex h-8.5 w-8.5 shrink-0 items-center justify-center rounded-full shadow transition-all ${
+            className={`ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full shadow transition-all ${
               sendingReply
                 ? 'bg-accent text-accent-label cursor-wait'
                 : canSend

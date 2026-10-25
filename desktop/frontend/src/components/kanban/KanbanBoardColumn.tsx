@@ -1,14 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, MouseEvent as ReactMouseEvent } from 'react'
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react'
 import { useTranslation } from '../../lib/i18n'
 import { useSortable } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { Loader2, Minus, Pause, Rss } from 'lucide-react'
+import { Loader2, Minus, Pause, Rss, Search } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { clsx } from '../../lib/utils'
 import { accounts$ } from '../../states/accounts'
 import { mail$ } from '../../states/mail'
-import { deletableFolder, deleteFolder, emptiableFolder, emptyFolder, isDraftFolder } from '../../states/mailFolders'
+import { exportFolderAsEml } from '../../states/emlExport'
+import {
+  deletableFolder,
+  deleteFolder,
+  emptiableFolder,
+  emptyFolder,
+  folderMatches,
+  isDraftFolder,
+} from '../../states/mailFolders'
 import {
   clearBulkSelection,
   isWailsDesktopRuntime,
@@ -22,7 +30,9 @@ import {
   kanbanColumnKey,
   kanban$,
   markColumnAllRead,
+  editKanbanSearchColumn,
   removeKanbanColumn,
+  saveKanbanSearchColumn,
   switchKanbanColumnFolder,
   type KanbanColumn,
 } from '../../states/kanban'
@@ -35,6 +45,7 @@ import {
   columnSearchActive,
   columnSearchHighlightClass,
   folderLabel,
+  activeKanbanColumnQuery,
   loadKanbanColumn,
   loadMoreKanbanColumn,
   syncKanbanColumn,
@@ -54,18 +65,44 @@ import { FolderSwitcher } from '../menu/FolderSwitcher'
 import { KanbanThreadCard } from './KanbanThreadCard'
 import { KanbanColumnMinimized } from './KanbanColumnMinimized'
 import { BulkActionBar } from '../threads/BulkActionBar'
+import { SearchOptions } from '../search/SearchOptions'
+import { boardWallpaper } from '../../lib/wallpapers'
 
 // A board column is both a dnd-kit sortable item and a drop target; this bundles
 // the wiring the column renderers need from those hooks.
 export type ColumnWrapper = {
   setNodeRef: (node: HTMLElement | null) => void
+  // The header that starts a drag. Registered so a key pressed on a button
+  // inside it isn't taken for picking the column up.
+  setHandleRef?: (node: HTMLElement | null) => void
   scrollIntoView: () => void
+  /** A card (not another column) is being dragged over this column. */
   isOver: boolean
+  /** This column is the one being dragged to a new slot. */
+  isDragging?: boolean
   /** Why the card currently being dragged can't be dropped here, if it can't. */
   dropRejection?: string
   style?: CSSProperties
   // Header drag props for reordering.
   dragHandle?: Record<string, unknown>
+}
+
+// The handle's props, minus the presses that must not pick the column up. A
+// menu opened from the handle is portaled out of it but still bubbles through it
+// in React's tree, so a press inside one is never a drag. `ignoreButtons` also
+// leaves the handle's own buttons alone, for a handle that is mostly controls.
+function dragHandleProps(handle: Record<string, unknown> | undefined, ignoreButtons = false) {
+  if (!handle) return undefined
+  const start = handle.onPointerDown as ((event: ReactPointerEvent<HTMLElement>) => void) | undefined
+  return {
+    ...handle,
+    onPointerDown: (event: ReactPointerEvent<HTMLElement>) => {
+      const target = event.target as Element
+      if (!event.currentTarget.contains(target)) return
+      if (ignoreButtons && target.closest('button')) return
+      start?.(event)
+    },
+  }
 }
 
 function KanbanColumnContent({
@@ -97,6 +134,8 @@ function KanbanColumnContent({
   const allAccountCursors = useValue(kanban$.accountCursors)
   const allFilters = useValue(kanban$.filters)
   const globalFilter = useValue(kanban$.globalFilter)
+  const allAttachmentsOnly = useValue(kanban$.attachmentsOnly)
+  const globalAttachmentsOnly = useValue(kanban$.globalAttachmentsOnly)
   const searchQuery = useValue(kanban$.searchQuery)
   const searchScope = useValue(kanban$.searchScope)
   const system = useValue(ui$.system)
@@ -104,7 +143,7 @@ function KanbanColumnContent({
   const width = useValue(settings$.kanbanColumnWidth)
   const minimizedColumns = useValue(settings$.kanbanMinimizedColumns)
   const board = useValue(settings$.kanbanBoards).find((item) => item.id === boardId)
-  const overWallpaper = !!board?.wallpaper
+  const overWallpaper = !!boardWallpaper(board?.wallpaper)
   const boardColumns = board?.columns ?? []
   const readThreads = useValue(mail$.readThreads)
   const labelFolders = useMemo(() => mergeLabelFolders(folders, foldersByAccount), [folders, foldersByAccount])
@@ -112,16 +151,19 @@ function KanbanColumnContent({
   // A column's own filter, once set, wins over the board-wide switch; the global
   // filter is only the default for columns the user hasn't touched.
   const filterMode = allFilters[key] ?? globalFilter
+  const attachmentsOnly = allAttachmentsOnly[key] ?? globalAttachmentsOnly
   // Keep a card visible (in place) only when opening it just changed its state —
   // e.g. selecting an unread card marks it read (tracked in readThreads) — not
   // merely because it's the open thread. So switching to Unread/Starred yields a
   // clean filtered list instead of pinning the currently-open conversation.
-  const threads = filterThreads(rawThreads, filterMode, undefined, readThreads)
+  const threads = filterThreads(rawThreads, filterMode, undefined, readThreads, attachmentsOnly)
   const unreadCount = kanbanColumnUnreadCount(column, allUnreadCounts[key], rawThreads)
   const hasUnread = unreadCount > 0
   const loading = allLoading[key] ?? false
   const loadingMore = allLoadingMore[key] ?? false
+  // On a saved search column the board search narrows the column's own query.
   const searchActive = columnSearchActive(key, searchQuery, searchScope)
+  const savedSearch = !!column.query
   const starredColumn = isUnifiedStarredColumn(column)
   // Every column pages on the single cursor now, unified included — the core
   // merges the per-account pages behind one. (The legacy per-account cursors
@@ -133,13 +175,21 @@ function KanbanColumnContent({
   const columnAccountLabel = columnAccount ? columnAccount.display_name || columnAccount.email || columnAccount.id : ''
   const isRss = isRssAccount(columnAccount, column.accountId)
   const isPaused = !!columnAccount?.paused
-  const emptyText = columnEmptyText(filterMode, searchActive, rawThreads.length > 0, isRss)
+  const emptyText = columnEmptyText(
+    filterMode,
+    searchActive || savedSearch,
+    rawThreads.length > 0,
+    isRss,
+    attachmentsOnly,
+  )
   const [syncing, setSyncing] = useState(false)
   const [headerMenu, setHeaderMenu] = useState<{ x: number; y: number } | null>(null)
+  const [editingQuery, setEditingQuery] = useState(false)
   // Only a per-account Trash/Junk column can be emptied — never a unified or
-  // starred column, which span folders the action must not touch.
+  // starred column, which span folders the action must not touch, nor a saved
+  // search, which shows only some of its folder.
   const emptiableTarget =
-    starredColumn || isRss || column.accountId === 'unified'
+    starredColumn || isRss || savedSearch || column.accountId === 'unified'
       ? null
       : emptiableFolder(
           labelFolders.find((folder) => folder.account_id === column.accountId && folder.id === column.folderId),
@@ -147,12 +197,20 @@ function KanbanColumnContent({
   // An ordinary folder of a single account can be deleted on the server; the
   // column goes with it, so unified/starred/RSS columns never offer this.
   const deletableTarget =
-    starredColumn || isRss || column.accountId === 'unified'
+    starredColumn || isRss || savedSearch || column.accountId === 'unified'
       ? null
       : deletableFolder(
           labelFolders.find((folder) => folder.account_id === column.accountId && folder.id === column.folderId),
           labelFolders.filter((folder) => folder.account_id === column.accountId),
         )
+  // A whole-folder export needs one real mailbox to list on the server. The
+  // folder row only supplies a name: an inbox column is keyed "inbox" whatever
+  // the server calls it, and the list may not have loaded yet.
+  const canExportFolder = !starredColumn && !isRss && !savedSearch && !!columnAccount
+  const exportColumnFolder = () => {
+    const folder = labelFolders.find((item) => folderMatches(item, column.accountId, column.folderId))
+    void exportFolderAsEml(column.accountId, column.folderId, folder?.name ?? column.folderId)
+  }
   const deleteColumnFolder = () => {
     if (!deletableTarget) return
     void deleteFolder(column.accountId, column.folderId, deletableTarget.name, deletableTarget.nested)
@@ -211,9 +269,32 @@ function KanbanColumnContent({
     setBulkSelection(rows.slice(from, to + 1), target.key)
   }
 
+  // The board's search effect doesn't watch the filters, so a filter change
+  // reloads here with whatever search currently covers this column.
   useEffect(() => {
-    void loadKanbanColumn(column, true)
-  }, [column.accountId, column.folderId, filterMode])
+    void loadKanbanColumn(column, true, activeKanbanColumnQuery(column))
+  }, [column.accountId, column.folderId, column.query, filterMode, attachmentsOnly])
+
+  // The search moves into a column of its own. A search scoped to just this
+  // column has done its job then, so it clears; a board-wide one stays.
+  const saveSearch = () => {
+    const saved = saveKanbanSearchColumn(boardId, column, searchQuery)
+    if (!saved) return
+    void loadKanbanColumn(saved, true)
+    if (searchScope === key) kanban$.searchQuery.set('')
+  }
+
+  // The query is edited in the header, so a collapsed column opens first. An
+  // edit that lands re-keys the column, which remounts it on its new query; an
+  // empty, unchanged or duplicate one just puts the old query back.
+  const startEditSearch = () => {
+    settings$.kanbanMinimizedColumns[boardKey].set(false)
+    setEditingQuery(true)
+  }
+  const commitEditSearch = (query: string) => {
+    setEditingQuery(false)
+    editKanbanSearchColumn(boardId, column, query)
+  }
 
   const openHeaderMenu = (event: ReactMouseEvent<HTMLElement>) => {
     event.preventDefault()
@@ -230,7 +311,7 @@ function KanbanColumnContent({
       offset={4}
       onClose={() => setHeaderMenu(null)}
       overlay
-      className="fixed z-50 min-w-[176px] rounded-xl border border-border bg-chats p-1 shadow-2xl animate-fade-in text-primary"
+      className="fixed z-50 min-w-[176px]"
       onContextMenu={(event) => {
         event.preventDefault()
         event.stopPropagation()
@@ -242,6 +323,8 @@ function KanbanColumnContent({
           mail$.readThreads.set({})
           kanban$.filters[key].set(mode)
         }}
+        attachmentsOnly={attachmentsOnly}
+        onAttachmentsOnlyChange={(on) => kanban$.attachmentsOnly[key].set(on)}
         hasUnread={hasUnread}
         onMarkAllRead={() => void markColumnAllRead(column)}
         onEmptyFolder={emptiableTarget ? () => void emptyColumnFolder() : undefined}
@@ -249,6 +332,7 @@ function KanbanColumnContent({
           emptiableTarget?.role === 'junk' ? t('threads.actions.emptyJunk') : t('threads.actions.emptyTrash')
         }
         onDeleteFolder={deletableTarget ? deleteColumnFolder : undefined}
+        onExportFolder={canExportFolder ? exportColumnFolder : undefined}
         onSync={async () => {
           setSyncing(true)
           try {
@@ -263,6 +347,8 @@ function KanbanColumnContent({
         onRemove={() => removeKanbanColumn(boardId, column)}
         onSearch={() => onSearchColumn(column)}
         searchLabel={t('kanban.actions.search', { defaultValue: 'Search' })}
+        onSaveSearch={searchActive && !savedSearch ? saveSearch : undefined}
+        onEditSearch={savedSearch ? startEditSearch : undefined}
         // A collapsed column shows no thread list, so filtering it has nothing to
         // act on until it expands.
         hideFilters={minimized}
@@ -288,7 +374,8 @@ function KanbanColumnContent({
       className={clsx(
         'relative flex h-full shrink-0 flex-col rounded-lg border transition-colors',
         columnSearchHighlightClass(searchActive, overWallpaper),
-        columnDropTargetClass(wrapper.isOver, !!wrapper.dropRejection),
+        // The column in the air is outlined the same way as one a card is over.
+        columnDropTargetClass(wrapper.isOver || !!wrapper.isDragging, !!wrapper.dropRejection),
       )}
     >
       {wrapper.isOver && wrapper.dropRejection && (
@@ -299,25 +386,32 @@ function KanbanColumnContent({
         </div>
       )}
       {bulkInColumn ? (
-        <BulkActionBar
-          items={bulkItems}
-          allItems={threads.map(bulkItemFor)}
-          className="min-h-12 rounded-t-lg border-b border-border bg-transparent"
-        />
+        // Stands in for the header, so it has to carry the column's drag handle too.
+        <div
+          ref={wrapper.setHandleRef}
+          className={wrapper.dragHandle ? 'shrink-0 cursor-grab touch-none active:cursor-grabbing' : 'shrink-0'}
+          {...dragHandleProps(wrapper.dragHandle, true)}
+        >
+          <BulkActionBar
+            items={bulkItems}
+            allItems={threads.map(bulkItemFor)}
+            className="min-h-12 rounded-t-lg border-b border-border bg-transparent"
+          />
+        </div>
       ) : (
         <div
+          ref={wrapper.setHandleRef}
           className={`flex h-12 shrink-0 items-center gap-2 border-b border-border px-3 ${
             wrapper.dragHandle ? 'cursor-grab touch-none active:cursor-grabbing' : ''
           }`}
           title={wrapper.dragHandle ? t('kanban.actions.dragToReorderColumn') : undefined}
           onClick={wrapper.scrollIntoView}
           onContextMenu={openHeaderMenu}
-          {...wrapper.dragHandle}
+          {...dragHandleProps(wrapper.dragHandle)}
         >
           <div className="relative shrink-0">
             <Avatar
               name={columnAccountLabel || accountLabel(column.accountId, accounts)}
-              email={isRss ? undefined : columnAccount?.email}
               src={columnAccount?.avatar_url}
               size={26}
               fallback={isRss ? <Rss size={13} /> : undefined}
@@ -329,6 +423,15 @@ function KanbanColumnContent({
                 title={t('settings.account.paused', { defaultValue: 'Paused' })}
               >
                 <Pause size={7} className="fill-current" />
+              </span>
+            )}
+            {/* A saved search marks its avatar too, so it stands apart from the folder's plain column. */}
+            {!isPaused && column.query && (
+              <span
+                className="absolute -bottom-1 -right-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-accent text-white ring-2 ring-chats"
+                title={column.query}
+              >
+                <Search size={8} strokeWidth={3} />
               </span>
             )}
           </div>
@@ -346,18 +449,24 @@ function KanbanColumnContent({
                   label={folderLabel(column, labelFolders, accounts, t)}
                   labelClassName="-mx-2"
                   // Folders already open as their own column on this board can't
-                  // be switched to — the board would end up with duplicates.
+                  // be switched to — the board would end up with duplicates. A
+                  // saved search only collides with the same search elsewhere.
                   takenFolderIds={boardColumns
-                    .filter((item) => item.accountId === column.accountId && item.folderId !== column.folderId)
+                    .filter(
+                      (item) =>
+                        item.accountId === column.accountId &&
+                        item.folderId !== column.folderId &&
+                        item.query === column.query,
+                    )
                     .map((item) => item.folderId)}
                   onSelect={(nextFolderId) => {
                     if (!switchKanbanColumnFolder(boardId, column, nextFolderId)) return
-                    void loadKanbanColumn({ accountId: column.accountId, folderId: nextFolderId }, true)
+                    void loadKanbanColumn({ ...column, folderId: nextFolderId }, true)
                   }}
                 />
               )}
             </h3>
-            {((searchActive && loading) || syncing) && (
+            {(((searchActive || savedSearch) && loading) || syncing) && (
               <Loader2 size={13} className="shrink-0 animate-spin text-accent" />
             )}
             {unreadCount > 0 && (
@@ -389,6 +498,8 @@ function KanbanColumnContent({
                 mail$.readThreads.set({})
                 kanban$.filters[key].set(mode)
               }}
+              attachmentsOnly={attachmentsOnly}
+              onAttachmentsOnlyChange={(on) => kanban$.attachmentsOnly[key].set(on)}
               hasUnread={hasUnread}
               onMarkAllRead={() => void markColumnAllRead(column)}
               onEmptyFolder={emptiableTarget ? () => void emptyColumnFolder() : undefined}
@@ -396,6 +507,7 @@ function KanbanColumnContent({
                 emptiableTarget?.role === 'junk' ? t('threads.actions.emptyJunk') : t('threads.actions.emptyTrash')
               }
               onDeleteFolder={deletableTarget ? deleteColumnFolder : undefined}
+              onExportFolder={canExportFolder ? exportColumnFolder : undefined}
               onSync={async () => {
                 setSyncing(true)
                 try {
@@ -410,10 +522,26 @@ function KanbanColumnContent({
               onRemove={() => removeKanbanColumn(boardId, column)}
               onSearch={() => onSearchColumn(column)}
               searchLabel={t('kanban.actions.search', { defaultValue: 'Search' })}
+              onSaveSearch={searchActive && !savedSearch ? saveSearch : undefined}
+              onEditSearch={savedSearch ? startEditSearch : undefined}
               size={14}
               triggerClassName="h-7 w-7"
             />
           </div>
+        </div>
+      )}
+      {savedSearch && (
+        // Its own row under the header: the query is what tells saved searches of
+        // one folder apart, so it gets the column's width instead of squeezing
+        // the folder name. Positioned for the editor's options form.
+        <div className="relative flex shrink-0 px-3 pt-2 pb-1">
+          <SavedSearchQuery
+            query={column.query ?? ''}
+            editing={editingQuery}
+            onStartEdit={startEditSearch}
+            onCommit={commitEditSearch}
+            onCancel={() => setEditingQuery(false)}
+          />
         </div>
       )}
       {headerContextMenu}
@@ -421,7 +549,7 @@ function KanbanColumnContent({
         data-thread-list
         className="flex-1 space-y-1 overflow-y-auto p-1"
         onScroll={(event) => {
-          if (searchActive || !hasMore || loadingMore) return
+          if (!hasMore || loadingMore) return
           const el = event.currentTarget
           if (el.scrollHeight - el.scrollTop - el.clientHeight < 240) {
             void loadMoreKanbanColumn(column)
@@ -431,6 +559,18 @@ function KanbanColumnContent({
         {threads.length === 0 ? (
           <div className="py-8 text-center text-xs font-medium text-secondary">
             {loading || syncing ? t('common.loading') : emptyText}
+            {/* A narrowed page can come back empty with older mail still to
+                read, and an empty column has nothing to scroll: offer the next
+                page directly. */}
+            {!loading && !syncing && hasMore && (
+              <button
+                className="mx-auto mt-3 flex h-8 items-center justify-center rounded-lg border border-border px-3 text-xs font-semibold text-secondary hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer transition-colors"
+                disabled={loadingMore}
+                onClick={() => void loadMoreKanbanColumn(column)}
+              >
+                {loadingMore ? t('common.loading') : t('threads.actions.loadMore')}
+              </button>
+            )}
           </div>
         ) : (
           <>
@@ -450,12 +590,23 @@ function KanbanColumnContent({
                   onBulkRangeSelect={() => selectRangeTo(bulkItem)}
                   onBulkModeSelect={() => toggleBulkSelection(bulkItem)}
                   onBulkPlainSelect={() => clearBulkSelection()}
-                  bulkItem={bulkItem}
                 />
               )
             })}
-            {loadingMore && (
+            {loadingMore ? (
               <div className="py-3 text-center text-xs font-medium text-secondary">{t('common.loading')}</div>
+            ) : (
+              // A narrowed page can leave too few cards to scroll, so scrolling
+              // alone can't always reach the rest.
+              hasMore &&
+              !loading && (
+                <button
+                  className="mx-auto my-2 flex h-8 items-center justify-center rounded-lg border border-border px-3 text-xs font-semibold text-secondary hover:bg-hover cursor-pointer transition-colors"
+                  onClick={() => void loadMoreKanbanColumn(column)}
+                >
+                  {t('threads.actions.loadMore')}
+                </button>
+              )
             )}
           </>
         )}
@@ -472,8 +623,9 @@ function KanbanColumnContent({
           onOpenThread={(threadId) => {
             const thread = threads.find((item) => item.thread_id === threadId)
             if (!thread) return
+            // Leave paneThreadId on the card conversation behind the tabs (see
+            // KanbanThreadCard's openInNewTab).
             openThreadTab(thread)
-            kanban$.paneThreadId.set(threadId)
             kanban$.paneColumnKey.set(boardKey)
           }}
           onAfterAction={(action, _threadId, detail) => {
@@ -491,6 +643,105 @@ function KanbanColumnContent({
         />
       )}
     </section>
+  )
+}
+
+// A saved search column's query beside its folder name, edited in place. It sits
+// inside the header's drag handle, so presses and keys in it stay its own: Enter
+// or Space would otherwise pick the column up.
+function SavedSearchQuery({
+  query,
+  editing,
+  onStartEdit,
+  onCommit,
+  onCancel,
+}: {
+  query: string
+  editing: boolean
+  onStartEdit: () => void
+  onCommit: (query: string) => void
+  onCancel: () => void
+}) {
+  const { t } = useTranslation()
+  const [draft, setDraft] = useState(query)
+  // Cancelled, or committed from the options form: leaving the editor then commits nothing.
+  const settled = useRef(false)
+  const editorRef = useRef<HTMLSpanElement | null>(null)
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  useEffect(() => {
+    if (!editing) return
+    setDraft(query)
+    settled.current = false
+  }, [editing, query])
+  const chipClass =
+    'flex min-w-0 items-center gap-1 rounded-md bg-accent/10 px-1.5 py-0.5 text-[0.625rem] font-semibold text-accent'
+  const keepEvent = (event: { stopPropagation: () => void }) => event.stopPropagation()
+
+  if (editing) {
+    return (
+      // Not positioned, so the options form lays out against its row, as wide as
+      // the column; it still sits inside the editor, so focus moving into it
+      // doesn't count as leaving.
+      <span
+        ref={editorRef}
+        className={clsx(chipClass, 'flex-1')}
+        onPointerDown={keepEvent}
+        onClick={keepEvent}
+        onKeyDown={keepEvent}
+        onBlur={(event) => {
+          if (settled.current || editorRef.current?.contains(event.relatedTarget as Node | null)) return
+          onCommit(draft)
+        }}
+        title=""
+      >
+        <Search size={10} className="shrink-0" />
+        <input
+          ref={inputRef}
+          autoFocus
+          value={draft}
+          aria-label={t('kanban.actions.editSearch')}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            event.stopPropagation()
+            // Enter and Escape belong to an IME while it composes. WebKit reports
+            // the keystroke that ends a composition as keyCode 229 instead.
+            if (event.nativeEvent.isComposing || event.keyCode === 229) return
+            if (event.key === 'Enter') event.currentTarget.blur()
+            if (event.key === 'Escape') {
+              settled.current = true
+              onCancel()
+            }
+          }}
+          className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[0.625rem] font-semibold text-primary outline-none"
+        />
+        <SearchOptions
+          query={draft}
+          anchorRef={editorRef}
+          onSearch={(next) => {
+            settled.current = true
+            onCommit(next)
+          }}
+          onDismiss={() => inputRef.current?.focus()}
+          submitLabel={t('buttons.save')}
+        />
+      </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      className={clsx(chipClass, 'cursor-pointer hover:bg-accent/15')}
+      title={query}
+      aria-label={t('kanban.actions.editSearch')}
+      onPointerDown={keepEvent}
+      onClick={(event) => {
+        event.stopPropagation()
+        onStartEdit()
+      }}
+    >
+      <Search size={10} className="shrink-0" />
+      <span className="truncate">{query}</span>
+    </button>
   )
 }
 
@@ -512,10 +763,11 @@ export function SortableColumn({
   threadMenu: ThreadContextMenuController
 }) {
   const key = kanbanBoardColumnKey(boardId, column)
-  const { setNodeRef, attributes, listeners, transform, transition, isDragging, isOver } = useSortable({
-    id: key,
-    data: { type: 'column', column },
-  })
+  const { setNodeRef, setActivatorNodeRef, attributes, listeners, transform, transition, isDragging, isOver, active } =
+    useSortable({
+      id: key,
+      data: { type: 'column', column },
+    })
   const nodeRef = useRef<HTMLElement | null>(null)
   const setColumnNodeRef = useCallback(
     (node: HTMLElement | null) => {
@@ -539,8 +791,11 @@ export function SortableColumn({
       column={column}
       wrapper={{
         setNodeRef: setColumnNodeRef,
+        setHandleRef: setActivatorNodeRef,
         scrollIntoView: scrollColumnIntoView,
-        isOver,
+        // A column passing over during a reorder is not a drop into this one.
+        isOver: isOver && active?.data.current?.type === 'thread',
+        isDragging,
         dropRejection,
         style,
         dragHandle: { ...attributes, ...listeners },

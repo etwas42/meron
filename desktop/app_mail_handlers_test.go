@@ -469,3 +469,29 @@ func TestOpenAttachmentRefusesTraversalAndUnlistedTypes(t *testing.T) {
 		t.Fatal("expected an unlisted type not to be opened")
 	}
 }
+
+func TestMailMoveAcrossAccountsPassesDestinationAndExactSource(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "thread", true: "explicit-uids"}[explicit], func(t *testing.T) {
+			threadID := formatImapThreadID("acc", "INBOX", "k1#Todo")
+			app, writer := newMailHandlerTestApp(t, sidecarResponsePlan{Result: map[string]any{"ok": true, "moved": float64(2)}})
+			payload := map[string]any{"thread_id": threadID, "target_account_id": "other", "target_folder_id": "INBOX"}
+			if explicit {
+				payload["message_ids"] = []any{"11", "12"}
+			}
+			if _, err := app.mailMove(payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(writer.calls) != 1 {
+				t.Fatalf("sidecar calls = %#v, want one cross-account move", writer.calls)
+			}
+			want := map[string]any{"account": "acc", "folder": "INBOX", "target_account": "other", "target_folder": "INBOX"}
+			if explicit {
+				want["uids"] = []any{float64(11), float64(12)}
+			} else {
+				want["thread_key"] = "k1#Todo"
+			}
+			assertCall(t, writer.calls[0], "messages.move", want)
+		})
+	}
+}

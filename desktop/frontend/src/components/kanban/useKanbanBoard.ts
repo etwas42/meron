@@ -3,8 +3,10 @@ import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core'
 import { useValue } from '@legendapp/state/react'
 import { invoke } from '../../lib/bridge'
 import { t } from '../../lib/i18n'
+import { mailTransferError } from '../../lib/mailTransferErrors'
 import { moveFeed } from '../../states/feeds'
 import { showToast } from '../../states/ui'
+import { rememberThreadTransfer } from '../../states/recentThreadTransfers'
 import { kanbanColumnKey, kanban$, reorderKanbanColumn, type KanbanColumn } from '../../states/kanban'
 import type { Account, Message } from '../../types'
 import {
@@ -50,7 +52,8 @@ export function useKanbanBoardSync(boardId: string, visibleColumns: KanbanColumn
       if (column.folderId.toLowerCase() === 'inbox') continue
       const account = accounts.find((item) => item.id === column.accountId)
       if (!account || account.paused || isRSSAccount(column.accountId, accounts)) continue
-      desired.add(kanbanColumnKey(column))
+      // Keyed by folder alone: a saved search shares its folder's watch.
+      desired.add(kanbanColumnKey({ accountId: column.accountId, folderId: column.folderId }))
     }
 
     const current = watchedKanbanFoldersRef.current
@@ -193,42 +196,27 @@ export function useKanbanDnd(boardId: string, accounts: Account[]) {
           ...targetBefore.filter((thread) => thread.thread_id !== threadId),
         ])
       }
-      if (origin.accountId === target.accountId) {
-        await invoke('mail.move', { thread_id: threadId, target_folder_id: target.folderId })
-        showToast(t(KANBAN_MOVE_MESSAGES.moved))
-      } else {
-        const copyRes = await invoke<{ copied?: number }>('mail.copy', {
-          thread_id: threadId,
-          target_account_id: target.accountId,
-          target_folder_id: target.folderId,
-        })
-        if (typeof copyRes?.copied === 'number' && copyRes.copied <= 0) {
-          throw new Error(t(KANBAN_MOVE_MESSAGES.copyFailed))
-        }
-        try {
-          const deleteRes = await invoke<{ deleted?: number }>('mail.delete', {
-            thread_id: threadId,
-            folder: origin.folderId,
-          })
-          if (typeof deleteRes?.deleted === 'number' && deleteRes.deleted <= 0) {
-            throw new Error(t(KANBAN_MOVE_MESSAGES.noMatchingMessages))
-          }
-          showToast(t(KANBAN_MOVE_MESSAGES.moved))
-        } catch (error) {
-          showToast(
-            error instanceof Error
-              ? t(KANBAN_MOVE_MESSAGES.copiedNotRemovedReason, { error: error.message })
-              : t(KANBAN_MOVE_MESSAGES.copiedNotRemoved),
-            'error',
-          )
-        }
+      const result = await invoke<{ moved?: number }>('mail.move', {
+        thread_id: threadId,
+        target_account_id: target.accountId,
+        target_folder_id: target.folderId,
+      })
+      if (typeof result?.moved === 'number' && result.moved <= 0) {
+        throw new Error(t(KANBAN_MOVE_MESSAGES.noMatchingMessages))
       }
+      rememberThreadTransfer({
+        action: 'move',
+        sourceAccountId: origin.accountId,
+        targetAccountId: target.accountId,
+        targetFolderId: target.folderId,
+      })
+      showToast(t(KANBAN_MOVE_MESSAGES.moved))
       await reloadAll()
     } catch (error) {
       kanban$.threads[sourceKey].set(sourceBefore)
       kanban$.threads[targetKey].set(targetBefore)
-      showToast(error instanceof Error ? error.message : t(KANBAN_MOVE_MESSAGES.failed), 'error')
-      await loadKanbanColumn(source, false, queryForColumn(source))
+      showToast(mailTransferError(error, t(KANBAN_MOVE_MESSAGES.failed)), 'error')
+      await reloadAll()
     } finally {
       kanban$.movingThread.set('')
     }

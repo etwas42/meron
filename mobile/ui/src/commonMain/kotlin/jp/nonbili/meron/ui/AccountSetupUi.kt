@@ -85,6 +85,8 @@ internal enum class MailSecurity {
 internal fun AddAccountScreen(
     onBack: () -> Unit,
     initialSection: Int,
+    /** The form is fixing an existing account's credentials, not adding one. */
+    reconnecting: Boolean,
     displayName: String,
     onDisplayNameChange: (String) -> Unit,
     senderName: String,
@@ -144,7 +146,9 @@ internal fun AddAccountScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(tr("accounts.actions.addAccount")) },
+                title = {
+                    Text(tr(if (reconnecting) "accounts.actions.reconnectAccountTitle" else "accounts.actions.addAccount"))
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = tr("buttons.back"))
@@ -255,7 +259,9 @@ internal fun AddAccountScreen(
                                             onSecurityChange = onSmtpSecurityChange,
                                         )
                                     }
-                                    Button(onClick = onAddPassword, modifier = Modifier.fillMaxWidth()) { Text(tr("accounts.actions.addAccount")) }
+                                    Button(onClick = onAddPassword, modifier = Modifier.fillMaxWidth()) {
+                                        Text(tr(if (reconnecting) "accounts.actions.reconnectAccount" else "accounts.actions.addAccount"))
+                                    }
                                 }
                             }
                         }
@@ -460,7 +466,7 @@ internal fun SetupField(
                             }) {
                                 Icon(
                                     Icons.Filled.ContentPaste,
-                                    contentDescription = "Paste",
+                                    contentDescription = tr("common.paste"),
                                     modifier = Modifier.size(20.dp),
                                 )
                             }
@@ -469,7 +475,7 @@ internal fun SetupField(
                             IconButton(onClick = { revealed = !revealed }) {
                                 Icon(
                                     if (revealed) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                    contentDescription = if (revealed) "Hide password" else "Show password",
+                                    contentDescription = tr(if (revealed) "accounts.actions.hidePassword" else "accounts.actions.showPassword"),
                                     modifier = Modifier.size(20.dp),
                                 )
                             }

@@ -1,15 +1,25 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import {
+  chosenThemeIds,
+  deleteCustomTheme,
   EMPTY_PROXY,
   hydrateSettings,
+  hydrateTrayStyle,
+  SETTINGS_DB_KEYS,
   isProxyUsable,
   normalizeSenderAddr,
   sanitizeKanbanBoards,
+  resolveThemeDef,
   sanitizeProxy,
+  selectTheme,
   setRemoteImageSender,
+  setThemeFollowSystem,
   settings$,
+  systemAppearance$,
+  upsertCustomTheme,
   WRITE_SESSION,
 } from './settings'
+import { DEFAULT_DARK_ID, builtinTheme, deriveThemeTokens, defaultCustomInput, type CustomTheme } from '../lib/themes'
 
 const baseBoard = {
   id: 'kb-1',
@@ -20,6 +30,19 @@ const baseBoard = {
 describe('sanitizeKanbanBoards', () => {
   it('keeps boards without customization fields untouched', () => {
     expect(sanitizeKanbanBoards([baseBoard])).toEqual([baseBoard])
+  })
+
+  it('keeps a saved search column query on one trimmed line', () => {
+    const columns = [
+      { accountId: 'acc-1', folderId: 'inbox', query: '  invoice\n due ' },
+      { accountId: 'acc-1', folderId: 'inbox', query: '   ' },
+      { accountId: 'acc-1', folderId: 'inbox', query: 42 },
+    ]
+    expect(sanitizeKanbanBoards([{ ...baseBoard, columns }])?.[0].columns).toEqual([
+      { accountId: 'acc-1', folderId: 'inbox', query: 'invoice due' },
+      { accountId: 'acc-1', folderId: 'inbox' },
+      { accountId: 'acc-1', folderId: 'inbox' },
+    ])
   })
 
   it('accepts an app-managed avatar url', () => {
@@ -78,6 +101,21 @@ describe('spellCheck setting', () => {
     settings$.spellCheck.set(false)
     hydrateSettings({ spell_check: 'true' })
     expect(settings$.spellCheck.get()).toBe(false)
+  })
+})
+
+describe('quoteReplies setting', () => {
+  afterEach(() => {
+    settings$.quoteReplies.set(false)
+  })
+
+  it('defaults reply quoting off', () => {
+    expect(settings$.quoteReplies.get()).toBe(false)
+  })
+
+  it('hydrates a persisted reply quoting preference', () => {
+    hydrateSettings({ quote_replies: true })
+    expect(settings$.quoteReplies.get()).toBe(true)
   })
 })
 
@@ -210,6 +248,187 @@ describe('settings persistence', () => {
     } finally {
       ;(window as any).go = wails
       settings$.remoteImageSenders.set([])
+    }
+  })
+})
+
+describe('theme following the system', () => {
+  afterEach(() => {
+    settings$.themeFollowSystem.set(false)
+    settings$.themeId.set('light')
+    settings$.lightThemeId.set('light')
+    settings$.darkThemeId.set(DEFAULT_DARK_ID)
+    settings$.customThemes.set([])
+    systemAppearance$.set('light')
+  })
+
+  it('paints the pick for the system appearance', () => {
+    settings$.themeFollowSystem.set(true)
+    settings$.lightThemeId.set('mist')
+    settings$.darkThemeId.set('forest')
+
+    systemAppearance$.set('light')
+    expect(resolveThemeDef().id).toBe('mist')
+    systemAppearance$.set('dark')
+    expect(resolveThemeDef().id).toBe('forest')
+    expect(document.documentElement.classList.contains('dark')).toBe(true)
+    expect(chosenThemeIds()).toEqual(['mist', 'forest'])
+  })
+
+  it('files a picked theme under its own appearance', () => {
+    settings$.themeFollowSystem.set(true)
+    selectTheme(builtinTheme('graphite')!)
+    selectTheme(builtinTheme('paper')!)
+    expect(settings$.darkThemeId.get()).toBe('graphite')
+    expect(settings$.lightThemeId.get()).toBe('paper')
+    expect(settings$.themeId.get()).toBe('light')
+  })
+
+  it('keeps the painted theme when toggled either way', () => {
+    settings$.themeId.set('plum')
+    systemAppearance$.set('dark')
+    setThemeFollowSystem(true)
+    expect(settings$.darkThemeId.get()).toBe('plum')
+    expect(resolveThemeDef().id).toBe('plum')
+
+    systemAppearance$.set('light')
+    expect(resolveThemeDef().id).toBe('light')
+    setThemeFollowSystem(false)
+    expect(settings$.themeId.get()).toBe('light')
+  })
+
+  it('falls back to the appearance default for a deleted custom pick', () => {
+    const source = defaultCustomInput('dark')
+    const custom: CustomTheme = {
+      id: 'custom-test',
+      name: 'Mine',
+      appearance: 'dark',
+      tokens: deriveThemeTokens(source),
+      source,
+    }
+    settings$.customThemes.set([custom])
+    settings$.themeFollowSystem.set(true)
+    selectTheme(custom)
+    systemAppearance$.set('dark')
+    expect(resolveThemeDef().id).toBe('custom-test')
+
+    deleteCustomTheme('custom-test')
+    expect(settings$.darkThemeId.get()).toBe(DEFAULT_DARK_ID)
+    expect(resolveThemeDef().id).toBe(DEFAULT_DARK_ID)
+  })
+
+  it('drops a custom pick edited to the other appearance from its old slot', () => {
+    const light = defaultCustomInput('light')
+    const custom: CustomTheme = {
+      id: 'custom-flip',
+      name: 'Mine',
+      appearance: 'light',
+      tokens: deriveThemeTokens(light),
+      source: light,
+    }
+    settings$.customThemes.set([custom])
+    settings$.themeFollowSystem.set(true)
+    selectTheme(custom)
+    expect(settings$.lightThemeId.get()).toBe('custom-flip')
+
+    const dark = defaultCustomInput('dark')
+    upsertCustomTheme({ ...custom, appearance: 'dark', tokens: deriveThemeTokens(dark), source: dark })
+    expect(settings$.darkThemeId.get()).toBe('custom-flip')
+
+    systemAppearance$.set('light')
+    expect(resolveThemeDef().id).toBe('light')
+    systemAppearance$.set('dark')
+    expect(resolveThemeDef().id).toBe('custom-flip')
+    expect(chosenThemeIds()).toEqual(['light', 'custom-flip'])
+  })
+
+  it('hydrates the persisted choice', () => {
+    hydrateSettings({ theme_follow_system: true, light_theme_id: 'dawn', dark_theme_id: 'ember' })
+    expect(settings$.themeFollowSystem.get()).toBe(true)
+    expect(settings$.lightThemeId.get()).toBe('dawn')
+    expect(settings$.darkThemeId.get()).toBe('ember')
+
+    hydrateSettings({ theme_follow_system: 'yes', light_theme_id: '', dark_theme_id: 7 })
+    expect(settings$.themeFollowSystem.get()).toBe(true)
+    expect(settings$.lightThemeId.get()).toBe('dawn')
+    expect(settings$.darkThemeId.get()).toBe('ember')
+  })
+})
+
+describe('chat full messages setting', () => {
+  afterEach(() => {
+    settings$.chatFullMessages.set(false)
+  })
+
+  it('scrolls long messages inside the bubble by default', () => {
+    expect(settings$.chatFullMessages.get()).toBe(false)
+  })
+
+  it('hydrates a persisted choice', () => {
+    hydrateSettings({ chat_full_messages: true })
+    expect(settings$.chatFullMessages.get()).toBe(true)
+
+    hydrateSettings({ chat_full_messages: false })
+    expect(settings$.chatFullMessages.get()).toBe(false)
+  })
+
+  it('ignores invalid persisted values', () => {
+    settings$.chatFullMessages.set(true)
+    hydrateSettings({ chat_full_messages: 'false' })
+    expect(settings$.chatFullMessages.get()).toBe(true)
+  })
+})
+
+describe('native monochrome tray icon setting', () => {
+  const initial = settings$.monochromeTrayIcon.get()
+  afterEach(() => hydrateTrayStyle(initial))
+
+  it('hydrates the native choice', () => {
+    hydrateTrayStyle(false)
+    expect(settings$.monochromeTrayIcon.get()).toBe(false)
+    hydrateTrayStyle(true)
+    expect(settings$.monochromeTrayIcon.get()).toBe(true)
+  })
+
+  it('ignores stale core preferences', () => {
+    hydrateTrayStyle(false)
+    hydrateSettings({ monochrome_tray_icon: true })
+    expect(settings$.monochromeTrayIcon.get()).toBe(false)
+    hydrateTrayStyle(true)
+    hydrateSettings({ monochrome_tray_icon: false })
+    expect(settings$.monochromeTrayIcon.get()).toBe(true)
+    expect(SETTINGS_DB_KEYS).not.toContain('monochrome_tray_icon')
+  })
+
+  it('does not write during hydration and sends user changes only to native storage', async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const wails = (window as any).go
+    const calls: { command: string; payload: any }[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: (command: string, payload: unknown) => {
+            calls.push({ command, payload })
+            return Promise.resolve()
+          },
+        },
+      },
+    }
+    try {
+      hydrateTrayStyle(true)
+      hydrateSettings({ monochrome_tray_icon: false })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(calls.filter((call) => call.command === 'tray.setStyle')).toEqual([])
+      settings$.monochromeTrayIcon.set(false)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      settings$.monochromeTrayIcon.set(true)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(calls.filter((call) => call.command === 'tray.setStyle').at(-1)?.payload).toEqual({ monochrome: true })
+      expect(calls.some((call) => call.command === 'app.prefsSet' && call.payload.key === 'monochrome_tray_icon')).toBe(
+        false,
+      )
+    } finally {
+      ;(window as any).go = wails
     }
   })
 })

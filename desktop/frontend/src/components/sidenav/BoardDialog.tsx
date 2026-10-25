@@ -1,6 +1,6 @@
 import { X } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from '../dialog/Dialog'
 import { createKanbanBoard } from '../../states/kanban'
 import { Button } from '../button/Button'
 import { IconButton } from '../button/IconButton'
@@ -20,16 +20,14 @@ export function BoardDialog({
   onClose: () => void
 }) {
   const { t } = useTranslation()
-  useEscapeKey(onClose)
   return (
-    <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 p-4"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose()
-      }}
+    <Dialog
+      onClose={onClose}
+      aria-label={t('kanban.actions.addBoard')}
+      backdropClassName="z-[100] dark:bg-black/40 backdrop-blur-none"
+      className="max-w-sm rounded-xl p-4"
     >
       <form
-        className="w-full max-w-sm rounded-xl border border-border bg-chats p-4 shadow-2xl"
         onSubmit={(event) => {
           event.preventDefault()
           const name = state.name.trim()
@@ -62,6 +60,6 @@ export function BoardDialog({
           </Button>
         </div>
       </form>
-    </div>
+    </Dialog>
   )
 }

@@ -15,6 +15,12 @@ import {
 } from '../../states/quickReply'
 import { sendReply } from '../../states/quickReplySend'
 import { showToast, ui$ } from '../../states/ui'
+import {
+  readAttachment,
+  reportUnattachedFiles,
+  settleAttachment,
+  takeWithinAttachmentLimits,
+} from '../../lib/attachFiles'
 import { settings$, isSendKey } from '../../states/settings'
 import type { ComposerAttachment } from '../../types'
 import { pickFiles } from '../../lib/nativeFilePicker'
@@ -51,6 +57,35 @@ function attachmentSnapshot(attachments: readonly ComposerAttachment[]): Compose
   return attachments.map((attachment) => ({ ...attachment }))
 }
 
+/** Adds files to the chat reply as attachments: from the file picker, a pasted
+ *  image, or files dropped onto the conversation (MessagePane). Reading a file
+ *  takes a moment; one read after the reader moved to another conversation is
+ *  left out, not attached to that conversation's reply. So is what goes over
+ *  the size limits. The reader is told. */
+export function addQuickReplyAttachments(files: ArrayLike<File>) {
+  const thread = ui$.selectedThread.peek()
+  logComposerPaste(
+    'adding attachments',
+    Array.from(files).map((file) => ({
+      name: file.name,
+      type: file.type,
+      size: file.size,
+    })),
+  )
+  const attached = compose$.composerAttachments.peek().reduce((bytes, attachment) => bytes + attachment.size, 0)
+  const key = `reply:${thread}`
+  const taken = takeWithinAttachmentLimits(key, Array.from(files), attached)
+  if (taken.length < files.length) reportUnattachedFiles()
+  for (const file of taken) {
+    readAttachment(file)
+      .then(({ attachment }) => {
+        if (ui$.selectedThread.peek() !== thread) return reportUnattachedFiles()
+        compose$.composerAttachments.push(attachment)
+      }, reportUnattachedFiles)
+      .finally(() => settleAttachment(key, file))
+  }
+}
+
 // State and behaviour for the quick-reply box: per-thread draft hydration and
 // autosave, attachment handling (file picker + sync/async/native paste), the
 // auto-growing textarea, the reply-focus shortcut and send. The component renders
@@ -61,6 +96,9 @@ export function useQuickReply() {
   const composerAttachments = useValue(compose$.composerAttachments)
   const sendShortcut = useValue(settings$.sendShortcut)
   const selectedThreadId = useValue(ui$.selectedThread)
+  // The box's text scales with both text size settings; its height follows.
+  const fontScale = useValue(settings$.fontScale)
+  const messageFontScale = useValue(settings$.messageFontScale)
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const replyFocus = useValue(ui$.replyFocus)
@@ -85,7 +123,7 @@ export function useQuickReply() {
     if (!textarea) return
     textarea.style.height = 'auto'
     textarea.style.height = `${Math.min(textarea.scrollHeight, QUICK_REPLY_MAX_HEIGHT_PX)}px`
-  }, [composer])
+  }, [composer, fontScale, messageFontScale])
 
   // Focus the box when the "r" shortcut fires (ignore the initial 0 value).
   // The caret goes to the end of the user's own text, not the end of the box —
@@ -164,34 +202,7 @@ export function useQuickReply() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [composerAttachments])
 
-  const addAttachmentFiles = (files: ArrayLike<File>) => {
-    logComposerPaste(
-      'adding attachments',
-      Array.from(files).map((file) => ({
-        name: file.name,
-        type: file.type,
-        size: file.size,
-      })),
-    )
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]
-      const reader = new FileReader()
-      reader.onload = () => {
-        const result = reader.result as string
-        const base64Data = result.split(',')[1]
-        const ext = file.type.startsWith('image/') ? file.type.slice(6) : ''
-        const filename = file.name || (ext ? `pasted-image-${Date.now()}.${ext}` : `pasted-${Date.now()}`)
-        compose$.composerAttachments.push({
-          id: `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
-          filename,
-          mime: file.type || 'application/octet-stream',
-          size: file.size,
-          data: base64Data,
-        })
-      }
-      reader.readAsDataURL(file)
-    }
-  }
+  const addAttachmentFiles = addQuickReplyAttachments
 
   const pickAttachmentFiles = async () => {
     try {

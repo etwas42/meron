@@ -118,8 +118,9 @@ pub fn reply_all_adds_recipients(target: &ReplyTarget, ours: &HashSet<String>) -
 }
 
 /// Both reply forms of one message, as the frontends receive them: `to`/`cc`
-/// for a plain reply, `all_to`/`all_cc` for reply-all, and whether reply-all is
-/// worth offering at all.
+/// for a plain reply, `all_to`/`all_cc` for reply-all, whether reply-all is
+/// worth offering at all, and whether the message takes replies at all (see
+/// [`accepts_replies`]).
 pub fn reply_json(target: &ReplyTarget, ours: &HashSet<String>) -> Value {
     let reply = reply_recipients(target, ours, false);
     let all = reply_recipients(target, ours, true);
@@ -129,7 +130,35 @@ pub fn reply_json(target: &ReplyTarget, ours: &HashSet<String>) -> Value {
         "all_to": all.to,
         "all_cc": all.cc,
         "all_adds_recipients": adds_recipients(&reply, &all),
+        "accepts_replies": accepts_replies(&reply),
     })
+}
+
+/// Whether a plain reply reaches anyone who reads it. False when every address
+/// it goes to or copies is a no-reply mailbox (GitHub's push notifications set Reply-To
+/// noreply@github.com, while the thread's other notifications reply to the
+/// pull request) or a bounce sender. Quick replies answer the newest message
+/// that accepts replies, rather than one whose reply would bounce.
+pub fn accepts_replies(reply: &ReplyRecipients) -> bool {
+    let addresses: Vec<String> = addresses_of(reply).collect();
+    addresses.is_empty() || addresses.iter().any(|addr| !unattended_address(addr))
+}
+
+/// A mailbox nobody reads replies to: no-reply senders (`noreply`, `no-reply`,
+/// `do_not_reply`, `accounts-noreply`, ...) and the senders of delivery reports.
+fn unattended_address(addr: &str) -> bool {
+    let local = addr.rsplit_once('@').map_or(addr, |(local, _)| local);
+    // Plus-addressing tags a mailbox without changing whose it is.
+    let local = local.split('+').next().unwrap_or(local);
+    let normalized: String = local
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | '.'))
+        .collect::<String>()
+        .to_lowercase();
+    normalized.contains("noreply")
+        || normalized.contains("donotreply")
+        || normalized == "mailerdaemon"
+        || normalized == "postmaster"
 }
 
 fn adds_recipients(reply: &ReplyRecipients, all: &ReplyRecipients) -> bool {
@@ -394,6 +423,59 @@ mod tests {
         );
     }
 
+    fn replying_to(to: &str) -> bool {
+        replying_to_and_copying(to, "")
+    }
+
+    fn replying_to_and_copying(to: &str, cc: &str) -> bool {
+        accepts_replies(&ReplyRecipients {
+            to: to.to_string(),
+            cc: cc.to_string(),
+        })
+    }
+
+    #[test]
+    fn no_reply_and_bounce_senders_do_not_accept_replies() {
+        for unattended in [
+            "nonbili/meron <noreply@github.com>",
+            "no-reply@example.com",
+            "Do_Not_Reply@example.com",
+            "donotreply+abc@example.com",
+            "accounts-noreply@google.com",
+            "MAILER-DAEMON@mx.example.com",
+            "postmaster@microsoft.com",
+        ] {
+            assert!(!replying_to(unattended), "{unattended}");
+        }
+        for attended in [
+            "nonbili/meron <reply+AAIIKG@reply.github.com>",
+            "ann@example.com",
+            "noreply@github.com, ann@example.com",
+            "",
+        ] {
+            assert!(replying_to(attended), "{attended}");
+        }
+        // A plain reply keeps the Cc, so a copied person still reads it.
+        assert!(replying_to_and_copying(
+            "noreply@example.com",
+            "Alice <alice@example.com>"
+        ));
+        assert!(!replying_to_and_copying(
+            "noreply@example.com",
+            "postmaster@example.com"
+        ));
+        // The same through the core's own recipients: a no-reply sender who
+        // copied Alice.
+        let target = ReplyTarget {
+            from_name: "Bot",
+            from_addr: "noreply@example.com",
+            reply_to: "",
+            to: "me@example.com",
+            cc: "alice@example.com",
+        };
+        assert_eq!(reply_json(&target, &ours())["accepts_replies"], true);
+    }
+
     #[test]
     fn the_bridge_field_carries_both_reply_forms() {
         let value = reply_json(&incoming(), &ours());
@@ -405,5 +487,6 @@ mod tests {
             "Alice <alice@example.com>, bob@example.com"
         );
         assert_eq!(value["all_adds_recipients"], true);
+        assert_eq!(value["accepts_replies"], true);
     }
 }

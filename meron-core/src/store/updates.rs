@@ -312,6 +312,29 @@ pub fn delete_quick_reply_drafts_in_thread(
     )?)
 }
 
+/// The lowercased Message-ID of each message in `uids` the cache holds, `""`
+/// for one without, `None` for one it doesn't. Read before a move drops the
+/// rows; see `engine::moved_message_ids`.
+pub fn cached_message_ids(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+) -> Result<Vec<Option<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT lower(COALESCE(json_extract(json, '$.message_id'), '')) FROM messages
+         WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+    )?;
+    let mut ids = Vec::with_capacity(uids.len());
+    for uid in uids {
+        let id: Option<String> = stmt
+            .query_row(params![account, folder, *uid], |row| row.get(0))
+            .optional()?;
+        ids.push(id.map(|id| id.trim().to_string()));
+    }
+    Ok(ids)
+}
+
 pub fn delete_messages_by_uid(
     conn: &Connection,
     account: &str,
@@ -325,6 +348,9 @@ pub fn delete_messages_by_uid(
             params![account, folder, *uid],
         )?;
     }
+    // Even when the row was already gone: a sync that fetched it first can
+    // still be holding the header and would insert it again.
+    remember_removed_uids(conn, account, folder, uids)?;
     Ok(deleted)
 }
 
@@ -333,6 +359,10 @@ pub fn delete_messages_by_uid(
 pub fn delete_folder_messages(conn: &Connection, account: &str, folder: &str) -> Result<usize> {
     let deleted = conn.execute(
         "DELETE FROM messages WHERE account = ?1 AND folder = ?2",
+        params![account, folder],
+    )?;
+    conn.execute(
+        "DELETE FROM uncached_unseen WHERE account = ?1 AND folder = ?2",
         params![account, folder],
     )?;
     Ok(deleted)
@@ -375,11 +405,13 @@ pub fn move_messages_by_uid(
     Ok(moved)
 }
 
-/// UIDs of every unseen message in a folder. Used by "mark all as read" to set
-/// `\Seen` on the server for exactly the messages currently flagged unread.
+/// UIDs of every unseen message in a folder, cached or not. Used by "mark all
+/// as read" to set `\Seen` on the server for exactly the messages counted unread.
 pub fn get_unseen_uids(conn: &Connection, account: &str, folder: &str) -> Result<Vec<u32>> {
     let mut stmt = conn.prepare(
-        "SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND seen = 0 AND uid <> 0",
+        "SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND seen = 0 AND uid <> 0
+         UNION
+         SELECT uid FROM uncached_unseen WHERE account = ?1 AND folder = ?2",
     )?;
     let rows = stmt.query_map(params![account, folder], |row| row.get::<_, u32>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -391,5 +423,11 @@ pub fn mark_folder_seen(conn: &Connection, account: &str, folder: &str, seen: bo
         "UPDATE messages SET seen = ?3 WHERE account = ?1 AND folder = ?2",
         params![account, folder, seen as i64],
     )?;
+    if seen {
+        conn.execute(
+            "DELETE FROM uncached_unseen WHERE account = ?1 AND folder = ?2",
+            params![account, folder],
+        )?;
+    }
     Ok(())
 }

@@ -5,16 +5,13 @@ import { useTranslation } from '../../lib/i18n'
 import { useEscapeKey } from '../../lib/useEscapeKey'
 import { copyAttachmentImage, downloadAttachment } from '../../states/mail'
 import { MenuItem } from '../menu/MenuItem'
+import { mediaKeyFromSrc } from './messageHelpers'
 import { VideoAttachment } from './VideoAttachment'
 
 // The native WebKitGTK image context menu ("Save Image As", "Open Image in New
 // Window") is dead inside the Wails webview — there's no browser download or
-// navigation backing it. Derive the media key from a `/media/<key>` src so we
-// can save through the bridge instead.
-function mediaKeyFromSrc(src: string): string | null {
-  const prefix = '/media/'
-  return src.startsWith(prefix) ? decodeURIComponent(src.slice(prefix.length)) : null
-}
+// navigation backing it. The media key behind a cached picture's src (see
+// mediaKeyFromSrc) lets us save through the bridge instead.
 
 const MIN_SCALE = 1
 const MAX_SCALE = 8
@@ -26,6 +23,7 @@ export type GalleryItem = {
   type?: 'image' | 'video'
   src: string
   filename: string
+  mime?: string
   // External/source URL for videos, used by the system-player fallback.
   url?: string
   // The text of the message the media came from, shown as a one-line caption.
@@ -168,7 +166,7 @@ export function Gallery({ items, index, onIndexChange, onClose }: GalleryProps) 
     setMenu(null)
     const key = mediaKeyFromSrc(current.src)
     if (!key) return
-    void downloadAttachment({ key, filename: current.filename })
+    void downloadAttachment({ key, filename: current.filename, mime: current.mime })
   }
   const copyCurrent = () => {
     setMenu(null)
@@ -183,22 +181,40 @@ export function Gallery({ items, index, onIndexChange, onClose }: GalleryProps) 
   // would otherwise mis-position the overlay and clip its controls.
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex flex-col bg-black/90 backdrop-blur-sm animate-fade-in select-none"
+      className="fixed inset-0 z-50 flex flex-col bg-black/90 backdrop-blur-sm select-none"
       onClick={onClose}
+      // React bubbles a portal's events to the component that rendered it: a
+      // right-click here must not also open the message's menu behind.
+      onContextMenu={(event) => event.stopPropagation()}
     >
-      {/* Top bar: counter + close */}
+      {/* Top bar: counter + save + close */}
       <div className="flex shrink-0 items-center justify-between px-4 py-3 text-white/90">
         <span className="text-xs font-semibold tabular-nums">{total > 1 ? `${index + 1} / ${total}` : ''}</span>
-        <button
-          onClick={(event) => {
-            event.stopPropagation()
-            onClose()
-          }}
-          className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15 cursor-pointer transition-colors"
-          title={t('chat.closeEsc')}
-        >
-          <X size={20} />
-        </button>
+        <div className="flex items-center gap-1">
+          {canSave && (
+            <button
+              onClick={(event) => {
+                event.stopPropagation()
+                saveCurrent()
+              }}
+              className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15 cursor-pointer transition-colors"
+              title={t('chat.saveFile', { filename: current.filename, mime: current.mime })}
+              aria-label={t('chat.saveFile', { filename: current.filename, mime: current.mime })}
+            >
+              <Download size={18} />
+            </button>
+          )}
+          <button
+            onClick={(event) => {
+              event.stopPropagation()
+              onClose()
+            }}
+            className="flex h-9 w-9 items-center justify-center rounded-full hover:bg-white/15 cursor-pointer transition-colors"
+            title={t('chat.closeEsc')}
+          >
+            <X size={20} />
+          </button>
+        </div>
       </div>
 
       {/* Image stage */}
@@ -290,8 +306,8 @@ export function Gallery({ items, index, onIndexChange, onClose }: GalleryProps) 
               setMenu(null)
             }}
           />
-          <div
-            className="fixed z-[61] min-w-[160px] rounded-xl border border-border bg-header p-1 shadow-xl"
+          <MenuSurface
+            className="fixed z-[61] min-w-[160px] bg-header shadow-xl"
             style={{ top: menu.y, left: menu.x }}
             onClick={(event) => event.stopPropagation()}
           >
@@ -305,7 +321,7 @@ export function Gallery({ items, index, onIndexChange, onClose }: GalleryProps) 
               label={t('chat.actions.copyImage')}
               onClick={copyCurrent}
             />
-          </div>
+          </MenuSurface>
         </>
       )}
 
@@ -322,3 +338,4 @@ export function Gallery({ items, index, onIndexChange, onClose }: GalleryProps) 
     document.body,
   )
 }
+import { MenuSurface } from '../menu/MenuSurface'

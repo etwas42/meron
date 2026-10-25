@@ -32,6 +32,39 @@ internal fun tr(
     args: Map<String, Any?> = emptyMap(),
 ): String = localizedString(LocalAppLocale.current, key, args)
 
+/**
+ * Catalog lookup outside a composition. `tr` needs `LocalAppLocale`, which the
+ * state functions have no access to, so resolve the tag from prefs the same way
+ * the root composable does.
+ */
+internal fun MeronMobileState.trs(
+    key: String,
+    args: Map<String, Any?> = emptyMap(),
+): String = localizedString(loadAppLanguageTag(prefs).ifBlank { "en" }, key, args)
+
+/**
+ * [trs] for a failure, followed by its reason when [error] has one: "Move
+ * failed: connection reset". The joining punctuation is itself a catalog
+ * string, since languages differ on it.
+ */
+internal fun MeronMobileState.trsError(
+    key: String,
+    error: Throwable?,
+    args: Map<String, Any?> = emptyMap(),
+): String = withReason(trs(key, args), error?.message) { template, fields -> trs(template, fields) }
+
+/** [message], then [reason] if there is one, joined by `common.errorWithReason`. */
+internal fun withReason(
+    message: String,
+    reason: String?,
+    lookup: (String, Map<String, Any?>) -> String,
+): String =
+    if (reason.isNullOrBlank()) {
+        message
+    } else {
+        lookup("common.errorWithReason", mapOf("message" to message, "error" to reason))
+    }
+
 /** Composable lookup for catalog strings that use positional `%1$s` / `%1$d`
  *  placeholders (the simple/non-ICU arg'd messages). */
 @Composable
@@ -125,6 +158,6 @@ private fun replacePlaceholders(
     value: String,
     args: Map<String, Any?>,
 ): String =
-    Regex("""\{([A-Za-z][A-Za-z0-9_]*)\}""").replace(value) { match ->
+    Regex("""\{([A-Za-z][A-Za-z0-9_]*)(?:\s*,\s*number)?\}""").replace(value) { match ->
         args[match.groupValues[1]]?.toString().orEmpty()
     }

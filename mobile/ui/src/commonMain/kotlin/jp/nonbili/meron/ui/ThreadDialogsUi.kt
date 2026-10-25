@@ -30,53 +30,12 @@ import jp.nonbili.meron.shared.ThreadSummary
 internal fun MoveThreadDialog(
     thread: ThreadSummary,
     folders: List<FolderSummary>,
+    accounts: List<AccountSummary> = emptyList(),
     onMove: (FolderSummary) -> Unit,
     onCreateAndMove: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val unusedCreateAndMove = onCreateAndMove
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(tr("threads.moveConversation")) },
-        text = {
-            val listState = rememberLazyListState()
-            LazyColumn(
-                Modifier.heightIn(max = 420.dp).appScrollbar(listState),
-                state = listState,
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                item {
-                    Text(
-                        thread.subject.ifBlank { tr("threads.noSubject") },
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                if (folders.isEmpty()) {
-                    item {
-                        Text(
-                            tr("folders.noOtherAvailable"),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(vertical = 12.dp),
-                        )
-                    }
-                } else {
-                    items(folders, key = { "${it.accountId}\n${it.name}" }) { folder ->
-                        FolderDestinationAction(folder) {
-                            onMove(folder)
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text(tr("buttons.cancel")) }
-        },
-    )
-    unusedCreateAndMove
+    ThreadDestinationDialog(thread, folders, accounts, "threads.moveConversation", "folders.noOtherAvailable", onMove, onDismiss)
 }
 
 @Composable
@@ -84,6 +43,19 @@ internal fun CopyThreadDialog(
     thread: ThreadSummary,
     folders: List<FolderSummary>,
     accounts: List<AccountSummary> = emptyList(),
+    onCopy: (FolderSummary) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ThreadDestinationDialog(thread, folders, accounts, "threads.copyConversation", "folders.noCopyTargets", onCopy, onDismiss)
+}
+
+@Composable
+private fun ThreadDestinationDialog(
+    thread: ThreadSummary,
+    folders: List<FolderSummary>,
+    accounts: List<AccountSummary>,
+    titleKey: String,
+    emptyKey: String,
     onCopy: (FolderSummary) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -105,7 +77,7 @@ internal fun CopyThreadDialog(
         }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(tr("threads.copyConversation")) },
+        title = { Text(tr(titleKey)) },
         text = {
             val listState = rememberLazyListState()
             LazyColumn(
@@ -125,7 +97,7 @@ internal fun CopyThreadDialog(
                 if (copyTargetCount == 0) {
                     item {
                         Text(
-                            tr("folders.noCopyTargets"),
+                            tr(emptyKey),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyMedium,
                             modifier = Modifier.padding(vertical = 12.dp),

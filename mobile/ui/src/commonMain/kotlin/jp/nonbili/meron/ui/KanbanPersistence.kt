@@ -16,6 +16,14 @@ private val kanbanJson = Json { ignoreUnknownKeys = true }
 
 private fun String.orFallback(fallback: String) = ifBlank { fallback }
 
+/**
+ * A board's stored preset, blank for none. Plain is the board's unset state, not
+ * a style of its own: the picker shows it selected when nothing is set, and any
+ * preset makes the board styled, so a stored Plain would leave no way back to
+ * the default board. Desktop's boardWallpaper() makes the same call.
+ */
+internal fun boardWallpaperPresetId(presetId: String): String = presetId.trim().takeUnless { it == "plain" }.orEmpty()
+
 @OptIn(ExperimentalUuidApi::class)
 internal fun parseKanbanBoards(raw: String): List<KanbanBoardSpec> {
     if (raw.isBlank()) return emptyList()
@@ -27,7 +35,7 @@ internal fun parseKanbanBoards(raw: String): List<KanbanBoardSpec> {
             val name = (obj["name"]?.asStringOrEmpty()).orEmpty().orFallback("Kanban board")
             val avatarUrl = obj["avatarUrl"]?.asStringOrEmpty().orEmpty()
             val wallpaper = obj["wallpaper"]?.let { runCatching { it.jsonObject }.getOrNull() }
-            val wallpaperPresetId = wallpaper?.get("presetId")?.asStringOrEmpty().orEmpty()
+            val wallpaperPresetId = boardWallpaperPresetId(wallpaper?.get("presetId")?.asStringOrEmpty().orEmpty())
             val wallpaperUrl = wallpaper?.get("url")?.asStringOrEmpty().orEmpty()
             val columns =
                 (obj["columns"]?.let { runCatching { it.jsonArray }.getOrNull() } ?: JsonArray(emptyList()))
@@ -35,7 +43,8 @@ internal fun parseKanbanBoards(raw: String): List<KanbanBoardSpec> {
                         val colObj = runCatching { col.jsonObject }.getOrNull() ?: return@mapNotNull null
                         val accountId = colObj["accountId"]?.asStringOrEmpty().orEmpty()
                         val folderId = colObj["folderId"]?.asStringOrEmpty().orEmpty()
-                        if (accountId.isNotBlank() && folderId.isNotBlank()) KanbanColumnSpec(accountId, folderId) else null
+                        val query = normalizeKanbanColumnQuery(colObj["query"]?.asStringOrEmpty().orEmpty())
+                        if (accountId.isNotBlank() && folderId.isNotBlank()) KanbanColumnSpec(accountId, folderId, query) else null
                     }.distinctBy(::kanbanColumnKey)
             KanbanBoardSpec(id, name, columns, avatarUrl, wallpaperPresetId, wallpaperUrl)
         }
@@ -57,6 +66,7 @@ internal fun serializeKanbanBoards(boards: List<KanbanBoardSpec>): String =
                             addJsonObject {
                                 put("accountId", column.accountId)
                                 put("folderId", column.folderId)
+                                if (column.query.isNotBlank()) put("query", column.query)
                             }
                         }
                     },
@@ -100,7 +110,9 @@ internal fun ensureKanbanDefaults(
     // deleted every one of them; only a profile that never stored any gets the
     // starter board, otherwise deleting the last board would undo itself.
     if (prefs.getString(KANBAN_BOARDS_PREF, "").isNotBlank()) return boards
-    val next = listOf(defaultKanbanBoard(accounts))
+    // The starter board is stored, so it is named in the app's language once.
+    val name = localizedString(loadAppLanguageTag(prefs).ifBlank { "en" }, "kanban.board.defaultName")
+    val next = listOf(defaultKanbanBoard(accounts, name))
     saveKanbanBoards(prefs, next)
     return next
 }
@@ -135,6 +147,13 @@ internal fun saveKanbanFilter(
         FilterMode.Starred -> "starred"
     },
 )
+
+internal fun loadKanbanAttachmentsOnly(prefs: AppPreferences): Boolean = prefs.getBoolean(KANBAN_ATTACHMENTS_PREF, false)
+
+internal fun saveKanbanAttachmentsOnly(
+    prefs: AppPreferences,
+    on: Boolean,
+) = prefs.putBoolean(KANBAN_ATTACHMENTS_PREF, on)
 
 internal fun loadKanbanSearch(prefs: AppPreferences): String = prefs.getString(KANBAN_SEARCH_PREF, "")
 

@@ -125,7 +125,7 @@ internal fun rememberPrintMessage(
     val cc = tr("composer.fields.cc")
     val bcc = tr("composer.fields.bcc")
     val replyTo = tr("chat.replyTo")
-    val attachments = tr("chat.printAttachments")
+    val attachments = tr("chat.attachments")
     val noSubject = tr("threads.noSubject")
     return { message ->
         print(message.subject.ifBlank { noSubject }, mailPrintHtml(message, from, to, cc, bcc, replyTo, attachments, noSubject, preferHtml && supportsHtmlMailPrinting, allowRemote))
@@ -157,7 +157,7 @@ internal fun rememberPrintThread(preferHtml: Boolean): (String, List<MessageBody
     val cc = tr("composer.fields.cc")
     val bcc = tr("composer.fields.bcc")
     val replyTo = tr("chat.replyTo")
-    val attachments = tr("chat.printAttachments")
+    val attachments = tr("chat.attachments")
     val noSubject = tr("threads.noSubject")
     return { subject, messages ->
         print(

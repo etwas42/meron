@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -20,13 +21,39 @@ type App struct {
 	sidecar       *Sidecar
 	logger        *log.Logger
 	logFile       *os.File
-	trayMu        sync.Mutex
-	trayHasUnread bool
+	tray          trayRenderer
+	trayInit      sync.Once
+	trayStylePath string
+	trayStyleMu   sync.Mutex
 	trayStop      func()
 	trayStopOnce  sync.Once
-	filePickerMu  sync.Mutex
-	lastFileDir   string
-	lastImageDir  string
+	// closeToTray is pushed by the frontend. Tray style is restored from
+	// native storage before publication.
+	closeToTray     atomic.Bool
+	quitting        atomic.Bool
+	closing         atomic.Bool
+	windowHidden    atomic.Bool
+	windowReadyOnce sync.Once
+
+	windowMu        sync.Mutex
+	window          windowState
+	windowSaved     windowState
+	windowSaveTimer *time.Timer
+	windowStatePath string
+
+	// At most one bulk .eml export runs at a time; emlExportCancel is non-nil
+	// for as long as it does.
+	emlExportMu     sync.Mutex
+	emlExportCancel context.CancelFunc
+
+	filePickerMu sync.Mutex
+	lastFileDir  string
+	lastImageDir string
+
+	// The paths of the latest native file drop (Linux), see filedrop.go.
+	fileDropMu   sync.Mutex
+	droppedPaths []string
+	droppedAt    time.Time
 
 	oauthMu          sync.Mutex
 	oauthState       string
@@ -76,11 +103,19 @@ func NewApp() *App {
 	loadDotEnvLocal()
 	logger, logFile := openAppLog()
 	captureCrashes(logFile)
-	return &App{logger: logger, logFile: logFile}
+	app := &App{logger: logger, logFile: logFile, windowStatePath: windowStatePath()}
+	app.window = loadWindowState(app.windowStatePath)
+	app.windowSaved = app.window
+	app.closeToTray.Store(true)
+	app.trayStylePath = filepath.Join(appConfigDir(), "tray.json")
+	app.tray.desired.monochrome = loadTrayStyle(app.trayStylePath)
+	return app
 }
 
 func (a *App) Startup(ctx context.Context) {
 	a.ctx = ctx
+	a.armStartupWindowFallback(startupWindowRevealDelay)
+	a.quitOnSignal()
 	a.queueStartupMailtoURLs(os.Args[1:])
 	if wailsRuntime.Environment(ctx).BuildType != "dev" {
 		installDesktopEntry()
@@ -103,6 +138,8 @@ func (a *App) Startup(ctx context.Context) {
 	a.startMCP()
 	a.setupNotificationListener()
 	a.setupResumeListener()
+	a.setupFileDrop(ctx)
+	a.setupAppearanceListener()
 }
 
 // onSystemResumed tells the sidecar the host woke from suspend so its IDLE
@@ -118,8 +155,16 @@ func (a *App) onSystemResumed() {
 	}
 }
 
+// HandleSecondInstanceLaunch brings the running window forward when Meron is
+// launched again, so a window closed to the tray is found again from the app
+// launcher instead of the launch appearing to do nothing.
 func (a *App) HandleSecondInstanceLaunch(args []string) {
-	for _, raw := range mailtoURLs(args) {
+	urls := mailtoURLs(args)
+	if len(urls) == 0 {
+		a.showMainWindow()
+		return
+	}
+	for _, raw := range urls {
 		a.openMailtoURL(raw)
 	}
 }
@@ -135,15 +180,23 @@ func (a *App) Shutdown(ctx context.Context) {
 	}
 	a.closeNotificationListener()
 	a.closeResumeListener()
+	a.closeAppearanceListener()
 	if a.logFile != nil {
 		_ = a.logFile.Close()
 	}
 }
 
+// quietCommands succeed without a log line: they arrive at frame rate and
+// would drown out everything else in the log.
+var quietCommands = map[string]bool{"window.resized": true}
+
 func (a *App) Invoke(command string, payload map[string]any) (result any, err error) {
 	start := time.Now()
 	defer a.recoverInvoke(command, &err)
 	result, err = a.invoke(command, payload)
+	if err == nil && quietCommands[command] {
+		return result, nil
+	}
 	if err != nil {
 		a.logf("invoke %s failed after %s: %v", command, time.Since(start).Round(time.Millisecond), err)
 	} else {
@@ -161,12 +214,16 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.mcpSettings(command, payload)
 	case "system.check":
 		return a.systemCheck()
+	case "system.appearance":
+		return a.systemAppearance()
 	case "system.pickImageFile":
 		return a.pickImageFile(payload)
 	case "system.pickFiles":
 		return a.pickFiles(payload, false, true)
 	case "system.pickImageFiles":
 		return a.pickFiles(payload, true, true)
+	case "system.readDroppedFiles":
+		return a.readDroppedFilesCommand(payload)
 	case "mailto.consumePending":
 		return a.consumePendingMailto(), nil
 	case "app.prefsGet":
@@ -175,12 +232,34 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.appPrefsSet(payload)
 	case "tray.setUnread":
 		return a.traySetUnread(payload)
+	case "tray.getStyle":
+		return a.trayGetStyle(), nil
+	case "tray.setStyle":
+		return a.traySetStyle(payload)
+	case "window.resized":
+		return a.windowResized()
+	case "window.ready":
+		a.revealWindow(false)
+		return map[string]any{"ok": true}, nil
+	case "window.chrome":
+		return a.windowChrome()
+	case "window.setTitlebar":
+		return a.windowSetTitlebar(payload)
+	case "window.minimise", "window.toggleMaximise", "window.close":
+		return a.windowControl(command)
+	case "window.setCloseToTray":
+		return a.windowSetCloseToTray(payload)
+	case "app.quit":
+		a.requestQuit()
+		return map[string]any{"ok": true}, nil
 	case "window.setAppearance":
 		return a.setWindowAppearance(payload)
 	case "i18n.setNativeLabels":
 		return a.setNativeLabels(payload)
 	case "changelog.fetch":
 		return a.changelogFetch()
+	case "search.parse", "search.build":
+		return a.searchQuery(command, payload)
 	case "update.status":
 		return a.updateStatus()
 	case "update.check":
@@ -223,6 +302,15 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.exportOpml(payload)
 	case "rss.importOpml":
 		return a.importOpml(payload)
+	case "tasks.lists", "tasks.listCreate", "tasks.listRename", "tasks.listDelete",
+		"tasks.listReorder", "tasks.items", "tasks.create", "tasks.update",
+		"tasks.setDone", "tasks.delete", "tasks.reorder", "tasks.clearCompleted",
+		"tasks.restore", "tasks.forThread":
+		return a.tasksInvoke(command, payload)
+	case "invite.respond", "calendar.events", "calendar.get", "calendar.create",
+		"calendar.update", "calendar.delete", "calendar.restore", "invite.removeFromCalendar",
+		"invite.addToCalendar":
+		return a.calendarInvoke(command, payload)
 	case "backup.export":
 		return a.exportBackup(payload)
 	case "backup.import":
@@ -302,6 +390,8 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.emptyFolder(payload)
 	case "mail.folderDelete":
 		return a.folderDelete(payload)
+	case "mail.folderSetNotify":
+		return a.folderSetNotify(payload)
 	case "mail.move":
 		return a.mailMove(payload)
 	case "mail.copy":
@@ -312,9 +402,18 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.openAttachment(payload)
 	case "mail.print":
 		html, _ := payload["html"].(string)
-		return printNativeMail(html)
+		printed, fallback, err := printNativeMail(html)
+		if fallback != "" {
+			a.logf("mail.print: native print declined (%s), using the browser fallback", fallback)
+		}
+		return printed, err
 	case "mail.saveEml":
 		return a.saveMessageEml(payload)
+	case "mail.exportEml":
+		return a.exportEml(payload)
+	case "mail.exportEmlCancel":
+		a.cancelEmlExport()
+		return map[string]any{"ok": true}, nil
 	case "mail.copyImage":
 		return a.copyImage(payload)
 	case "mail.readAttachment":
@@ -325,6 +424,8 @@ func (a *App) invoke(command string, payload map[string]any) (any, error) {
 		return a.writeMediaFile(payload)
 	case "composer.openAttachment":
 		return a.openComposerAttachment(payload)
+	case "avatar.resolve":
+		return a.sidecar.Call("avatar.resolve", payload)
 	case "account.writeAvatarFile":
 		return a.writeAvatarFile(payload)
 	case "account.writeChatWallpaperFile":
@@ -357,8 +458,9 @@ func (a *App) appPrefsSet(payload map[string]any) (any, error) {
 func (a *App) systemCheck() (any, error) {
 	dbPath := filepath.Join(appConfigDir(), "meron.db")
 	return map[string]any{
-		"platform":    runtime.GOOS,
-		"mail_engine": "meron_mail",
+		"platform":        runtime.GOOS,
+		"tray_monochrome": a.trayState().state().monochrome,
+		"mail_engine":     "meron_mail",
 		"meron_mail": map[string]any{
 			"configured":  coreBinaryPath() != "",
 			"available":   fileExists(coreBinaryPath()),

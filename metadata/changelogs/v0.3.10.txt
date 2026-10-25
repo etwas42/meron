@@ -1,0 +1,8 @@
+- Open threads in new tabs on double-click or Ctrl/Cmd+click with tab context menus
+- Add match-system theme following OS appearance and support dark message bodies
+- Share and import custom themes as a color string
+- Remember window size and maximized state, and add close-to-tray setting
+- Reorganize settings into General, Messages, and Composer sections
+- Slide Kanban conversation pane open and closed
+- Auto-fit chat bubbles and add bottom reader actions
+- Remove account avatars and board images from settings headers

@@ -1,0 +1,8 @@
+- Move thread and kanban search into the title bar
+- Keep thread tabs across kanban switches and restyle tab bar
+- Render reader videos and add active conversation tab close button
+- Copy text via native clipboard from message iframes
+- Keep conversation controls above details pane
+- Keep archived threads in place and the open conversation selected
+- Keep thread hover highlight while context menu is open
+- Fix single-instance launch on Linux snap packages

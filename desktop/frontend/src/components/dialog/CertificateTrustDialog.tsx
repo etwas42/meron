@@ -1,5 +1,6 @@
 import { useValue } from '@legendapp/state/react'
-import { useEscapeKey } from '../../lib/useEscapeKey'
+import { Dialog } from './Dialog'
+import { useTranslation } from '../../lib/i18n'
 import { certTrust$, dismissCertificatePrompt, trustPromptedCertificate } from '../../states/certificateTrust'
 import { CertificateTrustPanel } from './CertificateTrustPanel'
 
@@ -8,30 +9,27 @@ import { CertificateTrustPanel } from './CertificateTrustPanel'
 // submission server was refused. Setup-time failures are handled inline by the
 // account dialog instead, where the servers are already on screen.
 export function CertificateTrustDialog() {
+  const { t } = useTranslation()
   const prompt = useValue(certTrust$.prompt)
   const busy = useValue(certTrust$.busy)
-
-  useEscapeKey(() => {
-    if (!busy) dismissCertificatePrompt()
-  }, Boolean(prompt))
 
   if (!prompt) return null
 
   return (
-    <div
-      className="fixed inset-0 z-[120] flex items-center justify-center bg-black/45 p-4"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !busy) dismissCertificatePrompt()
-      }}
+    <Dialog
+      onClose={dismissCertificatePrompt}
+      dismissible={!busy}
+      role="alertdialog"
+      aria-label={t('accounts.certificate.title')}
+      backdropClassName="z-[120] bg-black/45 dark:bg-black/45 backdrop-blur-none"
+      className="max-w-md rounded-xl"
     >
-      <section role="alertdialog" aria-modal="true" className="w-full max-w-md">
-        <CertificateTrustPanel
-          prompt={prompt}
-          busy={busy}
-          onTrust={trustPromptedCertificate}
-          onDismiss={dismissCertificatePrompt}
-        />
-      </section>
-    </div>
+      <CertificateTrustPanel
+        prompt={prompt}
+        busy={busy}
+        onTrust={trustPromptedCertificate}
+        onDismiss={dismissCertificatePrompt}
+      />
+    </Dialog>
   )
 }

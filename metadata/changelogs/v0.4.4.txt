@@ -1,0 +1,10 @@
+- Attach files dropped onto a conversation or the composer
+- Save images and videos from the gallery and inline in a conversation
+- Toggle a conversation between HTML and plain text with H
+- Add Save as .eml to the conversation menu
+- Monochrome tray icon that follows the menu bar
+- Add expand all / collapse all, and thread menu on right-click
+- Float quick reply with single-row controls and shrink pinned header to one row
+- Darken message bodies to the surface they sit on, not black
+- Always scroll the conversation to a reply the reader just sent
+- Name folders by their last path segment in column titles

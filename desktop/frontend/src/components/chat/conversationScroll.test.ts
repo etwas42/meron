@@ -9,7 +9,9 @@ import {
   isUserScroll,
   resolveOpenScroll,
   resolveResizeScrollTop,
+  scrollReleasesPin,
   type ScrollMetrics,
+  visibleBounds,
 } from './conversationScroll'
 
 const CONTAINER_TOP = 100
@@ -63,6 +65,39 @@ describe('isUserScroll', () => {
 
   it("treats a scroll before any positioning as the reader's", () => {
     expect(isUserScroll(40, null)).toBe(true)
+  })
+})
+
+describe('scrollReleasesPin', () => {
+  const settled = { scrollHeight: 4000, clientHeight: VIEWPORT }
+  const release = (over: Partial<Parameters<typeof scrollReleasesPin>[0]> = {}) =>
+    scrollReleasesPin({
+      persistent: true,
+      metrics: metrics(2400, 4000),
+      expectedScrollTop: 1276,
+      settledGeometry: settled,
+      ...over,
+    })
+
+  it('keeps the pin through the scroll event our own positioning fires', () => {
+    expect(release({ metrics: metrics(1276, 4000) })).toBe(false)
+    expect(release({ persistent: false, metrics: metrics(1276, 4000) })).toBe(false)
+  })
+
+  // A native overlay scrollbar drag reaches the container as scroll events
+  // only, so the pointer hit test never sees it.
+  it('drops an expanded message pin when the view moves inside unchanged geometry', () => {
+    expect(release()).toBe(true)
+  })
+
+  it('keeps an expanded message pin when a resize moved the view', () => {
+    expect(release({ metrics: metrics(2400, 4600) })).toBe(false)
+    expect(release({ metrics: { scrollTop: 2400, scrollHeight: 4000, clientHeight: 640 } })).toBe(false)
+    expect(release({ settledGeometry: null })).toBe(false)
+  })
+
+  it('drops a settling pin on any position we did not set', () => {
+    expect(release({ persistent: false, metrics: metrics(2400, 4600) })).toBe(true)
   })
 })
 
@@ -158,6 +193,24 @@ describe('resolveOpenScroll on an already-open thread', () => {
     ).toEqual({ scrollTop: 3600, pin: null })
   })
 
+  it("follows the reader's own send from wherever they had scrolled to", () => {
+    // Replying from the head of a long message: nowhere near the bottom, and
+    // the reply used to land out of sight below it.
+    expect(reopen({ grew: true, ownSend: true, metrics: metrics(200, 3400) })).toEqual({ scrollTop: 3400, pin: null })
+  })
+
+  it("follows the reader's own send over a saved position and unread above it", () => {
+    expect(
+      reopen({
+        ownSend: true,
+        savedScrollTop: 640,
+        hasUnread: true,
+        firstUnreadOffsetTop: 300,
+        metrics: metrics(640, 3400),
+      }),
+    ).toEqual({ scrollTop: 3400, pin: null })
+  })
+
   it('holds the restored position against bodies still settling', () => {
     // The saved position was measured against settled bodies. Restoring it
     // while they are placeholder-sized and then leaving it unpinned is how a
@@ -214,7 +267,7 @@ describe('resolveResizeScrollTop', () => {
   const resize = (over: Partial<Parameters<typeof resolveResizeScrollTop>[0]> = {}) =>
     resolveResizeScrollTop({
       metrics: metrics(0, 4000),
-      previousScrollHeight: 4000,
+      previous: metrics(0, 4000),
       containerOffsetTop: CONTAINER_TOP,
       pinned: null,
       ...over,
@@ -233,27 +286,32 @@ describe('resolveResizeScrollTop', () => {
     expect(
       resize({
         pinned: { offsetTop: 1900, offset: -ANCHOR_GAP_PX },
-        previousScrollHeight: 2000,
+        previous: metrics(2000 - VIEWPORT, 2000),
         metrics: metrics(2000 - VIEWPORT, 6000),
       }),
     ).toBe(1900 - CONTAINER_TOP - ANCHOR_GAP_PX)
   })
 
   it('sticks to the bottom for a reader who was already there', () => {
-    expect(resize({ previousScrollHeight: 4000, metrics: metrics(4000 - VIEWPORT, 5000) })).toBe(5000)
+    expect(resize({ previous: metrics(4000 - VIEWPORT, 4000), metrics: metrics(4000 - VIEWPORT, 5000) })).toBe(5000)
   })
 
   it('does not yank back a reader who scrolled up', () => {
     expect(
-      resize({ previousScrollHeight: 4000, metrics: metrics(4000 - VIEWPORT - BOTTOM_STICK_PX - 1, 5000) }),
+      resize({ previous: metrics(4000 - VIEWPORT - BOTTOM_STICK_PX - 1, 4000), metrics: metrics(3039, 5000) }),
     ).toBeNull()
   })
 
-  it('measures the distance from the bottom before the resize, not after', () => {
-    // Content that grew far below the fold must not count as "the reader is
-    // near the bottom" just because they were before it appeared.
-    expect(resize({ previousScrollHeight: 4000, metrics: metrics(4000 - VIEWPORT, 40000) })).toBe(40000)
-    expect(resize({ previousScrollHeight: 40000, metrics: metrics(4000 - VIEWPORT, 40000) })).toBeNull()
+  it('does not yank back a reader who scrolled up only a little', () => {
+    // A body above the view mounting as the reader scrolls towards it. The
+    // browser's bottom anchoring has already moved the view by the growth.
+    expect(
+      resize({ previous: metrics(4000 - VIEWPORT - 100, 4000), metrics: metrics(4000 - VIEWPORT - 100 + 300, 4300) }),
+    ).toBeNull()
+  })
+
+  it('leaves a reader at the bottom alone when nothing grew', () => {
+    expect(resize({ previous: metrics(4000 - VIEWPORT, 4000), metrics: metrics(4000 - VIEWPORT, 4000) })).toBeNull()
   })
 })
 
@@ -303,5 +361,23 @@ describe('isMessageRead', () => {
 
   it('counts a message exactly filling the viewport', () => {
     expect(isMessageRead({ top: 0, bottom: 800 }, container)).toBe(true)
+  })
+})
+
+describe('visibleBounds', () => {
+  const container = { top: 0, bottom: 800 }
+
+  it('raises the bottom edge by the composer floating over it', () => {
+    expect(visibleBounds(container, 120)).toEqual({ top: 0, bottom: 680 })
+  })
+
+  it('leaves the bounds alone without a composer', () => {
+    expect(visibleBounds(container, 0)).toEqual(container)
+  })
+
+  it('does not count a message hidden behind the composer as read', () => {
+    // Its bottom is inside the container but under the 120px composer.
+    expect(isMessageRead({ top: 600, bottom: 760 }, visibleBounds(container, 120))).toBe(false)
+    expect(isMessageRead({ top: 600, bottom: 760 }, container)).toBe(true)
   })
 })

@@ -11,17 +11,6 @@ import jp.nonbili.meron.shared.ThreadSummary
 import jp.nonbili.meron.shared.folderIsDrafts
 import jp.nonbili.meron.shared.folderIsTrash
 
-// One-line header subtitle. The bubbles already name their sender and the list
-// itself shows how many there are, so only RSS feeds carry a subtitle: the
-// latest item's date.
-internal fun threadHeaderSubtitle(
-    messages: List<MessageBody>,
-    isRss: Boolean,
-): String {
-    if (messages.isEmpty() || !isRss) return ""
-    return formatInboxTimestamp(messages.maxOf { it.dateEpochSeconds })
-}
-
 // How long after open the list keeps re-anchoring to the target message while
 // asynchronously measured bubbles (HTML bodies in WebViews) settle.
 internal const val THREAD_OPEN_ANCHOR_WINDOW_MS = 2_000L
@@ -194,17 +183,18 @@ internal fun listViewedToBottom(
     return last.offset + last.size <= viewportEndOffset + bottomSlackPx
 }
 
-// Apply a partial scroll-driven read locally. Thread summaries carry the
-// authoritative unread-message count, including messages on older pages that
-// are not loaded in the conversation, so derive the remaining thread state
-// from that count rather than only from the currently rendered messages.
-internal fun threadAfterMessagesRead(
+// Move a card's unread count by `delta` messages, keeping `unread` in step.
+// Thread summaries carry the authoritative unread-message count, including
+// messages on older pages that are not loaded in the conversation, so the card
+// moves relative to that count rather than being derived from the rendered
+// messages.
+internal fun threadWithUnreadDelta(
     thread: ThreadSummary,
-    readCount: Int,
+    delta: Int,
 ): ThreadSummary {
-    if (!thread.unread || readCount <= 0) return thread
-    val remaining = (thread.unreadCount.coerceAtLeast(1) - readCount).coerceAtLeast(0)
-    return thread.copy(unread = remaining > 0, unreadCount = remaining)
+    val current = if (thread.unread) thread.unreadCount.coerceAtLeast(1) else 0
+    val next = (current + delta).coerceAtLeast(0)
+    return thread.copy(unread = next > 0, unreadCount = next)
 }
 
 internal fun threadMessageSearchText(message: MessageBody): String =
@@ -219,14 +209,26 @@ internal fun threadMessageSearchText(message: MessageBody): String =
         message.attachments.joinToString(" ") { it.filename },
     ).joinToString(" ").lowercase()
 
-internal fun threadDeleteActionLabel(
+/** The catalog key naming what deleting a thread in [folder] does. */
+internal fun threadDeleteActionKey(
     folder: String,
     folderRole: String = "folder",
 ): String =
     when {
-        folderRole == "drafts" || (folderRole == "folder" && folderIsDrafts(folder)) -> "Discard draft"
-        folderRole == "trash" || (folderRole == "folder" && folderIsTrash(folder)) -> "Delete forever"
-        else -> "Move to Trash"
+        folderRole == "drafts" || (folderRole == "folder" && folderIsDrafts(folder)) -> "threads.actions.discardDraft"
+        folderRole == "trash" || (folderRole == "folder" && folderIsTrash(folder)) -> "threads.actions.deleteForever"
+        else -> "threads.actions.moveToTrash"
+    }
+
+/** The catalog key for having deleted a thread in [folder]; takes a `count`. */
+internal fun threadDeletedStatusKey(
+    folder: String,
+    folderRole: String = "folder",
+): String =
+    when (threadDeleteActionKey(folder, folderRole)) {
+        "threads.actions.discardDraft" -> "mail.toast.draftDiscarded"
+        "threads.actions.deleteForever" -> "mail.toast.deletedCount"
+        else -> "mail.toast.threadMovedToTrash"
     }
 
 internal fun messagePlainText(message: MessageBody): String =

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { openComposeTab } from '../../states/compose'
@@ -8,24 +8,36 @@ import { ui$ } from '../../states/ui'
 import { mail$, getActiveThread, loadThread } from '../../states/mail'
 import { accounts$ } from '../../states/accounts'
 import { settings$ } from '../../states/settings'
-import { resetThreadView, thread$, type ConversationMode } from '../../states/thread'
+import { resetThreadView, thread$ } from '../../states/thread'
 import { Gallery } from './Gallery'
 import { ConversationDetailsPanel } from './ConversationDetailsPanel'
 import { EmptyState } from '../empty-state/EmptyState'
 import { QuickReplyComposer } from './QuickReplyComposer'
+import { addQuickReplyAttachments } from './useQuickReply'
+import { DropOverlay } from './DropOverlay'
+import { useFileDrop } from '../../lib/useFileDrop'
 import { ConversationTabs } from './ConversationTabs'
 import { ReaderTabView } from './ReaderTabView'
 import { ConversationHeader } from './ConversationHeader'
 import { ThreadSearchBarMobile } from './ThreadSearchBarMobile'
 import { ConversationMessageList } from './ConversationMessageList'
-import { MessageContextMenu, type MessageContextMenuState } from './MessageContextMenu'
+import { MessageContextMenu } from './MessageContextMenu'
 import { buildGalleryItems, buildThreadMedia, buildParticipants } from './conversationMedia'
 import { useThreadSearch } from './useThreadSearch'
-import { useConversationScroll } from './useConversationScroll'
+import { FrostedBand } from './FrostedBand'
+import {
+  ConversationScrollContext,
+  ConversationScrollIntentContext,
+  useConversationScroll,
+} from './useConversationScroll'
+import { COMPOSER_OVERLAP_VAR } from './conversationScroll'
 import { ArrowRight } from 'lucide-react'
+import { usePresence } from '../../lib/usePresence'
+import { PANE_ANIMATION_MS } from '../kanban/KanbanConversationPane'
 import { wallpaperCss } from '../../lib/wallpapers'
 import { clearMediaSession } from '../../lib/mediaSession'
 import { openCorrespondentMail } from '../../states/kanban'
+import { isRssAccount } from '../../lib/threadActions'
 import type { Message, MessageTab } from '../../types'
 
 function threadFromTab(tab: MessageTab, fallback: Message | null): Message {
@@ -63,7 +75,6 @@ export function MessagePane() {
   const allowedSenders = useValue(settings$.remoteImageSenders)
   const galleryIndex = useValue(thread$.galleryIndex)
   const mediaOpen = useValue(thread$.mediaOpen)
-  const modeOverrides = useValue(thread$.conversationModeOverrides)
   // Ring-highlight for a message jumped to from the starred list; shares the
   // search-match ring styling in ConversationMessageList.
   const flashMessageId = useValue(thread$.flashMessageId)
@@ -81,10 +92,15 @@ export function MessagePane() {
       ? threadFromTab(activeTabData, listedActiveThread)
       : listedActiveThread
 
+  const detailsOpen = !!activeThread && !activeDocumentTab && mediaOpen
+  // Slides open and shut beside the conversation on a wide window (index.css,
+  // .details-slide), like the board's conversation pane.
+  const detailsPhase = usePresence(detailsOpen, PANE_ANIMATION_MS)
+
   const activeAccount = activeThread
     ? accounts.find((account) => account.id === activeThread.account_id)
     : (accounts.find((account) => account.id === selectedAccountId) ?? null)
-  const isRSS = activeAccount?.provider === 'rss' || activeAccount?.auth_type === 'rss'
+  const isRSS = isRssAccount(activeAccount ?? undefined, activeThread?.account_id ?? selectedAccountId)
   const activeThreadId = activeThread?.thread_id ?? ''
   const conversationWallpaper = wallpaperCss(activeAccount?.chat_wallpaper)
   // Show a spinner instead of the previous thread's messages while a freshly
@@ -110,18 +126,6 @@ export function MessagePane() {
   )
   const unreadKey = displayMessages.map((message) => `${message.id}:${message.unread ? '1' : '0'}`).join('|')
 
-  const accountConversationMode: ConversationMode = (activeAccount?.conversation_html ?? true) ? 'html' : 'plain'
-  const conversationMode: ConversationMode = activeAccount
-    ? (modeOverrides[activeAccount.id] ?? accountConversationMode)
-    : 'plain'
-  const setQuickConversationMode = useCallback(
-    (mode: ConversationMode) => {
-      if (!activeAccount) return
-      thread$.conversationModeOverrides[activeAccount.id].set(mode)
-    },
-    [activeAccount],
-  )
-
   const { galleryItems, galleryOffsets } = useMemo(
     () => buildGalleryItems(displayMessages, accounts, revealedRemote, allowedSenders),
     [displayMessages, accounts, revealedRemote, allowedSenders],
@@ -138,19 +142,54 @@ export function MessagePane() {
   const threadSearchFocus = useValue(thread$.searchFocus)
   const desktopThreadSearchInputRef = useRef<HTMLInputElement | null>(null)
   const mobileThreadSearchInputRef = useRef<HTMLInputElement | null>(null)
-  const { threadSearchOpen, searchMatches, matchCount, activeSearchIndex, activeSearchId, goToSearchMatch } =
-    useThreadSearch(displayMessages)
-  const {
-    scrollRef,
-    bottomAnchorRef,
-    messagesWrapperRef,
-    handleConversationScroll,
-    setScrollTop,
-    scrollMessageToTop,
-    releasePinForUserScroll,
-  } = useConversationScroll(activeThreadId, displayMessages, conversationActiveTab, unreadKey)
+  const { threadSearchOpen, searchMatches, activeSearchId } = useThreadSearch(displayMessages, activeThread?.account_id)
+  const conversationRef = useRef<HTMLDivElement | null>(null)
+  const composerRef = useRef<HTMLDivElement | null>(null)
+  const hasConversation = !!activeThread
+  // The composer floats over the bottom of the message list, so messages scroll
+  // on behind its rounded box instead of ending at a straight edge above it. The
+  // list pads its end by the composer's height (COMPOSER_OVERLAP_VAR) so the
+  // newest message still clears it. Measured ahead of useConversationScroll,
+  // whose layout effects run in order after this one: its first positioning and
+  // read-marking pass on a pane that mounts with its messages already loaded
+  // would otherwise count the ones behind the composer as seen.
+  useLayoutEffect(() => {
+    const host = conversationRef.current
+    const composer = composerRef.current
+    if (!host || !composer) return
+    host.style.setProperty(COMPOSER_OVERLAP_VAR, `${composer.offsetHeight}px`)
+    return () => {
+      host.style.removeProperty(COMPOSER_OVERLAP_VAR)
+    }
+  }, [hasConversation, isRSS])
+  const conversationScroll = useConversationScroll(activeThreadId, displayMessages, conversationActiveTab, unreadKey)
+  const { scrollRef, setScrollTop } = conversationScroll
 
-  const [contextMenu, setContextMenu] = useState<MessageContextMenuState | null>(null)
+  const contextMenu = useValue(thread$.messageContextMenu)
+
+  // Files dropped anywhere on the open conversation go to the reply as
+  // attachments; feeds have no reply box, and a reader tab in front isn't the
+  // conversation. Files that arrive late (Linux) are for the conversation they
+  // were dropped on, not the one open by then. A drag that may be a link
+  // (Linux) must still reach the reply box, so the overlay is only drawn; the
+  // message bodies' frames, which would swallow the drop, then let it through
+  // to the pane.
+  const {
+    dragging: fileDragging,
+    mayBeLink,
+    dropHandlers: { ref: dropRef, ...dropHandlers },
+  } = useFileDrop(addQuickReplyAttachments, {
+    enabled: !!activeThread && !isRSS && !activeDocumentTab,
+    scope: activeThreadId,
+  })
+  // The conversation element is both the drop area and `conversationRef`.
+  const setConversationElement = useCallback(
+    (element: HTMLDivElement | null) => {
+      conversationRef.current = element
+      dropRef(element)
+    },
+    [dropRef],
+  )
 
   const showMessageInConversation = useCallback((messageId: string) => {
     thread$.pendingScrollMessageId.set(messageId)
@@ -161,6 +200,24 @@ export function MessagePane() {
   useEffect(() => {
     resetThreadView()
   }, [activeThreadId])
+
+  // Keeps the overlap in step as the composer grows with a longer reply or an
+  // attachment, and a reader at the bottom parked there. That goes through the
+  // scroll controller like any other positioning of ours, or the scroll it
+  // causes would read as the reader's and drop a settling pin.
+  useLayoutEffect(() => {
+    const host = conversationRef.current
+    const container = scrollRef.current
+    const composer = composerRef.current
+    if (!host || !container || !composer) return
+    const observer = new ResizeObserver(() => {
+      const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight <= 1
+      host.style.setProperty(COMPOSER_OVERLAP_VAR, `${composer.offsetHeight}px`)
+      if (atBottom) setScrollTop(container.scrollHeight)
+    })
+    observer.observe(composer)
+    return () => observer.disconnect()
+  }, [hasConversation, isRSS, scrollRef, setScrollTop])
 
   useLayoutEffect(() => {
     return () => {
@@ -243,17 +300,6 @@ export function MessagePane() {
 
   const conversationContent = activeThread ? (
     <>
-      <ConversationHeader
-        activeThread={activeThread}
-        isRSS={isRSS}
-        conversationMode={conversationMode}
-        setQuickConversationMode={setQuickConversationMode}
-        matchCount={matchCount}
-        activeSearchIndex={activeSearchIndex}
-        goToSearchMatch={goToSearchMatch}
-        desktopSearchInputRef={desktopThreadSearchInputRef}
-      />
-
       {activeThread.original_thread_id && (
         <div className="flex shrink-0 items-center justify-between bg-accent/10 dark:bg-accent/15 px-4 py-2.5 text-xs border-b border-border select-none transition-colors">
           <span className="text-secondary/90 font-medium">{t('chat.branchNotice')}</span>
@@ -267,40 +313,39 @@ export function MessagePane() {
         </div>
       )}
 
-      {threadSearchOpen && (
-        <ThreadSearchBarMobile
-          matchCount={matchCount}
-          activeSearchIndex={activeSearchIndex}
-          goToSearchMatch={goToSearchMatch}
-          inputRef={mobileThreadSearchInputRef}
-        />
+      {threadSearchOpen && <ThreadSearchBarMobile inputRef={mobileThreadSearchInputRef} />}
+
+      <ConversationScrollContext value={conversationScroll}>
+        <ConversationScrollIntentContext value={conversationScroll.releasePinForUserScroll}>
+          <ConversationMessageList
+            messages={displayMessages}
+            showThreadLoading={showThreadLoading}
+            showThreadError={showThreadError}
+            onRetryThreadLoad={retryThreadLoad}
+            messagesCursor={messagesCursor}
+            messagesLoadingMore={messagesLoadingMore}
+            activeThreadId={activeThreadId}
+            searchMatches={searchMatches}
+            activeSearchId={activeSearchId}
+            jumpMessageId={flashMessageId}
+            galleryOffsets={galleryOffsets}
+            wallpaperClassName={conversationWallpaper.className}
+            wallpaperStyle={conversationWallpaper.style}
+          />
+        </ConversationScrollIntentContext>
+      </ConversationScrollContext>
+
+      {!isRSS && (
+        <div ref={composerRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-10">
+          {/* What shows around the box is frosted, from a line the box itself
+              covers: below the footer's pt-1 and the curve of its rounded-2xl
+              corners, with no hard edge beside those corners. */}
+          <FrostedBand fade="top" className="bottom-0 left-0 right-3 top-5" />
+          <div className="relative">
+            <QuickReplyComposer />
+          </div>
+        </div>
       )}
-
-      <ConversationMessageList
-        messages={displayMessages}
-        showThreadLoading={showThreadLoading}
-        showThreadError={showThreadError}
-        onRetryThreadLoad={retryThreadLoad}
-        messagesCursor={messagesCursor}
-        messagesLoadingMore={messagesLoadingMore}
-        activeThreadId={activeThreadId}
-        searchMatches={searchMatches}
-        activeSearchId={activeSearchId}
-        jumpMessageId={flashMessageId}
-        galleryOffsets={galleryOffsets}
-        scrollRef={scrollRef}
-        messagesWrapperRef={messagesWrapperRef}
-        bottomAnchorRef={bottomAnchorRef}
-        wallpaperClassName={conversationWallpaper.className}
-        wallpaperStyle={conversationWallpaper.style}
-        onScroll={handleConversationScroll}
-        onSetScrollTop={setScrollTop}
-        onScrollMessageToTop={scrollMessageToTop}
-        onUserScrollIntent={releasePinForUserScroll}
-        onOpenContextMenu={setContextMenu}
-      />
-
-      {!isRSS && <QuickReplyComposer />}
     </>
   ) : (
     <div
@@ -318,15 +363,21 @@ export function MessagePane() {
       }`}
     >
       <ConversationTabs />
+      {activeThread && !activeDocumentTab && (
+        <ConversationHeader activeThread={activeThread} desktopSearchInputRef={desktopThreadSearchInputRef} />
+      )}
       <div className="relative flex min-h-0 flex-1 overflow-hidden">
         <section className="relative flex flex-1 flex-col overflow-hidden bg-chat">
           <div
+            ref={setConversationElement}
             aria-hidden={!!activeDocumentTab}
             className={`relative flex min-h-0 flex-1 flex-col ${
               activeDocumentTab ? 'pointer-events-none invisible' : ''
-            }`}
+            } ${fileDragging && mayBeLink ? '[&_iframe]:pointer-events-none' : ''}`}
+            {...dropHandlers}
           >
             {conversationContent}
+            {fileDragging && <DropOverlay passThrough={mayBeLink} />}
           </div>
           {activeDocumentTab && (
             <div className="absolute inset-0 z-20 flex flex-col bg-chat">
@@ -335,29 +386,41 @@ export function MessagePane() {
           )}
         </section>
 
-        {activeThread && !activeDocumentTab && mediaOpen && (
-          <ConversationDetailsPanel
-            media={mediaItems}
-            files={fileItems}
-            participants={participants}
-            scopeTitle={activeThread.subject || '(no subject)'}
-            // For RSS, from_name duplicates the subject (both the feed title), so
-            // show the feed host instead; otherwise show the sender name.
-            scopeSubtitle={isRSS ? activeThread.from_addr : activeThread.from_name || activeThread.from_addr}
-            loading={showThreadLoading}
-            onOpenImage={(index) => thread$.galleryIndex.set(index)}
-            onShowInConversation={showMessageInConversation}
-            onComposeTo={(person) =>
-              openComposeTab({
-                accountId: activeThread.account_id,
-                to: person.name && person.name !== person.email ? `${person.name} <${person.email}>` : person.email,
-              })
-            }
-            onViewMessagesWith={(person) =>
-              openCorrespondentMail(activeThread.account_id, activeThread.folder_id, person.email)
-            }
-            onClose={() => thread$.mediaOpen.set(false)}
-          />
+        {activeThread && detailsPhase !== 'closed' && (
+          <div
+            data-pane-phase={detailsPhase}
+            className={`details-slide${
+              detailsPhase === 'entering'
+                ? ' animate-pane-open'
+                : detailsPhase === 'exiting'
+                  ? ' animate-pane-close'
+                  : ''
+            }`}
+          >
+            <ConversationDetailsPanel
+              media={mediaItems}
+              files={fileItems}
+              participants={participants}
+              scopeTitle={activeThread.subject || '(no subject)'}
+              // For RSS, from_name duplicates the subject (both the feed title), so
+              // show the feed host instead; otherwise show the sender name.
+              scopeSubtitle={isRSS ? activeThread.from_addr : activeThread.from_name || activeThread.from_addr}
+              loading={showThreadLoading}
+              onOpenImage={(index) => thread$.galleryIndex.set(index)}
+              onShowInConversation={showMessageInConversation}
+              onComposeTo={(person) =>
+                openComposeTab({
+                  accountId: activeThread.account_id,
+                  to: person.name && person.name !== person.email ? `${person.name} <${person.email}>` : person.email,
+                })
+              }
+              onViewMessagesWith={(person) =>
+                openCorrespondentMail(activeThread.account_id, activeThread.folder_id, person.email)
+              }
+              onClose={() => thread$.mediaOpen.set(false)}
+              closing={detailsPhase === 'exiting'}
+            />
+          </div>
         )}
       </div>
 
@@ -370,7 +433,9 @@ export function MessagePane() {
         />
       )}
 
-      {contextMenu && <MessageContextMenu state={contextMenu} isRSS={isRSS} onClose={() => setContextMenu(null)} />}
+      {contextMenu && (
+        <MessageContextMenu state={contextMenu} isRSS={isRSS} onClose={() => thread$.messageContextMenu.set(null)} />
+      )}
     </div>
   )
 }

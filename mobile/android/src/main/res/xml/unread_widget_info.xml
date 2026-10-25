@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- No updatePeriodMillis: the count is pushed whenever unread state changes
+     (sync, push, notification actions, leaving the app). -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:configure="jp.nonbili.meron.AndroidUnreadWidgetConfigureActivity"
+    android:description="@string/mobile_android_widget_description"
+    android:initialLayout="@layout/unread_widget"
+    android:minWidth="40dp"
+    android:minHeight="40dp"
+    android:previewLayout="@layout/unread_widget"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="1"
+    android:targetCellHeight="1"
+    android:updatePeriodMillis="0"
+    android:widgetCategory="home_screen"
+    android:widgetFeatures="reconfigurable|configuration_optional" />

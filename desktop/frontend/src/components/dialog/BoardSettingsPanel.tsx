@@ -9,11 +9,12 @@ import {
   setKanbanBoardWallpaper,
 } from '../../states/kanban'
 import { confirmAction, showToast, ui$ } from '../../states/ui'
-import { WALLPAPER_PRESETS, sanitizeChatWallpaper, wallpaperCss } from '../../lib/wallpapers'
+import { WALLPAPER_PRESETS, boardWallpaper, wallpaperCss } from '../../lib/wallpapers'
 import { readFileData } from '../../lib/readFileData'
 import { pickImageFile } from '../../lib/nativeFilePicker'
 import { writeBoardAvatarFile, writeBoardWallpaperFile } from '../../lib/boardMedia'
 import { AvatarCropDialog } from './AvatarCropDialog'
+import { RemoveImageBadge } from './RemoveImageBadge'
 import { WallpaperDialog } from './WallpaperDialog'
 import { SettingRow, SettingsGroup, TextRow } from './AccountSettingsRows'
 
@@ -94,7 +95,7 @@ function BoardNameRow({ board }: { board: KanbanBoard }) {
 function BoardWallpaperCard({ board }: { board: KanbanBoard }) {
   const { t } = useTranslation()
   const [dialogOpen, setDialogOpen] = useState(false)
-  const wallpaper = sanitizeChatWallpaper(board.wallpaper)
+  const wallpaper = boardWallpaper(board.wallpaper)
 
   const presetName =
     wallpaper?.kind === 'preset'
@@ -167,18 +168,27 @@ export function BoardPanel({ board }: { board: KanbanBoard }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3 min-w-0">
-        <button
-          type="button"
-          title={t('kanban.board.changeImage')}
-          disabled={image.busy}
-          onClick={() => void image.pickFile()}
-          className="relative shrink-0 rounded-2xl group disabled:cursor-default cursor-pointer"
-        >
-          <BoardTile board={board} size={40} />
-          <span className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity">
-            <Camera size={15} className="text-white" />
-          </span>
-        </button>
+        <div className="relative shrink-0 group">
+          <button
+            type="button"
+            title={t('kanban.board.changeImage')}
+            disabled={image.busy}
+            onClick={() => void image.pickFile()}
+            className="relative block rounded-2xl disabled:cursor-default cursor-pointer"
+          >
+            <BoardTile board={board} size={40} />
+            <span className="absolute inset-0 flex items-center justify-center rounded-2xl bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity">
+              <Camera size={15} className="text-white" />
+            </span>
+          </button>
+          {board.avatarUrl && (
+            <RemoveImageBadge
+              label={t('kanban.board.removeImage')}
+              disabled={image.busy}
+              onRemove={() => setKanbanBoardAvatar(board.id, '')}
+            />
+          )}
+        </div>
         {image.pendingFile && (
           <AvatarCropDialog
             file={image.pendingFile}

@@ -1,16 +1,28 @@
 import { beforeEach, describe, expect, it } from 'bun:test'
 import { accounts$ } from '../states/accounts'
 import { t } from './i18n'
-import { kanban$, setGlobalKanbanFilter } from '../states/kanban'
-import { mail$ } from '../states/mail'
+import {
+  editKanbanSearchColumn,
+  getKanbanColumns,
+  kanban$,
+  narrowKanbanQuery,
+  saveKanbanSearchColumn,
+  setGlobalKanbanAttachmentsOnly,
+  setGlobalKanbanFilter,
+} from '../states/kanban'
+import { mail$, releaseRemovedThread, suppressRemovedThread } from '../states/mail'
+import { ui$ } from '../states/ui'
 import { settings$ } from '../states/settings'
 import type { Account, Folder } from '../types'
 import {
   KANBAN_DROP_REASONS,
   KANBAN_MOVE_MESSAGES,
   accountLabel,
+  activeKanbanColumnAttachmentsOnly,
   activeKanbanColumnFilter,
+  activeKanbanColumnQuery,
   columnDropTargetClass,
+  restrictColumnDragToHorizontal,
   columnEmptyText,
   columnSearchActive,
   folderLabel,
@@ -106,6 +118,86 @@ describe('searchTargets', () => {
   it('returns only the scoped column', () => {
     expect(searchTargets(columns, 'acc2\nINBOX')).toEqual([columns[1]])
   })
+
+  it('reaches saved search columns, and scopes to one apart from its folder', () => {
+    const saved = { accountId: 'acc1', folderId: 'INBOX', query: 'invoice' }
+    expect(searchTargets([...columns, saved], 'all')).toEqual([...columns, saved])
+    expect(searchTargets([...columns, saved], 'acc1\nINBOX\ninvoice')).toEqual([saved])
+    expect(searchTargets([...columns, saved], 'acc1\nINBOX')).toEqual([columns[0]])
+  })
+})
+
+describe('narrowKanbanQuery', () => {
+  it('joins the board search to a saved query with AND', () => {
+    expect(narrowKanbanQuery('from:boss', ' budget ')).toBe('from:boss\nAND budget')
+    expect(narrowKanbanQuery('from:boss', '  ')).toBe('from:boss')
+    expect(narrowKanbanQuery(undefined, ' budget ')).toBe('budget')
+  })
+
+  it('leaves the saved query as it is, quotes and groups left open too', () => {
+    expect(narrowKanbanQuery('subject:"Q3 AND budget', 'paid')).toBe('subject:"Q3 AND budget\nAND paid')
+    expect(narrowKanbanQuery('27" monitor', '24" monitor')).toBe('27" monitor\nAND 24" monitor')
+    expect(narrowKanbanQuery('subject:"Q3', '  ')).toBe('subject:"Q3')
+  })
+
+  it('drops a leading OR left stray after the AND', () => {
+    expect(narrowKanbanQuery('from:a', 'OR from:b')).toBe('from:a\nAND from:b')
+    expect(narrowKanbanQuery('from:a', 'OR OR')).toBe('from:a')
+    expect(narrowKanbanQuery('from:a', 'ORACLE')).toBe('from:a\nAND ORACLE')
+    expect(narrowKanbanQuery(undefined, 'OR x')).toBe('OR x')
+  })
+})
+
+describe('editKanbanSearchColumn', () => {
+  const inbox = { accountId: 'acc1', folderId: 'INBOX' }
+  const saved = { ...inbox, query: 'invoice' }
+  const sent = { accountId: 'acc1', folderId: 'Sent' }
+
+  beforeEach(() => {
+    settings$.kanbanBoards.set([{ id: 'kb-1', name: 'Work', columns: [inbox, saved, sent] }])
+    settings$.kanbanMinimizedColumns.set({})
+  })
+
+  it('changes the query in place and carries the column state over', () => {
+    kanban$.filters['acc1\nINBOX\ninvoice'].set('unread')
+    settings$.kanbanMinimizedColumns['kb-1\nacc1\nINBOX\ninvoice'].set(true)
+    expect(editKanbanSearchColumn('kb-1', saved, ' receipt ')).toEqual({ ...inbox, query: 'receipt' })
+    expect(getKanbanColumns('kb-1')).toEqual([inbox, { ...inbox, query: 'receipt' }, sent])
+    expect(kanban$.filters['acc1\nINBOX\nreceipt'].get()).toBe('unread')
+    expect(kanban$.filters['acc1\nINBOX\ninvoice'].get()).toBeUndefined()
+    expect(settings$.kanbanMinimizedColumns['kb-1\nacc1\nINBOX\nreceipt'].get()).toBe(true)
+  })
+
+  it('refuses an empty, unchanged or duplicate query, and a plain folder column', () => {
+    settings$.kanbanBoards.set([{ id: 'kb-1', name: 'Work', columns: [inbox, saved, { ...inbox, query: 'receipt' }] }])
+    expect(editKanbanSearchColumn('kb-1', saved, '   ')).toBeNull()
+    expect(editKanbanSearchColumn('kb-1', saved, 'invoice')).toBeNull()
+    expect(editKanbanSearchColumn('kb-1', saved, 'receipt')).toBeNull()
+    expect(editKanbanSearchColumn('kb-1', inbox, 'invoice')).toBeNull()
+    expect(getKanbanColumns('kb-1')).toEqual([inbox, saved, { ...inbox, query: 'receipt' }])
+  })
+})
+
+describe('saveKanbanSearchColumn', () => {
+  const inbox = { accountId: 'acc1', folderId: 'INBOX' }
+  const sent = { accountId: 'acc1', folderId: 'Sent' }
+
+  beforeEach(() => {
+    settings$.kanbanBoards.set([{ id: 'kb-1', name: 'Work', columns: [inbox, sent] }])
+  })
+
+  it('places the saved search right after the column it came from', () => {
+    expect(saveKanbanSearchColumn('kb-1', inbox, '  invoice \n due ')).toEqual({ ...inbox, query: 'invoice due' })
+    expect(getKanbanColumns('kb-1')).toEqual([inbox, { ...inbox, query: 'invoice due' }, sent])
+  })
+
+  it('refuses an empty query, a duplicate, and saving a saved search again', () => {
+    expect(saveKanbanSearchColumn('kb-1', inbox, '   ')).toBeNull()
+    const saved = saveKanbanSearchColumn('kb-1', inbox, 'invoice')!
+    expect(saveKanbanSearchColumn('kb-1', inbox, 'invoice')).toBeNull()
+    expect(saveKanbanSearchColumn('kb-1', saved, 'other')).toBeNull()
+    expect(getKanbanColumns('kb-1')).toHaveLength(3)
+  })
 })
 
 describe('columnEmptyText', () => {
@@ -127,6 +219,12 @@ describe('columnEmptyText', () => {
     expect(columnEmptyText('unread', true, true)).toBe('Matches hidden by Unread filter')
     expect(columnEmptyText('starred', true, true)).toBe('Matches hidden by Starred filter')
   })
+
+  it('adds the attachments toggle to whatever the filter says', () => {
+    expect(columnEmptyText('all', false, false, false, true)).toBe('No threads with attachments')
+    expect(columnEmptyText('unread', false, false, false, true)).toBe('No unread threads with attachments')
+    expect(columnEmptyText('all', true, true, false, true)).toBe('Matches hidden by Attachments filter')
+  })
 })
 
 describe('columnSearchActive', () => {
@@ -136,6 +234,40 @@ describe('columnSearchActive', () => {
     expect(columnSearchActive('k1', 'q', 'all')).toBe(true)
     expect(columnSearchActive('k1', 'q', 'k1')).toBe(true)
     expect(columnSearchActive('k1', 'q', 'k2')).toBe(false)
+  })
+})
+
+describe('activeKanbanColumnQuery', () => {
+  const column = { accountId: 'acc1', folderId: 'INBOX' }
+
+  beforeEach(() => {
+    kanban$.searchQuery.set('')
+    kanban$.searchScope.set('all')
+  })
+
+  it('returns the trimmed board query when the search covers every column', () => {
+    kanban$.searchQuery.set('  invoice ')
+    expect(activeKanbanColumnQuery(column)).toBe('invoice')
+  })
+
+  it('returns the query only for the column the search is scoped to', () => {
+    kanban$.searchQuery.set('invoice')
+    kanban$.searchScope.set('acc1\nINBOX')
+    expect(activeKanbanColumnQuery(column)).toBe('invoice')
+    expect(activeKanbanColumnQuery({ accountId: 'acc1', folderId: 'Sent' })).toBe('')
+  })
+
+  it('is empty when there is no search', () => {
+    kanban$.searchQuery.set('   ')
+    expect(activeKanbanColumnQuery(column)).toBe('')
+  })
+
+  it('gives a saved search column only the board search, not its own query', () => {
+    const saved = { ...column, query: 'invoice' }
+    kanban$.searchQuery.set('')
+    expect(activeKanbanColumnQuery(saved)).toBe('')
+    kanban$.searchQuery.set('receipt')
+    expect(activeKanbanColumnQuery(saved)).toBe('receipt')
   })
 })
 
@@ -149,6 +281,19 @@ describe('setGlobalKanbanFilter', () => {
 
     expect(kanban$.filters.get()).toEqual({})
     expect(activeKanbanColumnFilter(column)).toBe('unread')
+  })
+})
+
+describe('setGlobalKanbanAttachmentsOnly', () => {
+  it('clears per-column overrides so the new global toggle applies everywhere', () => {
+    const column = { accountId: 'acc1', folderId: 'INBOX' }
+    kanban$.attachmentsOnly['acc1\nINBOX'].set(true)
+    expect(activeKanbanColumnAttachmentsOnly(column)).toBe(true)
+
+    setGlobalKanbanAttachmentsOnly(false)
+
+    expect(kanban$.attachmentsOnly.get()).toEqual({})
+    expect(activeKanbanColumnAttachmentsOnly(column)).toBe(false)
   })
 })
 
@@ -191,6 +336,39 @@ describe('kanban column loading filters', () => {
     expect(handlers.size).toBe(0)
   })
 
+  it('reloads a synced saved search column still narrowed by the board search', async () => {
+    const handlers = new Map<string, (detail: unknown) => void>()
+    ;(window as any).runtime = {
+      EventsOn: (name: string, handler: (detail: unknown) => void) => {
+        handlers.set(name, handler)
+        return () => handlers.delete(name)
+      },
+    }
+    const queries: string[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string, payload: any) => {
+            if (command !== 'mail.threadList') return { online: true, queued: true }
+            queries.push(payload.query)
+            return { threads: [], next_cursor: '' }
+          },
+        },
+      },
+    }
+    kanban$.searchQuery.set('receipt')
+    kanban$.searchScope.set('all')
+    try {
+      const sync = syncKanbanColumn({ accountId: 'acc1', folderId: 'INBOX', query: 'invoice' })
+      await Promise.resolve()
+      handlers.get('mail.synced')?.({ account: 'acc1', folder: 'INBOX' })
+      await sync
+      expect(queries).toEqual(['invoice\nAND receipt'])
+    } finally {
+      kanban$.searchQuery.set('')
+    }
+  })
+
   it('waits for every account in a unified column before finishing sync', async () => {
     const handlers = new Map<string, (detail: unknown) => void>()
     ;(window as any).runtime = {
@@ -229,6 +407,51 @@ describe('kanban column loading filters', () => {
     expect(handlers.size).toBe(0)
   })
 
+  it('sends the board attachments toggle alongside the read-state filter', async () => {
+    const calls: { command: string; payload: any }[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string, payload: unknown) => {
+            calls.push({ command, payload })
+            return { threads: [], next_cursor: '', folder_unread: 0 }
+          },
+        },
+      },
+    }
+    kanban$.globalFilter.set('unread')
+    kanban$.globalAttachmentsOnly.set(true)
+    try {
+      await loadKanbanColumn({ accountId: 'acc1', folderId: 'INBOX' }, true)
+      expect(calls.find((call) => call.command === 'mail.threadList')?.payload).toMatchObject({
+        filter: 'unread',
+        attachments: true,
+      })
+    } finally {
+      kanban$.globalAttachmentsOnly.set(false)
+      kanban$.globalFilter.set('all')
+    }
+  })
+
+  it('reads a saved search column with its own query, narrowed by the board search', async () => {
+    const calls: { command: string; payload: any }[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string, payload: unknown) => {
+            calls.push({ command, payload })
+            return { threads: [], next_cursor: '', folder_unread: 0 }
+          },
+        },
+      },
+    }
+    await loadKanbanColumn({ accountId: 'acc1', folderId: 'INBOX', query: 'invoice' }, false, 'receipt')
+    expect(calls.find((call) => call.command === 'mail.threadList')?.payload).toMatchObject({
+      folder_id: 'INBOX',
+      query: 'invoice\nAND receipt',
+    })
+  })
+
   it('sends the active global filter when loading a single-account column', async () => {
     const calls: { command: string; payload: unknown }[] = []
     ;(window as any).go = {
@@ -254,6 +477,7 @@ describe('kanban column loading filters', () => {
       refresh: true,
       before_cursor: undefined,
     })
+    expect((threadListCalls[0] as { attachments?: boolean }).attachments).toBe(false)
     expect(activeKanbanColumnFilter({ accountId: 'acc1', folderId: 'INBOX' })).toBe('unread')
     expect(kanban$.unreadCounts['acc1\nINBOX'].get()).toBe(3)
     expect(mail$.foldersByAccount.acc1.get()?.[0]?.unread).toBe(3)
@@ -299,6 +523,44 @@ describe('kanban column loading filters', () => {
     expect(kanban$.loading['acc1\nArchive'].get()).toBe(false)
   })
 
+  it('reads on after a reload until the oldest card shown is back', async () => {
+    // Each request answers one card whatever its limit — as an attachments
+    // filter or a long thread can — so the read depth alone falls short.
+    const pages: Record<string, { threads: import('../types').Message[]; next_cursor: string }> = {
+      '': { threads: [message({ id: 't3', thread_id: 't3', date: 300 })], next_cursor: 'c1' },
+      c1: { threads: [message({ id: 't2', thread_id: 't2', date: 200 })], next_cursor: 'c2' },
+      c2: { threads: [message({ id: 't1', thread_id: 't1', date: 100 })], next_cursor: '' },
+    }
+    const calls: { before_cursor?: string; limit?: number }[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string, payload: { before_cursor?: string; limit?: number }) => {
+            if (command !== 'mail.threadList') return {}
+            calls.push(payload)
+            return pages[payload.before_cursor ?? '']
+          },
+        },
+      },
+    }
+    const column = { accountId: 'deep', folderId: 'INBOX' }
+    const key = 'deep\nINBOX'
+
+    await loadKanbanColumn(column)
+    await loadMoreKanbanColumn(column)
+    expect(kanban$.threads[key].get()?.map((thread) => thread.id)).toEqual(['t3', 't2'])
+
+    calls.length = 0
+    await loadKanbanColumn(column)
+
+    expect(calls.map((call) => [call.before_cursor, call.limit])).toEqual([
+      [undefined, 100],
+      ['c1', 50],
+    ])
+    expect(kanban$.threads[key].get()?.map((thread) => thread.id)).toEqual(['t3', 't2'])
+    expect(kanban$.cursors[key].get()).toBe('c2')
+  })
+
   it('keeps using the active filter when loading more of a column', async () => {
     const calls: { command: string; payload: unknown }[] = []
     ;(window as any).go = {
@@ -327,6 +589,61 @@ describe('kanban column loading filters', () => {
       before_cursor: 'uid:10',
     })
     expect(kanban$.unreadCounts['acc1\nINBOX'].get()).toBe(5)
+  })
+
+  it('pages with the search and filters the cursor was issued for', async () => {
+    const column = { accountId: 'acc1', folderId: 'Projects' }
+    const key = 'acc1\nProjects'
+    const calls: Record<string, unknown>[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string, payload: Record<string, unknown>) => {
+            if (command === 'mail.threadList') calls.push(payload)
+            return { threads: [], next_cursor: 'cursor-a' }
+          },
+        },
+      },
+    }
+    kanban$.searchQuery.set('alpha')
+    kanban$.searchScope.set('all')
+    kanban$.globalAttachmentsOnly.set(true)
+    await loadKanbanColumn(column, true, 'alpha')
+
+    // The board has moved on to another search and filters, but the column
+    // still holds search A's cursor until B's first page replaces it.
+    kanban$.searchQuery.set('beta')
+    kanban$.globalAttachmentsOnly.set(false)
+    kanban$.filters[key].set('unread')
+    await loadMoreKanbanColumn(column)
+
+    expect(calls[1]).toMatchObject({
+      query: 'alpha',
+      filter: 'all',
+      attachments: true,
+      before_cursor: 'cursor-a',
+    })
+    kanban$.searchQuery.set('')
+  })
+
+  it('does not page a column while a reload is replacing it', async () => {
+    const calls: string[] = []
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async (command: string) => {
+            calls.push(command)
+            return { threads: [], next_cursor: '' }
+          },
+        },
+      },
+    }
+    kanban$.cursors['acc1\nINBOX'].set('uid:10')
+    kanban$.loading['acc1\nINBOX'].set(true)
+
+    await loadMoreKanbanColumn({ accountId: 'acc1', folderId: 'INBOX' })
+
+    expect(calls).toEqual([])
   })
 
   it('sends one core-owned request for a unified column', async () => {
@@ -439,6 +756,46 @@ describe('kanban column loading filters', () => {
     expect(kanban$.threads['acc1\nINBOX'].get().map((thread) => thread.thread_id)).toEqual(['t2', 't1'])
   })
 
+  it('keeps an archived card out of a column reload and follows the open card', async () => {
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async () => ({
+            threads: [
+              message({ id: 't1', thread_id: 't1', date: 200 }),
+              message({ id: 't2', thread_id: 't2', date: 100 }),
+            ],
+            next_cursor: '',
+          }),
+        },
+      },
+    }
+    const column = { accountId: 'acc1', folderId: 'INBOX' }
+    kanban$.activeBoardId.set('board')
+    kanban$.paneColumnKey.set('board\nacc1\nINBOX')
+    kanban$.paneThreadId.set('t1')
+    ui$.selectedThread.set('t1')
+    kanban$.threads['acc1\nINBOX'].set([
+      message({ id: 't1', thread_id: 't1', date: 200 }),
+      message({ id: 't2', thread_id: 't2', date: 100 }),
+    ])
+    await loadKanbanColumn(column, false)
+    const undo = suppressRemovedThread('t1')
+    try {
+      await loadKanbanColumn(column, false)
+      expect(kanban$.threads['acc1\nINBOX'].get().map((thread) => thread.thread_id)).toEqual(['t2'])
+      expect(kanban$.paneThreadId.get()).toBe('t2')
+      expect(ui$.selectedThread.get()).toBe('t2')
+    } finally {
+      undo()
+      releaseRemovedThread('t1')
+      kanban$.activeBoardId.set('')
+      kanban$.paneThreadId.set('')
+      kanban$.paneColumnKey.set('')
+      ui$.selectedThread.set('')
+    }
+  })
+
   it('does not resurrect read threads when the column filter is All', async () => {
     ;(window as any).go = {
       main: { App: { Invoke: async () => ({ threads: [], next_cursor: '' }) } },
@@ -505,7 +862,7 @@ describe('kanban column loading filters', () => {
     expect(calls).toEqual([
       {
         command: 'mail.starredItems',
-        payload: { query: 'quarterly', filter: 'all', limit: 50, before_cursor: undefined },
+        payload: { query: 'quarterly', filter: 'all', attachments: false, limit: 50, before_cursor: undefined },
       },
     ])
     expect(kanban$.threads['unified\nstarred'].get().map((item) => item.id)).toEqual(['old', 'new'])
@@ -554,6 +911,14 @@ describe('kanbanColumnUnreadCount', () => {
         message({ unread: true, unread_count: 3 }),
       ]),
     ).toBe(3)
+  })
+
+  it('counts a saved search from its loaded matches, not the folder total', () => {
+    expect(
+      kanbanColumnUnreadCount({ accountId: 'acc1', folderId: 'inbox', query: 'invoice' }, 137, [
+        message({ unread: true, unread_count: 2 }),
+      ]),
+    ).toBe(2)
   })
 
   it('always derives unified starred from its loaded items', () => {
@@ -615,6 +980,23 @@ describe('labels', () => {
     expect(folderLabel({ accountId: 'acc1', folderId: 'INBOX' }, folders, accs)).toBe('Inbox')
     expect(folderLabel({ accountId: 'acc1', folderId: 'f1' }, folders, accs)).toBe('Receipts')
     expect(folderLabel({ accountId: 'acc1', folderId: 'f2' }, folders, accs)).toBe('f2')
+  })
+
+  it('folderLabel names a nested folder by its last path segment', () => {
+    const folders = [
+      { account_id: 'acc1', id: '[Gmail]/Now', name: '[Gmail]/Now', delimiter: '/' } as Folder,
+      { account_id: 'acc1', id: 'INBOX.Later', name: 'INBOX.Later', delimiter: '.' } as Folder,
+    ]
+    const accs = [account('acc1')]
+    expect(folderLabel({ accountId: 'acc1', folderId: '[Gmail]/Now' }, folders, accs)).toBe('Now')
+    expect(folderLabel({ accountId: 'acc1', folderId: 'INBOX.Later' }, folders, accs)).toBe('Later')
+    expect(searchColumnLabel({ accountId: 'acc1', folderId: '[Gmail]/Now' }, folders, accs)).toBe('acc1 / Now')
+  })
+
+  it('folderLabel keeps an RSS feed title whole', () => {
+    // Feed titles are not IMAP paths: a "/" in one is part of the name.
+    const folders = [{ account_id: 'rss-1', id: 'feed1', name: 'News / Tech' } as Folder]
+    expect(folderLabel({ accountId: 'rss-1', folderId: 'feed1' }, folders, [])).toBe('News / Tech')
   })
 
   it('searchColumnLabel names a unified column by its role', () => {
@@ -726,6 +1108,7 @@ describe('subscribeKanbanMailReloads', () => {
           folder_id: 'INBOX',
           query: '',
           filter: 'all',
+          attachments: false,
           refresh: false,
           limit: 50,
         },
@@ -747,6 +1130,7 @@ describe('subscribeKanbanMailReloads', () => {
           folder_id: 'INBOX',
           query: '',
           filter: 'all',
+          attachments: false,
           refresh: false,
           limit: 50,
         },
@@ -790,6 +1174,7 @@ describe('subscribeKanbanMailReloads', () => {
           folder_role: 'archive',
           query: '',
           filter: 'all',
+          attachments: false,
           refresh: false,
           limit: 50,
         },
@@ -814,6 +1199,15 @@ describe('resolveKanbanMove', () => {
     expect(resolveKanbanMove(unified, { accountId: 'acc1', folderId: 'Archive' }, thread, mailAccounts)).toEqual({
       kind: 'move',
       origin: { accountId: 'acc2', folderId: 'INBOX' },
+    })
+  })
+
+  it('refuses a drop onto a saved search column', () => {
+    const source = { accountId: 'acc1', folderId: 'Archive' }
+    const target = { accountId: 'acc1', folderId: 'INBOX', query: 'invoice' }
+    expect(resolveKanbanMove(source, target, message({}), mailAccounts)).toEqual({
+      kind: 'blocked',
+      reasonKey: KANBAN_DROP_REASONS.savedSearchTarget,
     })
   })
 
@@ -877,6 +1271,16 @@ describe('resolveKanbanMove', () => {
       kind: 'move',
       origin: { accountId: 'feed1', folderId: 'inbox' },
     })
+  })
+})
+
+describe('restrictColumnDragToHorizontal', () => {
+  const transform = { x: 40, y: 25, scaleX: 1, scaleY: 1 }
+  const dragging = (type: string) => ({ data: { current: { type } } })
+
+  it('pins a column to its row and leaves a card free', () => {
+    expect(restrictColumnDragToHorizontal({ transform, active: dragging('column') })).toEqual({ ...transform, y: 0 })
+    expect(restrictColumnDragToHorizontal({ transform, active: dragging('thread') })).toEqual(transform)
   })
 })
 

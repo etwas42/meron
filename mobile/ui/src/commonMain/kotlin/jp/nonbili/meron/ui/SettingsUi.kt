@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -26,10 +27,17 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Checklist
+import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Event
+import androidx.compose.material.icons.filled.FitScreen
+import androidx.compose.material.icons.filled.FormatQuote
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.HideImage
 import androidx.compose.material.icons.filled.Inbox
@@ -41,6 +49,7 @@ import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -81,6 +90,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import jp.nonbili.meron.shared.AccountSummary
+import jp.nonbili.meron.shared.FolderSummary
 import jp.nonbili.meron.shared.ProxySpec
 import jp.nonbili.meron.shared.SignatureSpec
 import jp.nonbili.meron.shared.StorageUsage
@@ -133,18 +143,37 @@ internal fun SettingsScreen(
     onMoveAccountUp: (AccountSummary) -> Unit,
     onMoveAccountDown: (AccountSummary) -> Unit,
     onRemoveAccount: (AccountSummary) -> Unit,
-    appearanceMode: AppAppearanceMode,
-    onAppearanceModeChange: (AppAppearanceMode) -> Unit,
+    themeChoice: ThemeChoice,
+    systemDark: Boolean,
+    onThemeChoiceChange: (ThemeChoice) -> Unit,
+    customThemes: List<CustomTheme>,
+    onImportCustomTheme: (CustomTheme) -> Unit,
+    onDeleteCustomTheme: (CustomTheme) -> Unit,
+    onShareCustomTheme: (CustomTheme) -> Unit,
     appLanguageTag: String,
     onAppLanguageChange: (String) -> Unit,
     showSenderImages: Boolean,
     onToggleSenderImages: () -> Unit,
+    darkMailBodies: Boolean,
+    onToggleDarkMailBodies: () -> Unit,
+    chatFullMessages: Boolean,
+    onToggleChatFullMessages: () -> Unit,
+    autoFitMessages: Boolean,
+    onToggleAutoFitMessages: () -> Unit,
+    readerBottomActions: Boolean,
+    onToggleReaderBottomActions: () -> Unit,
     showUnreadBadges: Boolean,
     onToggleUnreadBadges: () -> Unit,
     showUnifiedInboxNav: Boolean,
     onToggleUnifiedInboxNav: () -> Unit,
+    tasksEnabled: Boolean,
+    onToggleTasks: () -> Unit,
+    calendarEnabled: Boolean,
+    onToggleCalendar: () -> Unit,
     sendShortcutMode: SendShortcutMode,
     onToggleSendShortcut: () -> Unit,
+    quoteReplies: Boolean,
+    onToggleQuoteReplies: () -> Unit,
     conversationLayout: ConversationLayout,
     onToggleConversationLayout: () -> Unit,
     messageFontScale: Int,
@@ -158,6 +187,9 @@ internal fun SettingsScreen(
     onSaveAccountSignature: (AccountSummary, SignatureSpec) -> Unit,
     onSaveAccountProxy: (AccountSummary, ProxySpec) -> Unit,
     onSaveAccountServerSettings: (AccountSummary, ServerSettingsDraft) -> Unit,
+    foldersByAccount: Map<String, List<FolderSummary>>,
+    onRequestAccountFolders: (AccountSummary) -> Unit,
+    onSetFolderNotify: (FolderSummary, Boolean) -> Unit,
     kanbanColumnWidth: Int,
     onCycleKanbanColumnWidth: () -> Unit,
     notificationsNeedPermission: Boolean,
@@ -181,7 +213,6 @@ internal fun SettingsScreen(
     onRestoreBackup: () -> Unit,
     backupBusy: Boolean,
 ) {
-    var showThemePicker by remember { mutableStateOf(false) }
     var showLanguagePicker by remember { mutableStateOf(false) }
     var showMessageTextSize by remember { mutableStateOf(false) }
     val settingsNavController = rememberNavController()
@@ -193,12 +224,15 @@ internal fun SettingsScreen(
     val page =
         when (settingsBackStackEntry?.destination?.route ?: SettingsRoutes.Root) {
             SettingsRoutes.General -> SettingsPage.General
+            SettingsRoutes.Messages -> SettingsPage.Messages
+            SettingsRoutes.Composer -> SettingsPage.Composer
             SettingsRoutes.Account -> selectedSettingsAccountId?.let { SettingsPage.AccountDetail(it) } ?: SettingsPage.Root
             SettingsRoutes.AccountWallpaper -> selectedSettingsAccountId?.let { SettingsPage.AccountWallpaper(it) } ?: SettingsPage.Root
             SettingsRoutes.KanbanBoard -> selectedSettingsBoardId?.let { SettingsPage.KanbanBoardDetail(it) } ?: SettingsPage.Root
             SettingsRoutes.KanbanBoardWallpaper -> selectedSettingsBoardId?.let { SettingsPage.KanbanBoardWallpaper(it) } ?: SettingsPage.Root
             SettingsRoutes.SyncLog -> SettingsPage.SyncLog
             SettingsRoutes.RemoteSenders -> SettingsPage.RemoteSenders
+            SettingsRoutes.Theme -> SettingsPage.Theme
             else -> SettingsPage.Root
         }
     LaunchedEffect(initialGeneral) {
@@ -231,13 +265,6 @@ internal fun SettingsScreen(
             onConsumeInitialKanbanBoard()
         }
     }
-    if (showThemePicker) {
-        ThemePickerDialog(
-            current = appearanceMode,
-            onSelect = onAppearanceModeChange,
-            onDismiss = { showThemePicker = false },
-        )
-    }
     if (showLanguagePicker) {
         LanguagePickerDialog(
             currentTag = appLanguageTag,
@@ -269,12 +296,15 @@ internal fun SettingsScreen(
                         when (page) {
                             SettingsPage.Root -> tr("settings.label")
                             SettingsPage.General -> tr("settings.sections.general")
+                            SettingsPage.Messages -> tr("settings.sections.messages")
+                            SettingsPage.Composer -> tr("settings.sections.composer")
                             is SettingsPage.AccountDetail -> tr("settings.account.account")
                             is SettingsPage.AccountWallpaper -> tr("settings.account.chatBackground")
                             is SettingsPage.KanbanBoardDetail -> tr("kanban.board.label")
                             is SettingsPage.KanbanBoardWallpaper -> tr("settings.account.chatBackground")
                             SettingsPage.SyncLog -> tr("settings.viewSyncLog")
                             SettingsPage.RemoteSenders -> tr("settings.privacy.remoteSenders")
+                            SettingsPage.Theme -> tr("common.theme")
                         },
                     )
                 },
@@ -305,8 +335,9 @@ internal fun SettingsScreen(
         ) {
             composable(SettingsRoutes.General) {
                 SettingsGeneralPage(
-                    appearanceMode = appearanceMode,
-                    onOpenTheme = { showThemePicker = true },
+                    themeChoice = themeChoice,
+                    systemDark = systemDark,
+                    onOpenTheme = { settingsNavController.navigate(SettingsRoutes.Theme) },
                     appLanguageTag = appLanguageTag,
                     onOpenLanguage = { showLanguagePicker = true },
                     showSenderImages = showSenderImages,
@@ -315,20 +346,14 @@ internal fun SettingsScreen(
                     onToggleUnreadBadges = onToggleUnreadBadges,
                     showUnifiedInboxNav = showUnifiedInboxNav,
                     onToggleUnifiedInboxNav = onToggleUnifiedInboxNav,
+                    tasksEnabled = tasksEnabled,
+                    onToggleTasks = onToggleTasks,
+                    calendarEnabled = calendarEnabled,
+                    onToggleCalendar = onToggleCalendar,
                     kanbanColumnWidth = kanbanColumnWidth,
                     onCycleKanbanColumnWidth = onCycleKanbanColumnWidth,
-                    sendShortcutMode = sendShortcutMode,
-                    onToggleSendShortcut = onToggleSendShortcut,
-                    conversationLayout = conversationLayout,
-                    onToggleConversationLayout = onToggleConversationLayout,
-                    messageFontScale = messageFontScale,
-                    onOpenMessageTextSize = { showMessageTextSize = true },
                     appProxy = appProxy,
                     onSaveAppProxy = onSaveAppProxy,
-                    appSignatureHtml = appSignatureHtml,
-                    onSaveAppSignature = onSaveAppSignature,
-                    remoteImageSenderCount = remoteImageSenders.size,
-                    onOpenRemoteSenders = { settingsNavController.navigate(SettingsRoutes.RemoteSenders) },
                     notificationsNeedPermission = notificationsNeedPermission,
                     onEnableNotifications = onEnableNotifications,
                     supportsBackgroundPush = supportsBackgroundPush,
@@ -349,6 +374,51 @@ internal fun SettingsScreen(
                     onRestoreBackup = onRestoreBackup,
                     backupBusy = backupBusy,
                     focusProxy = directOpenRoute == SettingsRoutes.General,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            composable(SettingsRoutes.Messages) {
+                SettingsMessagesPage(
+                    conversationLayout = conversationLayout,
+                    onToggleConversationLayout = onToggleConversationLayout,
+                    messageFontScale = messageFontScale,
+                    onOpenMessageTextSize = { showMessageTextSize = true },
+                    darkMailBodies = darkMailBodies,
+                    onToggleDarkMailBodies = onToggleDarkMailBodies,
+                    chatFullMessages = chatFullMessages,
+                    onToggleChatFullMessages = onToggleChatFullMessages,
+                    autoFitMessages = autoFitMessages,
+                    onToggleAutoFitMessages = onToggleAutoFitMessages,
+                    readerBottomActions = readerBottomActions,
+                    onToggleReaderBottomActions = onToggleReaderBottomActions,
+                    remoteImageSenderCount = remoteImageSenders.size,
+                    onOpenRemoteSenders = { settingsNavController.navigate(SettingsRoutes.RemoteSenders) },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            composable(SettingsRoutes.Composer) {
+                SettingsComposerPage(
+                    sendShortcutMode = sendShortcutMode,
+                    onToggleSendShortcut = onToggleSendShortcut,
+                    quoteReplies = quoteReplies,
+                    onToggleQuoteReplies = onToggleQuoteReplies,
+                    appSignatureHtml = appSignatureHtml,
+                    onSaveAppSignature = onSaveAppSignature,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+
+            composable(SettingsRoutes.Theme) {
+                ThemePickerPage(
+                    choice = themeChoice,
+                    systemDark = systemDark,
+                    onChange = onThemeChoiceChange,
+                    customThemes = customThemes,
+                    onImportCustomTheme = onImportCustomTheme,
+                    onDeleteCustomTheme = onDeleteCustomTheme,
+                    onShareCustomTheme = onShareCustomTheme,
                     modifier = Modifier.fillMaxSize(),
                 )
             }
@@ -415,6 +485,9 @@ internal fun SettingsScreen(
                         onMoveDown = { onMoveAccountDown(account) },
                         onRemove = { onRemoveAccount(account) },
                         focusProxy = focusAccountProxy && directOpenRoute == SettingsRoutes.Account,
+                        folders = foldersByAccount[account.id].orEmpty(),
+                        onRequestFolders = { onRequestAccountFolders(account) },
+                        onSetFolderNotify = onSetFolderNotify,
                         modifier = Modifier.fillMaxSize(),
                     )
                 }
@@ -505,8 +578,8 @@ internal fun SettingsScreen(
             }
 
             composable(SettingsRoutes.Root) {
-                // Mirrors the desktop Settings sidebar: a single "General" entry,
-                // then Kanban boards, Mail accounts, and Feed accounts sections.
+                // Mirrors the desktop Settings sidebar: General, Messages and
+                // Composer, then Kanban boards, Mail accounts, and Feed accounts.
                 val mailAccounts = accounts.filter { !accountSummaryIsRss(it) }
                 val feedAccounts = accounts.filter { accountSummaryIsRss(it) }
                 val rootListState = rememberLazyListState()
@@ -517,6 +590,22 @@ internal fun SettingsScreen(
                             title = tr("settings.sections.general"),
                             subtitle = null,
                             onClick = { settingsNavController.navigate(SettingsRoutes.General) },
+                        )
+                    }
+                    item {
+                        SettingsRow(
+                            icon = Icons.AutoMirrored.Filled.Chat,
+                            title = tr("settings.sections.messages"),
+                            subtitle = null,
+                            onClick = { settingsNavController.navigate(SettingsRoutes.Messages) },
+                        )
+                    }
+                    item {
+                        SettingsRow(
+                            icon = Icons.Filled.Edit,
+                            title = tr("settings.sections.composer"),
+                            subtitle = null,
+                            onClick = { settingsNavController.navigate(SettingsRoutes.Composer) },
                         )
                     }
                     item { SettingsSectionLabel(tr("settings.sections.kanbanBoards")) }
@@ -625,7 +714,13 @@ private sealed class SettingsPage {
 
     data object General : SettingsPage()
 
+    data object Messages : SettingsPage()
+
+    data object Composer : SettingsPage()
+
     data object RemoteSenders : SettingsPage()
+
+    data object Theme : SettingsPage()
 
     data class AccountDetail(
         val accountId: String,
@@ -649,19 +744,23 @@ private sealed class SettingsPage {
 private object SettingsRoutes {
     const val Root = "settings/root"
     const val General = "settings/general"
+    const val Messages = "settings/messages"
+    const val Composer = "settings/composer"
     const val Account = "settings/account"
     const val AccountWallpaper = "settings/account-wallpaper"
     const val KanbanBoard = "settings/kanban-board"
     const val KanbanBoardWallpaper = "settings/kanban-board-wallpaper"
     const val SyncLog = "settings/sync-log"
     const val RemoteSenders = "settings/remote-senders"
+    const val Theme = "settings/theme"
 }
 
-// Combines the desktop "General" section: Appearance, Sidebar, Kanban,
-// Composer, Sync & notifications, and Storage in one scrollable page.
+// Appearance, Side navigation, Kanban, Network, Sync & notifications and Data
+// in one scrollable page; how mail is read and written have pages of their own.
 @Composable
 internal fun SettingsGeneralPage(
-    appearanceMode: AppAppearanceMode,
+    themeChoice: ThemeChoice,
+    systemDark: Boolean,
     onOpenTheme: () -> Unit,
     appLanguageTag: String,
     onOpenLanguage: () -> Unit,
@@ -671,20 +770,14 @@ internal fun SettingsGeneralPage(
     onToggleUnreadBadges: () -> Unit,
     showUnifiedInboxNav: Boolean,
     onToggleUnifiedInboxNav: () -> Unit,
+    tasksEnabled: Boolean,
+    onToggleTasks: () -> Unit,
+    calendarEnabled: Boolean,
+    onToggleCalendar: () -> Unit,
     kanbanColumnWidth: Int,
     onCycleKanbanColumnWidth: () -> Unit,
-    sendShortcutMode: SendShortcutMode,
-    onToggleSendShortcut: () -> Unit,
-    conversationLayout: ConversationLayout,
-    onToggleConversationLayout: () -> Unit,
-    messageFontScale: Int,
-    onOpenMessageTextSize: () -> Unit,
     appProxy: ProxySpec,
     onSaveAppProxy: (ProxySpec) -> Unit,
-    appSignatureHtml: String,
-    onSaveAppSignature: (String) -> Unit,
-    remoteImageSenderCount: Int,
-    onOpenRemoteSenders: () -> Unit,
     notificationsNeedPermission: Boolean,
     onEnableNotifications: () -> Unit,
     supportsBackgroundPush: Boolean,
@@ -707,19 +800,30 @@ internal fun SettingsGeneralPage(
     focusProxy: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    val listState = rememberLazyListState(initialFirstVisibleItemIndex = if (focusProxy) 12 else 0)
+    // The Network label: Appearance (label + 3 rows), Side navigation (label +
+    // 3 rows) and Kanban (2) come before it on every platform.
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = if (focusProxy) 10 else 0)
     LazyColumn(modifier.appScrollbar(listState), state = listState) {
         item { SettingsSectionLabel(tr("settings.pages.appearance")) }
         item {
-            val displayedAppearanceMode =
-                if (appearanceMode == AppAppearanceMode.System) AppAppearanceMode.Light else appearanceMode
+            // The preview is what is painted now; while following the system
+            // the label names both picks.
+            val displayedAppearanceMode = themeChoice.resolve(systemDark)
+            val themeLabel =
+                if (themeChoice.followSystem) "${themeChoice.light.label} / ${themeChoice.dark.label}" else displayedAppearanceMode.label
             SettingsRow(
                 icon = Icons.Filled.Visibility,
                 title = tr("common.theme"),
                 onClick = onOpenTheme,
                 trailing = {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(displayedAppearanceMode.label, color = MaterialTheme.colorScheme.primary)
+                        Text(
+                            themeLabel,
+                            color = MaterialTheme.colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.widthIn(max = 180.dp),
+                        )
                         Box(
                             Modifier
                                 .width(44.dp)
@@ -730,15 +834,6 @@ internal fun SettingsGeneralPage(
                         }
                     }
                 },
-            )
-        }
-        item {
-            SettingsRow(
-                icon = Icons.AutoMirrored.Filled.Chat,
-                title = tr("settings.appearance.conversationLayout"),
-                hint = tr("settings.appearance.conversationLayoutHint"),
-                onClick = onToggleConversationLayout,
-                trailing = { Text(conversationLayout.label(), color = MaterialTheme.colorScheme.primary) },
             )
         }
         item {
@@ -767,17 +862,14 @@ internal fun SettingsGeneralPage(
                 onToggle = onToggleSenderImages,
             )
         }
+
+        item { SettingsSectionLabel(tr("settings.sections.sideNav")) }
         item {
-            SettingsRow(
-                icon = Icons.Filled.FormatSize,
-                title = tr("settings.appearance.messageTextSize"),
-                onClick = onOpenMessageTextSize,
-                trailing = {
-                    Text(
-                        trf("settings.appearance.textSizeValue", messageFontScale),
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                },
+            SettingsToggleRow(
+                icon = Icons.Filled.Inbox,
+                title = tr("settings.sideNav.showUnifiedInbox"),
+                checked = showUnifiedInboxNav,
+                onToggle = onToggleUnifiedInboxNav,
             )
         }
         item {
@@ -789,14 +881,22 @@ internal fun SettingsGeneralPage(
                 onToggle = onToggleUnreadBadges,
             )
         }
-
-        item { SettingsSectionLabel(tr("settings.sections.sideNav")) }
         item {
             SettingsToggleRow(
-                icon = Icons.Filled.Inbox,
-                title = tr("settings.sideNav.showUnifiedInbox"),
-                checked = showUnifiedInboxNav,
-                onToggle = onToggleUnifiedInboxNav,
+                icon = Icons.Filled.Checklist,
+                title = tr("settings.tasks.enable"),
+                hint = tr("settings.tasks.enableHint"),
+                checked = tasksEnabled,
+                onToggle = onToggleTasks,
+            )
+        }
+        item {
+            SettingsToggleRow(
+                icon = Icons.Filled.Event,
+                title = tr("settings.calendar.enable"),
+                hint = tr("settings.calendar.enableHint"),
+                checked = calendarEnabled,
+                onToggle = onToggleCalendar,
             )
         }
 
@@ -807,44 +907,6 @@ internal fun SettingsGeneralPage(
                 title = tr("settings.kanban.columnWidth"),
                 onClick = onCycleKanbanColumnWidth,
                 trailing = { Text(trf("settings.kanban.columnWidthValue", kanbanColumnWidth), color = MaterialTheme.colorScheme.primary) },
-            )
-        }
-
-        item { SettingsSectionLabel(tr("settings.sections.composer")) }
-        item {
-            SettingsRow(
-                icon = Icons.AutoMirrored.Filled.Send,
-                title = tr("settings.composer.sendMessageWith"),
-                onClick = onToggleSendShortcut,
-                trailing = { Text(sendShortcutMode.label(), color = MaterialTheme.colorScheme.primary) },
-            )
-        }
-
-        item { SettingsSectionLabel(tr("settings.sections.signature")) }
-        item {
-            SettingsSignatureRow(
-                html = appSignatureHtml,
-                onSave = onSaveAppSignature,
-            )
-        }
-
-        item { SettingsSectionLabel(tr("settings.sections.privacy")) }
-        item {
-            SettingsRow(
-                icon = Icons.Filled.HideImage,
-                title = tr("settings.privacy.remoteSenders"),
-                hint = tr("settings.privacy.remoteSendersHint"),
-                onClick = onOpenRemoteSenders,
-                trailing = {
-                    Text(
-                        if (remoteImageSenderCount == 0) {
-                            tr("settings.privacy.remoteSendersNone")
-                        } else {
-                            tr("settings.privacy.remoteSendersCount", mapOf("count" to remoteImageSenderCount))
-                        },
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                },
             )
         }
 
@@ -925,7 +987,7 @@ internal fun SettingsGeneralPage(
             )
         }
 
-        item { SettingsSectionLabel(tr("settings.sections.backup")) }
+        item { SettingsSectionLabel(tr("settings.sections.data")) }
         item {
             SettingsRow(
                 icon = Icons.Filled.Save,
@@ -942,8 +1004,6 @@ internal fun SettingsGeneralPage(
                 onClick = { if (!backupBusy) onRestoreBackup() },
             )
         }
-
-        item { SettingsSectionLabel(tr("settings.sections.storage")) }
         item {
             SettingsRow(
                 icon = Icons.Filled.Info,
@@ -966,6 +1026,158 @@ internal fun SettingsGeneralPage(
                 subtitle = if (storageBusy) tr("settings.storage.working") else tr("settings.storage.clearCachedAttachmentsOnly"),
                 onClick = onClearStorageCache,
                 trailing = storageUsage?.cacheBytes?.takeIf { it > 0 }?.let { { Text(formatBytes(it)) } },
+            )
+        }
+
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+// How received mail is shown and handled.
+@Composable
+internal fun SettingsMessagesPage(
+    conversationLayout: ConversationLayout,
+    onToggleConversationLayout: () -> Unit,
+    messageFontScale: Int,
+    onOpenMessageTextSize: () -> Unit,
+    darkMailBodies: Boolean,
+    onToggleDarkMailBodies: () -> Unit,
+    chatFullMessages: Boolean,
+    onToggleChatFullMessages: () -> Unit,
+    autoFitMessages: Boolean,
+    onToggleAutoFitMessages: () -> Unit,
+    readerBottomActions: Boolean,
+    onToggleReaderBottomActions: () -> Unit,
+    remoteImageSenderCount: Int,
+    onOpenRemoteSenders: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+    LazyColumn(modifier.appScrollbar(listState), state = listState) {
+        item { SettingsSectionLabel(tr("settings.pages.appearance")) }
+        item {
+            SettingsRow(
+                icon = Icons.AutoMirrored.Filled.Chat,
+                title = tr("settings.appearance.conversationLayout"),
+                hint = tr("settings.appearance.conversationLayoutHint"),
+                onClick = onToggleConversationLayout,
+                trailing = { Text(conversationLayout.label(), color = MaterialTheme.colorScheme.primary) },
+            )
+        }
+        if (conversationLayout == ConversationLayout.Chat) {
+            item {
+                SettingsToggleRow(
+                    icon = Icons.Filled.UnfoldMore,
+                    title = tr("settings.appearance.chatFullMessages"),
+                    hint = tr("settings.appearance.chatFullMessagesHint"),
+                    checked = chatFullMessages,
+                    onToggle = onToggleChatFullMessages,
+                )
+            }
+        }
+        item {
+            SettingsRow(
+                icon = Icons.Filled.FormatSize,
+                title = tr("settings.appearance.messageTextSize"),
+                onClick = onOpenMessageTextSize,
+                trailing = {
+                    Text(
+                        trf("settings.appearance.textSizeValue", messageFontScale),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                },
+            )
+        }
+        item {
+            SettingsToggleRow(
+                icon = Icons.Filled.DarkMode,
+                title = tr("settings.appearance.darkMessageBodies"),
+                hint = tr("settings.appearance.darkMessageBodiesHint"),
+                checked = darkMailBodies,
+                onToggle = onToggleDarkMailBodies,
+            )
+        }
+        if (MailWebViewFitsWideContent) {
+            item {
+                SettingsToggleRow(
+                    icon = Icons.Filled.FitScreen,
+                    title = tr("settings.appearance.autoFitMessages"),
+                    hint = tr("settings.appearance.autoFitMessagesHint"),
+                    checked = autoFitMessages,
+                    onToggle = onToggleAutoFitMessages,
+                )
+            }
+        }
+        item {
+            SettingsToggleRow(
+                icon = Icons.AutoMirrored.Filled.Reply,
+                title = tr("settings.appearance.readerBottomActions"),
+                hint = tr("settings.appearance.readerBottomActionsHint"),
+                checked = readerBottomActions,
+                onToggle = onToggleReaderBottomActions,
+            )
+        }
+
+        item { SettingsSectionLabel(tr("settings.sections.privacy")) }
+        item {
+            SettingsRow(
+                icon = Icons.Filled.HideImage,
+                title = tr("settings.privacy.remoteSenders"),
+                hint = tr("settings.privacy.remoteSendersHint"),
+                onClick = onOpenRemoteSenders,
+                trailing = {
+                    Text(
+                        if (remoteImageSenderCount == 0) {
+                            tr("settings.privacy.remoteSendersNone")
+                        } else {
+                            tr("settings.privacy.remoteSendersCount", mapOf("count" to remoteImageSenderCount))
+                        },
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                },
+            )
+        }
+
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+@Composable
+internal fun SettingsComposerPage(
+    sendShortcutMode: SendShortcutMode,
+    onToggleSendShortcut: () -> Unit,
+    quoteReplies: Boolean,
+    onToggleQuoteReplies: () -> Unit,
+    appSignatureHtml: String,
+    onSaveAppSignature: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberLazyListState()
+    LazyColumn(modifier.appScrollbar(listState), state = listState) {
+        item { SettingsSectionLabel(tr("settings.sections.general")) }
+        item {
+            SettingsRow(
+                icon = Icons.AutoMirrored.Filled.Send,
+                title = tr("settings.composer.sendMessageWith"),
+                onClick = onToggleSendShortcut,
+                trailing = { Text(sendShortcutMode.label(), color = MaterialTheme.colorScheme.primary) },
+            )
+        }
+        item {
+            SettingsToggleRow(
+                icon = Icons.Filled.FormatQuote,
+                title = tr("settings.composer.quoteReplies"),
+                hint = tr("settings.composer.quoteRepliesHint"),
+                checked = quoteReplies,
+                onToggle = onToggleQuoteReplies,
+            )
+        }
+
+        item { SettingsSectionLabel(tr("settings.sections.signature")) }
+        item {
+            SettingsSignatureRow(
+                html = appSignatureHtml,
+                onSave = onSaveAppSignature,
             )
         }
 
@@ -1160,13 +1372,15 @@ private fun settingsSwitchColors() =
         val isDark = background.luminance() < 0.5f
         val uncheckedTrack = if (isDark) Color(0xFF475569) else Color(0xFFCBD5E1)
         val uncheckedThumb = if (isDark) Color(0xFFE2E8F0) else Color.White
+        // White is unreadable on a light primary, as in a dynamic dark scheme.
+        val checkedThumb = if (primary.luminance() > 0.4f) onPrimary else Color.White
         SwitchDefaults.colors(
-            checkedThumbColor = Color.White,
+            checkedThumbColor = checkedThumb,
             checkedTrackColor = primary,
             uncheckedThumbColor = uncheckedThumb,
             uncheckedTrackColor = uncheckedTrack,
             uncheckedBorderColor = outline,
-            disabledCheckedThumbColor = Color.White.copy(alpha = 0.38f),
+            disabledCheckedThumbColor = checkedThumb.copy(alpha = 0.38f),
             disabledCheckedTrackColor = primary.copy(alpha = 0.38f),
             disabledUncheckedThumbColor = uncheckedThumb.copy(alpha = 0.55f),
             disabledUncheckedTrackColor = uncheckedTrack.copy(alpha = 0.38f),

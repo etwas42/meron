@@ -291,6 +291,9 @@ internal fun ComposeScreen(
     onSubjectChange: (String) -> Unit,
     body: String,
     onBodyChange: (String) -> Unit,
+    hasFoldedQuote: Boolean,
+    onExpandQuote: () -> Unit,
+    onRemoveQuote: () -> Unit,
     attachments: List<DraftAttachment>,
     recipientSuggestionField: String,
     recipientSuggestions: List<ContactSuggestion>,
@@ -439,11 +442,17 @@ internal fun ComposeScreen(
         ) {
             val optionalFieldsHeight = (if (sendIdentities.size > 1) 56 else 0) + (if (showCcBcc) 128 else 0)
             val attachmentHeight = attachments.size * 36 + if (attachments.isNotEmpty()) 44 else 0
+            // With a folded quote the body only grows with what is typed, so the
+            // quote's dots sit right under the text rather than below an empty box.
             val bodyMinHeight =
-                max(
-                    280f,
-                    maxHeight.value - optionalFieldsHeight - attachmentHeight - 220f,
-                ).dp
+                if (hasFoldedQuote) {
+                    96.dp
+                } else {
+                    max(
+                        280f,
+                        maxHeight.value - optionalFieldsHeight - attachmentHeight - 220f,
+                    ).dp
+                }
             val bodyScrollState = rememberScrollState()
             Column(
                 Modifier
@@ -550,6 +559,9 @@ internal fun ComposeScreen(
                                 }
                             },
                 )
+                if (hasFoldedQuote) {
+                    FoldedQuoteChip(onExpand = onExpandQuote, onRemove = onRemoveQuote)
+                }
                 if (attachments.isNotEmpty()) {
                     Column(
                         modifier =
@@ -1137,7 +1149,7 @@ internal fun ComposeField(
                 ) {
                     Icon(
                         Icons.Filled.ContentPaste,
-                        contentDescription = "Paste",
+                        contentDescription = tr("common.paste"),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -1211,6 +1223,41 @@ internal fun ComposeField(
             HorizontalDivider(
                 color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f),
                 thickness = 0.5.dp,
+            )
+        }
+    }
+}
+
+// The quote of the message being answered, folded away under the body: a tap on
+// the dots unfolds it into the body, a long press offers to drop it instead.
+@Composable
+private fun FoldedQuoteChip(
+    onExpand: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box(Modifier.padding(horizontal = 16.dp)) {
+        QuoteToggle(
+            open = false,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            onToggle = onExpand,
+            onLongClick = { menuOpen = true },
+        )
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text(tr("chat.showQuotedText")) },
+                onClick = {
+                    menuOpen = false
+                    onExpand()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text(tr("composer.removeQuotedText"), color = MaterialTheme.colorScheme.error) },
+                leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                onClick = {
+                    menuOpen = false
+                    onRemove()
+                },
             )
         }
     }

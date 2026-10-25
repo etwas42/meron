@@ -12,21 +12,25 @@ pub(crate) use std::time::{SystemTime, UNIX_EPOCH};
 
 mod accounts;
 mod backup;
+mod calendar;
 mod feeds;
 mod helpers;
 mod mail;
 mod media;
 mod oauth;
 mod prefs;
+mod tasks;
 
 pub(crate) use accounts::*;
 pub(crate) use backup::*;
+pub(crate) use calendar::*;
 pub(crate) use feeds::*;
 pub(crate) use helpers::*;
 pub(crate) use mail::*;
 pub(crate) use media::*;
 pub(crate) use oauth::*;
 pub(crate) use prefs::*;
+pub(crate) use tasks::*;
 
 #[cfg(test)]
 mod tests;
@@ -98,6 +102,7 @@ pub fn dispatch_protocol_request(req: &Request) -> Result<Value, String> {
         "mail.folderList" => Ok(json!({ "folders": [] })),
         "mail.folderCreate" => Ok(json!({ "folders": [] })),
         "mail.folderDelete" => Ok(json!({ "ok": true, "deleted": 0, "folders": [] })),
+        "mail.folderSetNotify" => Ok(json!({ "folders": [] })),
         "mail.threadList" => Ok(json!({ "threads": [] })),
         "mail.threadRead" => Ok(json!({ "messages": [] })),
         "mail.attachmentRead" | "mail.readAttachment" => Ok(json!({ "data": "" })),
@@ -106,6 +111,7 @@ pub fn dispatch_protocol_request(req: &Request) -> Result<Value, String> {
         "mail.starredItems" => Ok(json!({ "items": [] })),
         "mail.allocateIdentity" => Ok(json!({ "message_id": "" })),
         "mail.send" => Ok(json!({ "ok": true })),
+        "invite.respond" => Ok(json!({ "ok": true })),
         "mail.saveDraft" => Ok(json!({ "ok": true })),
         "mail.discardDraft" => Ok(json!({ "ok": true, "deleted": 0, "permanent": true })),
         "mail.archive" => Ok(json!({ "ok": true, "moved": 0 })),
@@ -119,12 +125,22 @@ pub fn dispatch_protocol_request(req: &Request) -> Result<Value, String> {
         "rss.thread" => Ok(json!({ "messages": [] })),
         "rss.markRead" => Ok(json!({ "ok": true })),
         "rss.markStarred" => Ok(json!({ "ok": true })),
-        method => Err(format!("unknown method: {method}")),
+        method => match stub_mobile_tasks(method).or_else(|| stub_mobile_calendar(method)) {
+            Some(value) => Ok(value),
+            None => Err(format!("unknown method: {method}")),
+        },
     }
 }
 
 pub fn dispatch_mobile_protocol_request(req: &Request, data_dir: &str) -> Result<Value, String> {
     match req.method.as_str() {
+        "search.parse" | "search.build" => {
+            crate::search_query::handle_request(&req.method, &req.params)
+                .ok_or_else(|| format!("bad {} request", req.method))
+        }
+        "avatar.resolve" => {
+            serde_json::to_value(crate::avatar::resolve(&req.params)).map_err(|err| err.to_string())
+        }
         "changelog.fetch" => {
             let variant = crate::changelog::Variant::parse(
                 req.params
@@ -186,6 +202,7 @@ pub fn dispatch_mobile_protocol_request(req: &Request, data_dir: &str) -> Result
         "mail.folderList" => list_mobile_folders(data_dir, &req.params),
         "mail.folderCreate" => create_mobile_folder(data_dir, &req.params),
         "mail.folderDelete" => delete_mobile_folder(data_dir, &req.params),
+        "mail.folderSetNotify" => set_mobile_folder_notify(data_dir, &req.params),
         "mail.threadList" => list_mobile_threads(data_dir, &req.params),
         "mail.threadRead" => read_mobile_thread(data_dir, &req.params),
         "mail.attachmentRead" | "mail.readAttachment" => {
@@ -209,6 +226,7 @@ pub fn dispatch_mobile_protocol_request(req: &Request, data_dir: &str) -> Result
         }
         "mail.sync" | "messages.sync" => sync_mobile_mail(data_dir, &req.params),
         "mail.send" => send_mobile_message(data_dir, &req.params),
+        "invite.respond" => respond_mobile_invite(data_dir, &req.params),
         "mail.saveDraft" => save_mobile_draft(data_dir, &req.params),
         "mail.discardDraft" => discard_mobile_draft(data_dir, &req.params),
         "mail.archive" => archive_mobile_thread(data_dir, &req.params),
@@ -223,7 +241,12 @@ pub fn dispatch_mobile_protocol_request(req: &Request, data_dir: &str) -> Result
         "rss.thread" => read_mobile_rss_thread(data_dir, &req.params),
         "rss.markRead" => mark_mobile_rss_thread_read(data_dir, &req.params),
         "rss.markStarred" => mark_mobile_rss_thread_starred(data_dir, &req.params),
-        _ => dispatch_protocol_request(req),
+        method => match dispatch_mobile_tasks(data_dir, method, &req.params)
+            .or_else(|| dispatch_mobile_calendar(data_dir, method, &req.params))
+        {
+            Some(result) => result,
+            None => dispatch_protocol_request(req),
+        },
     }
 }
 

@@ -11,3 +11,12 @@ export function openExternal(url: string) {
     window.open(url, '_blank', 'noreferrer')
   }
 }
+
+// Put text on the system clipboard. navigator.clipboard rejects when the top
+// document isn't focused — e.g. a link right-clicked inside a message iframe
+// keeps focus in that frame — so prefer the runtime's native clipboard.
+export async function copyText(text: string) {
+  const set = (window as any).runtime?.ClipboardSetText
+  if (set && (await set(text).catch(() => false))) return
+  await navigator.clipboard?.writeText(text)
+}

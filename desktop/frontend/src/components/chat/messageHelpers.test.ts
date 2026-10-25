@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:test'
+import { Calendar, Contact, File, FileImage, FileKey, FileText, Mail } from 'lucide-react'
 import {
   bodyContentKey,
   extractAddr,
+  fileIconFor,
   formatFileSize,
   formatMessageStamp,
   formatRecipientSummary,
@@ -11,11 +13,14 @@ import {
   htmlReferencesMedia,
   isImage,
   isVideo,
+  mediaFilename,
+  mediaKeyFromSrc,
   mediaSrc,
   messageSearchText,
   normalizeBodyText,
   normalizeUrl,
   readerAttachmentImages,
+  readerAttachmentVideos,
   parseAddressList,
   parseInlineMessageContent,
   standaloneAttachmentImages,
@@ -257,5 +262,71 @@ describe('readerAttachmentImages', () => {
   it('skips images the body already renders', () => {
     const html = '<img src="/media/inline.png">'
     expect(readerAttachmentImages(attachments, html, true).map((a) => a.filename)).toEqual(['pasted.png', 'pixel.png'])
+  })
+})
+
+describe('readerAttachmentVideos', () => {
+  const attachments = [
+    { key: 'clip.mp4', mime: 'video/mp4', filename: 'clip.mp4' },
+    { url: 'https://cdn.example/remote.mp4?a=1&b=2', mime: 'video/mp4', filename: 'remote.mp4' },
+    { key: 'image.png', mime: 'image/png', filename: 'image.png' },
+    { mime: 'video/mp4', filename: 'missing.mp4' },
+  ] as any[]
+
+  it('gates remote videos while allowing cached clips', () => {
+    expect(readerAttachmentVideos(attachments, undefined, false).map((a) => a.filename)).toEqual(['clip.mp4'])
+    expect(readerAttachmentVideos(attachments, undefined, true).map((a) => a.filename)).toEqual([
+      'clip.mp4',
+      'remote.mp4',
+    ])
+  })
+
+  it('avoids duplicating videos already in the HTML', () => {
+    const html = '<video src="https://cdn.example/remote.mp4?a=1&amp;b=2"></video>'
+    expect(readerAttachmentVideos(attachments, html, true).map((a) => a.filename)).toEqual(['clip.mp4'])
+  })
+})
+
+describe('fileIconFor', () => {
+  it('names invites, contact cards, forwarded mail and signatures by extension', () => {
+    expect(fileIconFor('invite.ics', '')).toBe(Calendar)
+    expect(fileIconFor('Dana Evans.vcf', '')).toBe(Contact)
+    expect(fileIconFor('Fwd.eml', '')).toBe(Mail)
+    expect(fileIconFor('smime.p7s', '')).toBe(FileKey)
+    expect(fileIconFor('IMG_0001.HEIC', '')).toBe(FileImage)
+  })
+
+  it('checks specific text types before the text/ catch-all', () => {
+    expect(fileIconFor('invite', 'text/calendar; method=REQUEST')).toBe(Calendar)
+    expect(fileIconFor('card', 'text/x-vcard')).toBe(Contact)
+    expect(fileIconFor('notes', 'text/plain')).toBe(FileText)
+    expect(fileIconFor('forwarded', 'message/rfc822')).toBe(Mail)
+  })
+
+  it('falls back to a generic file, and ignores a name with no extension', () => {
+    expect(fileIconFor('mystery.bin', 'application/octet-stream')).toBe(File)
+    expect(fileIconFor('ics', 'application/octet-stream')).toBe(File)
+  })
+})
+
+describe('mediaKeyFromSrc', () => {
+  it('reads the key from a relative or same-origin media src', () => {
+    expect(mediaKeyFromSrc('/media/a%20b/0.png')).toBe('a b/0.png')
+    expect(mediaKeyFromSrc(`${window.location.origin}/media/msg/1.jpg`)).toBe('msg/1.jpg')
+  })
+
+  it('ignores remote and other sources', () => {
+    expect(mediaKeyFromSrc('https://example.com/media/x.png')).toBeNull()
+    expect(mediaKeyFromSrc(`${window.location.origin}/other/x.png`)).toBeNull()
+    expect(mediaKeyFromSrc('data:image/png;base64,AAAA')).toBeNull()
+    expect(mediaKeyFromSrc('not a url')).toBeNull()
+  })
+})
+
+describe('mediaFilename', () => {
+  it("prefers the attachment's name, else the key's file name", () => {
+    const attachments = [{ filename: 'photo.png', mime: 'image/png', size: 1, key: 'msg/0.png' }]
+    expect(mediaFilename('msg/0.png', attachments)).toBe('photo.png')
+    expect(mediaFilename('msg/1.jpg', attachments)).toBe('1.jpg')
   })
 })

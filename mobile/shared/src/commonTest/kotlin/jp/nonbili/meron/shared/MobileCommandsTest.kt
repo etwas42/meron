@@ -9,6 +9,16 @@ import kotlin.test.assertTrue
 
 class MobileCommandsTest {
     @Test
+    fun senderImagesUseSharedCoreResolution() {
+        val core = FakeMeronCore("""{"src":"data:image/png;base64,aGVsbG8=","kind":"favicon"}""")
+        val result = runSuspend { MobileMailCommandClient(core).resolveSenderImage("em@em1.cloudflare.com") }
+        assertEquals("avatar.resolve", core.lastCommand)
+        assertEquals("""{"email":"em@em1.cloudflare.com","size":96}""", core.lastPayloadJson)
+        assertEquals("data:image/png;base64,aGVsbG8=", parseSenderImageResponse(result))
+        assertEquals("", parseSenderImageResponse("""{"src":"","kind":""}"""))
+    }
+
+    @Test
     fun starredAndIdentityCommandsCarryCoreOwnedQueryAndLifecycle() {
         val core = FakeMeronCore("{}")
         val client = MobileMailCommandClient(core)
@@ -17,7 +27,7 @@ class MobileCommandsTest {
         }
         assertEquals(MobileCommand.StarredItems, core.lastCommand)
         assertEquals(
-            """{"query":"design","filter":"unread","limit":25,"before_cursor":"starred:opaque"}""",
+            """{"query":"design","filter":"unread","attachments":false,"limit":25,"before_cursor":"starred:opaque"}""",
             core.lastPayloadJson,
         )
 
@@ -428,6 +438,139 @@ class MobileCommandsTest {
     }
 
     @Test
+    fun taskClientMethodsUseSharedCoreCommandNames() {
+        val core = FakeMeronCore("""{"ok":true}""")
+        val client = MobileMailCommandClient(core)
+
+        runSuspend { client.taskLists() }
+        assertEquals(MobileCommand.TaskLists, core.lastCommand)
+
+        runSuspend { client.taskItems(TaskItemsParams(listId = "list-1", includeCompleted = true)) }
+        assertEquals(MobileCommand.TaskItems, core.lastCommand)
+        assertEquals("""{"list_id":"list-1","include_completed":true}""", core.lastPayloadJson)
+
+        runSuspend {
+            client.createTask(
+                TaskCreateParams(
+                    listId = "list-1",
+                    title = "Book the flight",
+                    notes = "window seat",
+                    dueAt = 1_700_000_000,
+                ),
+            )
+        }
+        assertEquals(MobileCommand.TaskCreate, core.lastCommand)
+        assertEquals(
+            """{"list_id":"list-1","title":"Book the flight","notes":"window seat","due_at":1700000000,"account":"","thread_id":"","message_id":""}""",
+            core.lastPayloadJson,
+        )
+
+        runSuspend { client.setTaskDone(TaskSetDoneParams(taskId = "task-1", done = true)) }
+        assertEquals(MobileCommand.TaskSetDone, core.lastCommand)
+        assertEquals("""{"task_id":"task-1","done":true}""", core.lastPayloadJson)
+
+        runSuspend { client.reorderTasks(TaskReorderParams(listId = "list-1", taskIds = listOf("b", "a"))) }
+        assertEquals(MobileCommand.TaskReorder, core.lastCommand)
+        assertEquals("""{"list_id":"list-1","task_ids":["b","a"]}""", core.lastPayloadJson)
+
+        runSuspend { client.clearCompletedTasks(TaskClearCompletedParams(listId = "list-1")) }
+        assertEquals(MobileCommand.TaskClearCompleted, core.lastCommand)
+        assertEquals("""{"list_id":"list-1"}""", core.lastPayloadJson)
+    }
+
+    @Test
+    fun threadTasksAsksForTheThreadsTasks() {
+        val core = FakeMeronCore("""{"tasks":[]}""")
+        val client = MobileMailCommandClient(core)
+        runSuspend { client.threadTasks(TaskForThreadParams("acct#INBOX#t1")) }
+        assertEquals(MobileCommand.TaskForThread, core.lastCommand)
+        assertEquals("""{"thread_id":"acct#INBOX#t1"}""", core.lastPayloadJson)
+    }
+
+    /**
+     * The restore blob travels from the delete response back to the core
+     * untouched — parsing and rebuilding it would be a chance to lose a field.
+     */
+    @Test
+    fun undoHandsTheRestoreBlobBackVerbatim() {
+        val deleteResponse =
+            """{"id":1,"result":{"ok":true,"restore":{"tasks":[{"id":"task-1","list_id":"list-1","title":"Reply"}]}}}"""
+        val restore = parseTaskRestorePayload(deleteResponse)
+        assertEquals("""{"tasks":[{"id":"task-1","list_id":"list-1","title":"Reply"}]}""", restore)
+
+        val core = FakeMeronCore("""{"ok":true}""")
+        val client = MobileMailCommandClient(core)
+        runSuspend { client.restoreTasks(TaskRestoreParams(restore!!)) }
+        assertEquals(MobileCommand.TaskRestore, core.lastCommand)
+        assertEquals("""{"restore":$restore}""", core.lastPayloadJson)
+    }
+
+    /** A delete with nothing to put back must not offer an Undo that no-ops. */
+    @Test
+    fun aDeleteWithNothingToRestoreReportsNoPayload() {
+        assertEquals(null, parseTaskRestorePayload("""{"id":1,"result":{"ok":true}}"""))
+        assertEquals(null, parseTaskRestorePayload("""{"id":1,"result":{"ok":true,"restore":null}}"""))
+    }
+
+    /** A null field is "leave it alone", so it must not reach the core at all. */
+    @Test
+    fun taskUpdateOmitsTheFieldsItIsNotChanging() {
+        val core = FakeMeronCore("""{"ok":true}""")
+        val client = MobileMailCommandClient(core)
+
+        runSuspend { client.updateTask(TaskUpdateParams(taskId = "task-1", title = "Pay the rent")) }
+        assertEquals(MobileCommand.TaskUpdate, core.lastCommand)
+        assertEquals("""{"task_id":"task-1","title":"Pay the rent"}""", core.lastPayloadJson)
+
+        runSuspend { client.updateTask(TaskUpdateParams(taskId = "task-1", dueAt = 0)) }
+        assertEquals("""{"task_id":"task-1","due_at":0}""", core.lastPayloadJson)
+    }
+
+    /** Adding a message to Tasks has no list to name; the core picks the default. */
+    @Test
+    fun taskCreatedFromAMessageCarriesItsThreadAndNoList() {
+        val core = FakeMeronCore("""{"ok":true}""")
+        val client = MobileMailCommandClient(core)
+
+        runSuspend {
+            client.createTask(
+                TaskCreateParams(
+                    title = "Boiler repair",
+                    account = "acct1",
+                    threadId = "acct1#thread#4",
+                    messageId = "<boiler@example.com>",
+                ),
+            )
+        }
+        assertEquals(
+            """{"list_id":"","title":"Boiler repair","notes":"","due_at":0,"account":"acct1","thread_id":"acct1#thread#4","message_id":"<boiler@example.com>"}""",
+            core.lastPayloadJson,
+        )
+    }
+
+    @Test
+    fun taskResponsesParseIntoTypedSummaries() {
+        val listsJson =
+            """{"lists":[{"id":"list-1","title":"My Tasks"},{"id":"list-2","title":"Groceries"}],"default_list_id":"list-1"}"""
+        val lists = parseTaskListsResponse(listsJson)
+        assertEquals(listOf("list-1", "list-2"), lists.lists.map { it.id })
+        assertEquals("My Tasks", lists.lists.first().title)
+        assertEquals("list-1", lists.defaultListId)
+
+        val tasksJson =
+            """{"list_id":"list-1","tasks":[{"id":"task-1","list_id":"list-1","title":"Reply","notes":"n","due_at":1700000000,"completed_at":0,"done":false,"account":"acct1","thread_id":"acct1#thread#4","message_id":"<m@example.com>"}]}"""
+        val tasks = parseTasksResponse(tasksJson)
+        assertEquals(1, tasks.size)
+        assertEquals("Reply", tasks.first().title)
+        assertEquals(1_700_000_000, tasks.first().dueAt)
+        assertEquals(false, tasks.first().done)
+        assertEquals("acct1#thread#4", tasks.first().threadId)
+
+        assertEquals(2, parseClearedTaskCount("""{"ok":true,"removed":2}"""))
+        assertEquals(0, parseClearedTaskCount("""{"ok":true}"""))
+    }
+
+    @Test
     fun rssClientMethodsUseSharedCoreCommandNames() {
         val core = FakeMeronCore("""{"ok":true}""")
         val client = MobileMailCommandClient(core)
@@ -552,13 +695,17 @@ class MobileCommandsTest {
         assertEquals(MobileCommand.FolderDelete, core.lastCommand)
         assertEquals("""{"account_id":"acc1","folder_id":"Work"}""", core.lastPayloadJson)
 
+        runSuspend { client.setFolderNotify(FolderSetNotifyParams(accountId = "acc1", folderId = "Work", enabled = true)) }
+        assertEquals(MobileCommand.FolderSetNotify, core.lastCommand)
+        assertEquals("""{"account_id":"acc1","folder_id":"Work","enabled":true}""", core.lastPayloadJson)
+
         runSuspend { client.listThreads(ThreadListParams(accountId = "acc1")) }
         assertEquals(MobileCommand.ThreadList, core.lastCommand)
-        assertEquals("""{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","refresh":false}""", core.lastPayloadJson)
+        assertEquals("""{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","attachments":false,"refresh":false}""", core.lastPayloadJson)
 
         runSuspend { client.listStarredItems() }
         assertEquals(MobileCommand.StarredItems, core.lastCommand)
-        assertEquals("""{"query":"","filter":"all","limit":50}""", core.lastPayloadJson)
+        assertEquals("""{"query":"","filter":"all","attachments":false,"limit":50}""", core.lastPayloadJson)
 
         runSuspend { client.readThread(ThreadReadParams(threadId = "thread1")) }
         assertEquals(MobileCommand.ThreadRead, core.lastCommand)
@@ -596,6 +743,10 @@ class MobileCommandsTest {
         assertEquals(MobileCommand.Move, core.lastCommand)
         assertEquals("""{"thread_id":"thread1","target_folder_id":"Work"}""", core.lastPayloadJson)
 
+        runSuspend { client.move(MoveThreadParams(threadId = "thread1", targetFolderId = "INBOX", targetAccountId = "acc2")) }
+        assertEquals(MobileCommand.Move, core.lastCommand)
+        assertEquals("""{"thread_id":"thread1","target_folder_id":"INBOX","target_account_id":"acc2"}""", core.lastPayloadJson)
+
         runSuspend { client.copy(CopyThreadParams(threadId = "thread1", targetAccountId = "acc2", targetFolderId = "Archive")) }
         assertEquals(MobileCommand.Copy, core.lastCommand)
         assertEquals("""{"thread_id":"thread1","target_account_id":"acc2","target_folder_id":"Archive"}""", core.lastPayloadJson)
@@ -632,13 +783,14 @@ class MobileCommandsTest {
                         folderId = "inbox",
                         query = "design",
                         filter = "unread",
+                        attachments = true,
                         beforeCursor = "1700000000:44",
                         refresh = true,
                     ),
             )
 
         assertEquals(
-            """{"id":4,"method":"mail.threadList","params":{"account_id":"acc1","folder_id":"inbox","query":"design","filter":"unread","before_cursor":"1700000000:44","refresh":true}}""",
+            """{"id":4,"method":"mail.threadList","params":{"account_id":"acc1","folder_id":"inbox","query":"design","filter":"unread","attachments":true,"before_cursor":"1700000000:44","refresh":true}}""",
             request.toJson(),
         )
     }
@@ -648,11 +800,11 @@ class MobileCommandsTest {
     @Test
     fun threadListSendsLimitOnlyWhenSet() {
         assertEquals(
-            """{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","refresh":false,"limit":150}""",
+            """{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","attachments":false,"refresh":false,"limit":150}""",
             ThreadListParams(accountId = "acc1", limit = 150).toJson(),
         )
         assertEquals(
-            """{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","refresh":false}""",
+            """{"account_id":"acc1","folder_id":"inbox","query":"","filter":"all","attachments":false,"refresh":false}""",
             ThreadListParams(accountId = "acc1").toJson(),
         )
     }
@@ -1206,6 +1358,76 @@ class MobileCommandsTest {
     }
 
     @Test
+    fun replyQuoteQuotesThePlainBodyUnderAnAttribution() {
+        val message = MessageBody(id = "m", from = "Jane", fromAddr = "jane@example.com", to = "", subject = "Hi", body = "Lunch?\n\nJane\n")
+
+        assertEquals("On Mon, Jane <jane@example.com> wrote:", replyQuoteAttribution(message, "Mon"))
+        assertEquals("\n\nOn Mon, Jane <jane@example.com> wrote:\n> Lunch?\n>\n> Jane", replyQuotedPlainBody(message, "Mon"))
+        // A text-only original stays a text-only reply.
+        assertEquals("", replyQuotedHtmlBody(message, "Mon"))
+        assertEquals("On Mon, jane@example.com wrote:", replyQuoteAttribution(message.copy(from = ""), "Mon"))
+    }
+
+    @Test
+    fun replyQuoteCitesAnHtmlOriginalAndRebuildsItsInlineImages() {
+        val image = MessageAttachment(filename = "a.png", mimeType = "image/png", key = "acct/1/0.png")
+        val message =
+            MessageBody(
+                id = "m",
+                from = "Jane",
+                fromAddr = "jane@example.com",
+                to = "",
+                subject = "Hi",
+                body = "Lunch?",
+                bodyHtml = "<p>Lunch? <img src=\"/media/acct/1/0.png\"></p>",
+                attachments = listOf(image),
+            )
+
+        assertEquals(
+            "<p>On Mon, Jane &lt;jane@example.com&gt; wrote:</p><blockquote type=\"cite\"><p>Lunch? <img src=\"cid:meron-forward-0@meron\"></p></blockquote>",
+            replyQuotedHtmlBody(message, "Mon", forwardInlineImages(message)),
+        )
+        // An image whose bytes could not be read never points at this device.
+        assertTrue(!replyQuotedHtmlBody(message, "Mon").contains("/media/"))
+    }
+
+    @Test
+    fun withReplyQuoteAppendsTheQuoteToTheSentReply() {
+        val params = SendMailParams(accountId = "a", to = "jane@example.com", subject = "Re: Hi", body = "Sounds good")
+        val quote = "\n\nOn Mon, Jane wrote:\n> Lunch?"
+
+        val plain = params.withReplyQuote(quote, "", "On Mon, Jane wrote:")
+        assertEquals("Sounds good\n\nOn Mon, Jane wrote:\n> Lunch?", plain.body)
+        assertEquals("", plain.html)
+
+        val inline = DraftAttachment(id = "i", displayName = "a.png", mimeType = "image/png", dataBase64 = "AA==", inlineId = "meron-forward-0@meron")
+        val rich = params.withReplyQuote(quote, "<p>On Mon, Jane wrote:</p><blockquote type=\"cite\"><p>Lunch?</p></blockquote>", "On Mon, Jane wrote:", listOf(inline))
+        assertEquals("<p>Sounds good</p><p>On Mon, Jane wrote:</p><blockquote type=\"cite\"><p>Lunch?</p></blockquote>", rich.html)
+        assertEquals(listOf("meron-forward-0@meron"), rich.attachments.map { it.inlineId })
+
+        assertEquals("On Mon, Jane wrote:\n> Lunch?", params.copy(body = "").withReplyQuote(quote, "", "On Mon, Jane wrote:").body)
+
+        // A reopened quoted reply already carries its quote.
+        val saved = params.copy(body = "Sounds good$quote").withReplyQuote(quote, "<blockquote type=\"cite\"><p>Lunch?</p></blockquote>", "On Mon, Jane wrote:")
+        assertEquals("Sounds good$quote", saved.body)
+        assertEquals("<p>Sounds good</p><blockquote type=\"cite\"><p>Lunch?</p></blockquote>", saved.html)
+
+        // One whose quote the user trimmed goes out as they left it.
+        val trimmed = params.copy(body = "Sounds good\n\nOn Mon, Jane wrote:\n> Lun").withReplyQuote(quote, "<p>x</p>", "On Mon, Jane wrote:")
+        assertEquals("Sounds good\n\nOn Mon, Jane wrote:\n> Lun", trimmed.body)
+        assertEquals("", trimmed.html)
+    }
+
+    @Test
+    fun forwardHtmlForSendFindsAReplyQuoteByItsAttribution() {
+        val quote = "<p>On Mon, Jane wrote:</p><blockquote type=\"cite\"><p>Lunch?</p></blockquote>"
+        val body = "Sounds good\n\nOn Mon, Jane wrote:\n> Lunch?"
+
+        assertEquals("<p>Sounds good</p>$quote", forwardHtmlForSend(body, quote, "On Mon, Jane wrote:"))
+        assertEquals("", forwardHtmlForSend("Sounds good", quote, "On Mon, Jane wrote:"))
+    }
+
+    @Test
     fun forwardHtmlForSendPrependsTypedTextAndDropsHtmlWithoutQuote() {
         val quote = """<p><br></p><div class="meron-forwarded-message"><p>$FORWARD_QUOTE_MARKER</p><p>Original</p></div>"""
         val body = "See below.\n\n$FORWARD_QUOTE_MARKER\nFrom: Ada\n\nOriginal"
@@ -1339,7 +1561,7 @@ class MobileCommandsTest {
     @Test
     fun jsonBuilderEscapesPayloadStrings() {
         assertEquals(
-            """{"account_id":"a\"b","folder_id":"line\nbreak","query":"","filter":"all","refresh":false}""",
+            """{"account_id":"a\"b","folder_id":"line\nbreak","query":"","filter":"all","attachments":false,"refresh":false}""",
             ThreadListParams(accountId = "a\"b", folderId = "line\nbreak").toJson(),
         )
     }

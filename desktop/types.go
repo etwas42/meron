@@ -57,6 +57,8 @@ type Folder struct {
 	Role      string `json:"role"`
 	Delimiter string `json:"delimiter"`
 	Unread    uint32 `json:"unread"`
+	// The user opted this folder in to live sync and new-mail notifications.
+	Notify bool `json:"notify"`
 }
 
 type Message struct {
@@ -91,6 +93,8 @@ type Message struct {
 	HasDraft       bool   `json:"has_draft,omitempty"`
 	HasAttachments bool   `json:"has_attachments"`
 	Attachments    any    `json:"attachments,omitempty"`
+	// Invite is the calendar event the message carries (meron-core/src/calendar.rs).
+	Invite any `json:"invite,omitempty"`
 	// Reply carries the core's reply and reply-all recipients for this message
 	// (see meron-core/src/reply.rs), so every client addresses a reply the same
 	// way. Absent on thread cards, which have no recipient headers to work from.
@@ -103,6 +107,15 @@ type Message struct {
 	// oldest first; SendersTruncated marks senders left out after the first.
 	Senders          []ThreadSender `json:"senders,omitempty"`
 	SendersTruncated bool           `json:"senders_truncated,omitempty"`
+	// Files lists a thread card's attachments in thread order, for the chips
+	// under the row; only messages whose body is cached are known.
+	Files []ThreadFile `json:"files,omitempty"`
+}
+
+// ThreadFile is one attachment named on a thread card.
+type ThreadFile struct {
+	Filename string `json:"filename"`
+	Mime     string `json:"mime"`
 }
 
 // ThreadSender is one sender on a thread card: a short name, or Me for the
@@ -113,6 +126,7 @@ type ThreadSender struct {
 }
 
 type AddPasswordAccountRequest struct {
+	ID           string `json:"id"`
 	Email        string `json:"email"`
 	DisplayName  string `json:"display_name"`
 	SenderName   string `json:"sender_name"`
@@ -135,6 +149,7 @@ type AddPasswordAccountRequest struct {
 }
 
 type AddGmailOAuthRequest struct {
+	ID           string `json:"id"`
 	Email        string `json:"email"`
 	DisplayName  string `json:"display_name"`
 	SenderName   string `json:"sender_name"`
@@ -148,6 +163,7 @@ type AddGmailOAuthRequest struct {
 // AddOutlookOAuthRequest mirrors AddGmailOAuthRequest. AvatarURL is unused
 // (Microsoft's id_token carries no picture) but kept for shape parity.
 type AddOutlookOAuthRequest struct {
+	ID           string `json:"id"`
 	Email        string `json:"email"`
 	DisplayName  string `json:"display_name"`
 	SenderName   string `json:"sender_name"`
@@ -173,16 +189,27 @@ type FolderDeleteRequest struct {
 	FolderID  string `json:"folder_id"`
 }
 
+type FolderSetNotifyRequest struct {
+	AccountID string `json:"account_id"`
+	FolderID  string `json:"folder_id"`
+	Enabled   bool   `json:"enabled"`
+}
+
 type ThreadListRequest struct {
 	AccountID string `json:"account_id"`
 	FolderID  string `json:"folder_id"`
 	// Unified view only: the role each account answers from (its own Sent,
 	// Archive, …). Ignored for a single account, which names a real folder.
-	FolderRole   string `json:"folder_role"`
-	Query        string `json:"query"`
-	Filter       string `json:"filter"`
+	FolderRole string `json:"folder_role"`
+	Query      string `json:"query"`
+	Filter     string `json:"filter"`
+	// Attachments keeps only threads with attachments; it combines with Filter.
+	Attachments  bool   `json:"attachments"`
 	BeforeCursor string `json:"before_cursor"`
 	Refresh      bool   `json:"refresh"`
+	// Limit is the page size; a reload of a column the user has scrolled asks
+	// for every row it already shows. Zero means the default page.
+	Limit int `json:"limit"`
 }
 
 type AttachmentInput struct {

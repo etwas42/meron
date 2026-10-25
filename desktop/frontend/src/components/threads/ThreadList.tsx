@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties, DragEvent, PointerEventHandler } from 'react'
-import { Search, X, Plus, SquarePen, MoreHorizontal, Loader2 } from 'lucide-react'
+import { Plus, SquarePen, MoreHorizontal, Loader2 } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
 import { openAddFeed, RSS_FEED_DRAG_TYPE } from '../../states/feeds'
@@ -17,7 +17,15 @@ import {
   type BulkSelectionItem,
 } from '../../states/ui'
 import { thread$ } from '../../states/thread'
-import { mail$, getFilteredThreads, syncMail, loadMoreThreads, loadThreads, threadListViewKey } from '../../states/mail'
+import {
+  mail$,
+  getFilteredThreads,
+  syncMail,
+  loadMoreThreads,
+  loadThreads,
+  threadListViewKey,
+  listFilterKey,
+} from '../../states/mail'
 import { markAllRead } from '../../states/mailFlags'
 import {
   isDraftFolder,
@@ -26,18 +34,23 @@ import {
   emptyFolder,
   deletableFolder,
   deleteFolder,
+  setFolderNotify,
+  isNotifiableFolder,
+  folderMatches,
 } from '../../states/mailFolders'
-import { clsx } from '../../lib/utils'
+import { exportFolderAsEml } from '../../states/emlExport'
 import { isRssAccount } from '../../lib/threadActions'
 import { folderLabel } from '../../lib/kanbanData'
 import { isUnifiedStarred } from '../../lib/unifiedFolders'
 import { EmptyState } from '../empty-state/EmptyState'
 import { IconButton } from '../button/IconButton'
 import { QuickSettingsMenu } from '../sidenav/QuickSettingsMenu'
+import { useTitleBar } from '../titlebar/TitleBar'
 import { FolderSwitcher } from '../menu/FolderSwitcher'
 import { ThreadActionsMenu } from './ThreadActionsMenu'
 import { ThreadContextMenu, useThreadContextMenu } from './ThreadContextMenu'
 import { ThreadListItem } from './ThreadListItem'
+import { ThreadSearchInput } from './ThreadSearchInput'
 import { BulkActionBar } from './BulkActionBar'
 
 type ThreadListProps = {
@@ -59,6 +72,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
   const system = useValue(ui$.system)
   const filteredThreads = useValue(getFilteredThreads)
   const filterMode = useValue(ui$.filterMode)
+  const attachmentsOnly = useValue(ui$.attachmentsOnly)
   const threadsCursor = useValue(mail$.threadsCursor)
   const threadsLoadingMore = useValue(mail$.threadsLoadingMore)
   // The rows on hand belong to the view they were loaded for. Until that is the
@@ -66,7 +80,9 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
   // true from the first paint of a navigation, which is a frame or more before
   // the effect that starts the load.
   const threadsLoadedKey = useValue(mail$.threadsLoadedKey)
-  const threadsLoading = threadsLoadedKey !== threadListViewKey(selectedAccount, selectedFolder, query, filterMode)
+  const threadsLoading =
+    threadsLoadedKey !==
+    threadListViewKey(selectedAccount, selectedFolder, query, listFilterKey(filterMode, attachmentsOnly))
   const threadMenu = useThreadContextMenu(accounts)
   // Starred is a folder of the unified view whose rows span every account. It
   // lists ordinary threads, so it shares this list's selection, context menu and
@@ -75,20 +91,13 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
   // Quick-settings (view + theme) anchor for the narrow-window header button.
   // The side navigation that normally hosts these controls is hidden at this width.
   const [quickMenu, setQuickMenu] = useState<{ x: number; y: number } | null>(null)
-  // Focus the search box when ⌘/Ctrl+Shift+F (or the palette) bumps the signal.
-  const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const titleBar = useTitleBar()
   const [searchFocused, setSearchFocused] = useState(false)
-  // Searching takes over the header: the folder name and the icon buttons step
-  // aside so the box is full width while it is being used. It stays open with
-  // text in it after blur, so a typed query is never truncated out of view.
-  const searchExpanded = searchFocused || query.length > 0
-  const globalSearchFocus = useValue(ui$.globalSearchFocus)
-  useEffect(() => {
-    if (globalSearchFocus === 0) return
-    const input = searchInputRef.current
-    input?.focus()
-    input?.select()
-  }, [globalSearchFocus])
+  // Without a title bar of ours the search box is in this header, and searching
+  // takes it over: the folder name and the icon buttons step aside so the box is
+  // full width while it is being used. It stays open with text in it after blur,
+  // so a typed query is never truncated out of view.
+  const searchExpanded = !titleBar && (searchFocused || query.length > 0)
 
   // Keep the selected thread visible when it changes — chiefly so j/k keyboard
   // navigation can walk past the fold. `block: "nearest"` leaves already-visible
@@ -127,12 +136,23 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
           folders.find((folder) => folder.id === selectedFolder),
           folders,
         )
+  // A whole-folder export needs one real mailbox to list on the server. The
+  // folder row only supplies a name: the inbox is selected as "inbox" whatever
+  // the server calls it, and the list may not have loaded yet.
+  const notifyTarget =
+    isStarredView || isRSSAccount || selectedAccount === 'unified'
+      ? undefined
+      : folders.find((folder) => folder.id === selectedFolder && isNotifiableFolder(folder))
+  const canExportFolder = !isStarredView && !isRSSAccount && !!activeAccount && !!selectedFolder
+  const exportFolderName =
+    folders.find((folder) => folderMatches(folder, selectedAccount, selectedFolder))?.name ?? selectedFolder
   const hasUnread = isRSSAccount
     ? filteredThreads.some((thread) => thread.unread)
     : folderUnread(folders, selectedFolder) > 0 || filteredThreads.some((thread) => thread.unread)
   // A search pages on the cursor the core mints for it, whatever the filter chip
   // says — a query is answered by a search, not by a filtered listing. Without a
-  // cursor (feeds, starred) there is nothing more to load.
+  // cursor (feeds, starred) there is nothing more to load. The attachments
+  // toggle narrows the same cursor-paged listing, so it does not stop paging.
   const canLoadMore = !!threadsCursor && (!!query.trim() || filterMode === 'all')
   const feedRowsDraggable = !isStarredView && isRSSAccount
   // The folder switcher needs a folder list to offer. That is an account's real
@@ -145,7 +165,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
   // wording holds while a search or filter is hiding the threads that are there.
   const inboxFolder = folders.find((folder) => folder.role === 'inbox' || folder.id === 'inbox')
   const inInbox = selectedFolder === (inboxFolder?.id ?? 'inbox')
-  const narrowed = !!query.trim() || filterMode !== 'all'
+  const narrowed = !!query.trim() || filterMode !== 'all' || attachmentsOnly
   const emptyStateTitle = narrowed
     ? t('empty.noMatchingMail')
     : isRSSAccount
@@ -162,6 +182,15 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
         : inInbox
           ? t('empty.inboxEmpty')
           : t('empty.pullLatestMessages')
+  const loadMoreButton = (
+    <button
+      className="mx-3 my-3 flex h-9 shrink-0 items-center justify-center rounded-lg border border-border text-xs font-semibold text-secondary hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer transition-colors"
+      disabled={threadsLoadingMore}
+      onClick={() => void loadMoreThreads()}
+    >
+      {threadsLoadingMore ? t('common.loading') : t('threads.actions.loadMore')}
+    </button>
+  )
   const desktopBulk = isWailsDesktopRuntime() || !!system
   const bulkItems = selectedBulkItems()
   const bulkGroupKey = `thread-list:${selectedAccount}:${selectedFolder}`
@@ -192,6 +221,23 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
     }
   }
 
+  // Ctrl/Cmd+click and double-click. Starred feed rows are single articles, so
+  // they open in a reader tab, as their plain click does.
+  const openInNewTab = (thread: (typeof filteredThreads)[number]) => {
+    if (
+      isStarredView &&
+      isRssAccount(
+        accounts.find((acc) => acc.id === thread.account_id),
+        thread.account_id,
+      )
+    ) {
+      openMessageTab(thread)
+      ui$.mobilePane.set('conversation')
+      return
+    }
+    openThreadTab(thread)
+  }
+
   const selectRangeTo = (target: BulkSelectionItem) => {
     const anchor = ui$.bulkAnchorKey.peek()
     const rows = filteredThreads.map(bulkItemFor)
@@ -218,7 +264,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
   return (
     <section
       data-thread-list
-      className={`relative flex w-full shrink-0 flex-col border-r border-border bg-chats min-[769px]:w-[var(--thread-list-width)] ${
+      className={`relative flex w-full shrink-0 flex-col bg-chats min-[769px]:w-[var(--thread-list-width)] ${
         mobilePane === 'threads' ? 'max-[768px]:flex' : 'max-[768px]:hidden'
       }`}
       onKeyDownCapture={(event) => {
@@ -228,7 +274,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
     >
       {onResizeStart && (
         <div
-          className="absolute right-0 top-0 z-20 hidden h-full w-2 translate-x-1 cursor-col-resize min-[769px]:block"
+          className="absolute right-0 top-0 z-30 hidden h-full w-2 translate-x-1 cursor-col-resize min-[769px]:block"
           onPointerDown={onResizeStart}
           title={t('layout.resizeThreadList')}
         >
@@ -236,11 +282,11 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
         </div>
       )}
       {bulkInThisList ? (
-        <BulkActionBar items={bulkItems} allItems={filteredThreads.map(bulkItemFor)} className="min-h-16" />
+        <BulkActionBar items={bulkItems} allItems={filteredThreads.map(bulkItemFor)} className="min-h-12" />
       ) : (
         // Less padding on the right than the left: the trailing icon buttons carry
         // their own, so px-4 on both sides left the row lopsided.
-        <div className="flex h-16 shrink-0 flex-row items-center gap-3 pl-4 pr-2 border-b border-border bg-white dark:bg-[#0f172a]/40">
+        <div className="flex h-12 shrink-0 flex-row items-center gap-3 pl-4 pr-2 border-b border-border/60">
           <div className="flex items-center gap-2 w-full">
             {/* Current folder, doubling as a picker: switching here retargets the
               list the same way it retargets a kanban column. Capped so a deep
@@ -254,35 +300,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                 onSelect={(nextFolderId) => ui$.selectedFolder.set(nextFolderId)}
               />
             )}
-            <div className="relative min-w-0 flex-1">
-              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 text-secondary" size={15} />
-              <input
-                ref={searchInputRef}
-                value={query}
-                onChange={(event) => ui$.query.set(event.target.value)}
-                onFocus={() => setSearchFocused(true)}
-                onBlur={() => setSearchFocused(false)}
-                onKeyDown={(event) => {
-                  if (event.key !== 'Escape') return
-                  ui$.query.set('')
-                  event.currentTarget.blur()
-                }}
-                placeholder={isRSSAccount ? t('threads.searchFeeds') : t('threads.searchMessages')}
-                className={clsx(
-                  'w-full rounded-xl bg-hover py-2 pl-8 text-[0.8125rem] text-primary placeholder-secondary focus:ring-1 focus:ring-accent focus:bg-chats border border-transparent focus:border-transparent transition-all duration-150',
-                  // The right padding only has to clear the clear button while there is one.
-                  query ? 'pr-8' : 'pr-3',
-                )}
-              />
-              {query && (
-                <button
-                  onClick={() => ui$.query.set('')}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-secondary hover:text-primary cursor-pointer"
-                >
-                  <X size={15} />
-                </button>
-              )}
-            </div>
+            {titleBar ? <div className="flex-1" /> : <ThreadSearchInput onFocusChange={setSearchFocused} />}
 
             {!searchExpanded && (
               <>
@@ -314,6 +332,8 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                   <ThreadActionsMenu
                     filterMode={filterMode}
                     onFilterChange={(mode) => ui$.filterMode.set(mode)}
+                    attachmentsOnly={attachmentsOnly}
+                    onAttachmentsOnlyChange={(on) => ui$.attachmentsOnly.set(on)}
                     hasUnread={hasUnread}
                     onMarkAllRead={() => markAllRead()}
                     onEmptyFolder={
@@ -340,6 +360,23 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                             )
                         : undefined
                     }
+                    onToggleNotify={
+                      notifyTarget
+                        ? () =>
+                            void setFolderNotify(
+                              selectedAccount,
+                              notifyTarget.id,
+                              !notifyTarget.notify,
+                              notifyTarget.name,
+                            )
+                        : undefined
+                    }
+                    notifyEnabled={!!notifyTarget?.notify}
+                    onExportFolder={
+                      canExportFolder
+                        ? () => void exportFolderAsEml(selectedAccount, selectedFolder, exportFolderName)
+                        : undefined
+                    }
                     onSync={syncMail}
                     syncing={busy}
                     allLabel={isRSSAccount ? t('filters.allFeeds') : t('filters.all')}
@@ -357,19 +394,22 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                     onClick={() => openAddFeed(selectedAccount)}
                   />
                 )}
-                {/* View + theme: only reachable here when the side navigation is hidden (narrow). */}
-                <IconButton
-                  icon={MoreHorizontal}
-                  iconSize={18}
-                  label={t('sidenav.actions.viewAndTheme')}
-                  size="md"
-                  radius="lg"
-                  className="min-[769px]:hidden"
-                  onClick={(e) => {
-                    const rect = e.currentTarget.getBoundingClientRect()
-                    setQuickMenu({ x: rect.right - 208, y: rect.bottom })
-                  }}
-                />
+                {/* View + theme: only reachable here when the side navigation is hidden
+                  (narrow) and there is no title bar of ours holding it. */}
+                {!titleBar && (
+                  <IconButton
+                    icon={MoreHorizontal}
+                    iconSize={18}
+                    label={t('sidenav.actions.viewAndTheme')}
+                    size="md"
+                    radius="lg"
+                    className="min-[769px]:hidden"
+                    onClick={(e) => {
+                      const rect = e.currentTarget.getBoundingClientRect()
+                      setQuickMenu({ x: rect.right - 208, y: rect.bottom })
+                    }}
+                  />
+                )}
               </>
             )}
           </div>
@@ -385,7 +425,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
 
       {/* Thread List Items */}
       <div
-        className="flex-1 overflow-y-auto flex flex-col"
+        className="flex-1 overflow-y-auto flex flex-col gap-0.5 p-1.5"
         onScroll={(event) => {
           if (!canLoadMore || threadsLoadingMore) return
           const el = event.currentTarget
@@ -408,7 +448,14 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
           ) : isStarredView ? (
             <EmptyState title={t('empty.noStarredItems')} text={t('empty.noStarredItemsText')} />
           ) : (
-            <EmptyState title={emptyStateTitle} text={emptyStateText} />
+            // A narrowed page can come back empty with older mail still to read
+            // (the core stops reading on after a few emptied pages), so an empty
+            // list is not the end while the cursor says otherwise.
+            <EmptyState
+              title={emptyStateTitle}
+              text={emptyStateText}
+              action={canLoadMore ? loadMoreButton : undefined}
+            />
           )
         ) : (
           <>
@@ -418,18 +465,21 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                 <ThreadListItem
                   key={thread.id}
                   thread={thread}
-                  accounts={accounts}
-                  selectedAccount={selectedAccount}
-                  selectedThread={selectedThread}
+                  active={thread.thread_id === selectedThread}
+                  badgeAccount={
+                    isStarredView || selectedAccount === 'unified'
+                      ? accounts.find((acc) => acc.id === thread.account_id)
+                      : undefined
+                  }
+                  contextMenuOpen={threadMenu.isOpen(thread)}
                   rootRef={thread.thread_id === selectedThread ? selectedItemRef : undefined}
-                  showAccountBadge={isStarredView ? true : undefined}
                   draggable={feedRowsDraggable}
                   onDragStart={(event) => startFeedDrag(event, thread)}
                   bulkSelectable={desktopBulk && bulkInThisList}
                   bulkSelected={!!bulkSelection[bulkItem.key]}
                   onSelect={(event) => {
-                    if (desktopBulk && (event.metaKey || event.ctrlKey)) {
-                      toggleBulkSelection(bulkItem)
+                    if (!bulkInThisList && (event.metaKey || event.ctrlKey)) {
+                      openInNewTab(thread)
                       return
                     }
                     if (desktopBulk && event.shiftKey) {
@@ -464,6 +514,11 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                     ui$.selectedThread.set(thread.thread_id)
                     ui$.mobilePane.set('conversation')
                   }}
+                  onOpenInNewTab={() => {
+                    // A draft's first click already resumed it in the composer.
+                    if (bulkInThisList || isDraftFolder(thread.folder_id, thread.account_id)) return
+                    openInNewTab(thread)
+                  }}
                   onContextMenu={(event) => {
                     if (bulkInThisList) {
                       event.preventDefault()
@@ -475,15 +530,7 @@ export function ThreadList({ width, onResizeStart }: ThreadListProps = {}) {
                 />
               )
             })}
-            {canLoadMore && (
-              <button
-                className="mx-3 my-3 flex h-9 shrink-0 items-center justify-center rounded-lg border border-border text-xs font-semibold text-secondary hover:bg-hover disabled:cursor-not-allowed disabled:opacity-60 cursor-pointer transition-colors"
-                disabled={threadsLoadingMore}
-                onClick={() => void loadMoreThreads()}
-              >
-                {threadsLoadingMore ? t('common.loading') : t('threads.actions.loadMore')}
-              </button>
-            )}
+            {canLoadMore && loadMoreButton}
           </>
         )}
       </div>

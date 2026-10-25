@@ -1,5 +1,5 @@
 import type { LucideIcon } from 'lucide-react'
-import { Check, Pencil, Trash2 } from 'lucide-react'
+import { Check, Forward, Pencil, Trash2 } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
 import type { ThemeDef } from '../../lib/themes'
 
@@ -27,6 +27,7 @@ export function ThemeSwatch({
   theme,
   selected,
   onSelect,
+  onShare,
   onEdit,
   onDelete,
   large,
@@ -34,6 +35,7 @@ export function ThemeSwatch({
   theme: ThemeDef
   selected: boolean
   onSelect: () => void
+  onShare?: () => void
   onEdit?: () => void
   onDelete?: () => void
   /** Bigger mock + label, for the theme picker dialog grid. */
@@ -88,8 +90,9 @@ export function ThemeSwatch({
         </span>
         {selected && <Check size={large ? 12 : 11} className="shrink-0 text-accent" />}
       </div>
-      {(onEdit || onDelete) && (
+      {(onShare || onEdit || onDelete) && (
         <div className="absolute right-1 top-1 hidden gap-0.5 group-hover:flex">
+          {onShare && <MiniAction icon={Forward} label={translate('theme.share')} onClick={onShare} />}
           {onEdit && <MiniAction icon={Pencil} label={translate('theme.edit')} onClick={onEdit} />}
           {onDelete && <MiniAction icon={Trash2} label={translate('theme.delete')} onClick={onDelete} />}
         </div>

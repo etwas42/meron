@@ -16,6 +16,9 @@ export const isFilterMode = (value: unknown): value is FilterMode =>
 export type SetupMode = 'gmail' | 'outlook' | 'custom' | 'rss'
 export type MobilePane = 'threads' | 'conversation'
 export type ToastTone = 'success' | 'error'
+// Where the toast floats: centred on the window, or over the Tasks panel for
+// the panel's own actions, so the Undo appears beside what it would undo.
+export type ToastPlacement = 'app' | 'tasks'
 export type EditFeed = { threadId: string; name: string; url?: string }
 export type ConfirmTone = 'default' | 'danger'
 export type ConfirmState = {
@@ -54,6 +57,9 @@ export const ui$ = observable({
   bulkAnchorKey: '',
   query: '',
   filterMode: 'all' as FilterMode,
+  /** Keep only threads with attachments. Independent of `filterMode`, so it
+   * combines with unread and starred. */
+  attachmentsOnly: false,
   // Modals / panels.
   setupOpen: false,
   setupMode: 'gmail' as SetupMode,
@@ -65,6 +71,16 @@ export const ui$ = observable({
   accountSettingsId: '',
   addFeedAccount: '',
   editFeed: null as EditFeed | null,
+  // The optional Tasks panel: whether the right-hand panel is showing, and
+  // which list it is showing. Unlike a board it does not own the main pane —
+  // it sits beside mail or kanban, so both stay visible while you work through
+  // a list. Lives here rather than in states/tasks because the panel is app
+  // chrome, like the dialogs above it.
+  tasksPanelOpen: false,
+  activeTaskList: '',
+  // The optional calendar. Unlike Tasks it is a view: it takes the main pane,
+  // the way a board does, until an account or a board is opened.
+  calendarOpen: false,
   // Command palette (⌘/Ctrl+K). Ephemeral: open flag, search query, and the
   // highlighted row index.
   paletteOpen: false,
@@ -89,6 +105,7 @@ export const ui$ = observable({
   // Optional one-shot undo paired with the current toast. Set by reversible
   // actions (archive/star/unread) so an accidental keystroke is recoverable.
   toastUndo: null as null | (() => void),
+  toastPlacement: 'app' as ToastPlacement,
   confirm: null as ConfirmState | null,
 })
 
@@ -96,6 +113,20 @@ let pendingConfirmResolve: ((confirmed: boolean) => void) | null = null
 
 // Open the command palette, resetting the query and selection so it always
 // starts fresh at the top.
+/** Whether a modal (palette, dialog, confirm) is open. Single-key shortcuts
+ * stand down while one is, so its own keys (Enter, letters) work as usual. */
+export function modalOpen(): boolean {
+  return (
+    ui$.paletteOpen.peek() ||
+    ui$.shortcutsOpen.peek() ||
+    ui$.settingsOpen.peek() ||
+    ui$.setupOpen.peek() ||
+    !!ui$.addFeedAccount.peek() ||
+    !!ui$.editFeed.peek() ||
+    !!ui$.confirm.peek()
+  )
+}
+
 export function openCommandPalette() {
   ui$.paletteQuery.set('')
   ui$.paletteIndex.set(0)
@@ -106,37 +137,52 @@ export function closeCommandPalette() {
   ui$.paletteOpen.set(false)
 }
 
-// Ask the ThreadList to focus (and select) its search box.
+// Ask the open search box (thread list or kanban board) to focus and select.
 export function focusGlobalSearch() {
   ui$.globalSearchFocus.set(ui$.globalSearchFocus.peek() + 1)
 }
 
-// Show a transient toast for ~2.2s. Clears only if it's still showing this
-// message, so a newer toast isn't cut short. Pass tone "error" for failures.
-// A duration of 0 stays visible until the caller dismisses it.
-export function showToast(msg: string, tone: ToastTone = 'success', duration = 2200) {
+let toastTimer: ReturnType<typeof setTimeout> | undefined
+
+export function dismissToast() {
+  clearTimeout(toastTimer)
+  toastTimer = undefined
+  ui$.toast.set('')
   ui$.toastUndo.set(null)
+}
+
+// Success confirmations last ~2.2s; errors stay until dismissed or replaced.
+// An explicit duration overrides this default; 0 disables automatic dismissal.
+export function showToast(
+  msg: string,
+  tone: ToastTone = 'success',
+  duration = tone === 'error' ? 0 : 2200,
+  placement: ToastPlacement = 'app',
+) {
+  clearTimeout(toastTimer)
+  ui$.toastUndo.set(null)
+  ui$.toastPlacement.set(placement)
   ui$.toastTone.set(tone)
   ui$.toast.set(msg)
   if (duration === 0) return
-  setTimeout(() => {
+  toastTimer = setTimeout(() => {
     if (ui$.toast.get() === msg) {
-      ui$.toast.set('')
-      ui$.toastUndo.set(null)
+      dismissToast()
     }
   }, duration)
 }
 
 // Like showToast but pairs the message with an Undo affordance. Given a longer
 // (5s) window since the whole point is to catch an accidental action.
-export function showUndoToast(msg: string, undo: () => void) {
+export function showUndoToast(msg: string, undo: () => void, placement: ToastPlacement = 'app') {
+  clearTimeout(toastTimer)
   ui$.toastTone.set('success')
+  ui$.toastPlacement.set(placement)
   ui$.toast.set(msg)
   ui$.toastUndo.set(() => undo)
-  setTimeout(() => {
+  toastTimer = setTimeout(() => {
     if (ui$.toast.get() === msg) {
-      ui$.toast.set('')
-      ui$.toastUndo.set(null)
+      dismissToast()
     }
   }, 5000)
 }
@@ -144,8 +190,7 @@ export function showUndoToast(msg: string, undo: () => void) {
 // Run the pending undo (if any) and dismiss the toast.
 export function runToastUndo() {
   const undo = ui$.toastUndo.peek() as (() => void) | null
-  ui$.toast.set('')
-  ui$.toastUndo.set(null)
+  dismissToast()
   undo?.()
 }
 
@@ -232,6 +277,9 @@ export function focusQuickReply() {
 const filterSession = persistedField(ui$.filterMode, 'session_filter_mode', (raw) =>
   isFilterMode(raw) ? raw : undefined,
 )
+const attachmentsSession = persistedField(ui$.attachmentsOnly, 'session_attachments_only', (raw) =>
+  typeof raw === 'boolean' ? raw : undefined,
+)
 
 let restoringNav = false
 function persistNav(key: string, value: string) {
@@ -263,9 +311,10 @@ ui$.selectedAccount.onChange(() => clearBulkSelection())
 ui$.selectedFolder.onChange(() => clearBulkSelection())
 ui$.query.onChange(() => clearBulkSelection())
 ui$.filterMode.onChange(() => clearBulkSelection())
+ui$.attachmentsOnly.onChange(() => clearBulkSelection())
 
 /** Prefs keys this module owns; boot requests them in its single prefsGet. */
-export const UI_SESSION_KEYS = ['session_account', 'session_folder', filterSession.key]
+export const UI_SESSION_KEYS = ['session_account', 'session_folder', filterSession.key, attachmentsSession.key]
 
 /**
  * Seed ui$ navigation from the persisted last session. Call once at boot after
@@ -292,4 +341,5 @@ export function restoreUiSession(prefs: Record<string, unknown>, accounts: Accou
     restoringNav = false
   }
   filterSession.restore(prefs)
+  attachmentsSession.restore(prefs)
 }

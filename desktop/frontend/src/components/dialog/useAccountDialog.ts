@@ -4,6 +4,7 @@ import { invoke } from '../../lib/bridge'
 import { boot } from '../../boot'
 import { ui$, type SetupMode } from '../../states/ui'
 import { accounts$ } from '../../states/accounts'
+import { clearSyncErrorFor } from '../../states/connectivity'
 import { openMailAccount } from '../../states/kanban'
 import { nextRssAccountDisplayName } from '../../states/feeds'
 import { errorMessage } from '../../lib/errors'
@@ -34,6 +35,10 @@ export function useAccountDialog() {
   // credential is intact, the UI never holds it, and asking for it again to
   // change a port would be busywork the user cannot always satisfy.
   const editing = !!reconnectAccount && reconnectAccount.needs_reconnect !== true
+  const reconnectIdFor = (email: string) =>
+    reconnectAccount && email.trim().toLowerCase() === reconnectAccount.email.trim().toLowerCase()
+      ? reconnectAccount.id
+      : undefined
   const gmailConfigured = !!system?.gmail_oauth_configured
   const outlookConfigured = !!system?.outlook_oauth_configured
 
@@ -207,7 +212,9 @@ export function useAccountDialog() {
           refresh_token: res.profile!.refresh_token,
           expires_in: res.profile!.expires_in,
         })
+        const reconnectId = reconnectIdFor(res.profile.email)
         const added = await invoke<AddAccountResult>(addCommand, {
+          ...(reconnectId ? { id: reconnectId } : {}),
           email: res.profile.email,
           display_name: res.profile.display_name,
           sender_name: res.profile.display_name,
@@ -217,6 +224,7 @@ export function useAccountDialog() {
           refresh_token: res.profile.refresh_token,
           expires_in: res.profile.expires_in,
         })
+        if (reconnectId) clearSyncErrorFor(added.account?.id ?? reconnectId)
         ui$.reconnectAccountId.set('')
         ui$.setupOpen.set(false)
         await boot()
@@ -390,11 +398,13 @@ export function useAccountDialog() {
       setLoading(true)
       // Snapshot existing ids so we can jump to the freshly added account below.
       const before = new Set(accounts$.peek().map((acc) => acc.id))
+      const reconnectId = reconnectIdFor(form.email)
       let createdId = ''
       if (mode === 'gmail' || mode === 'outlook') {
         const added = await invoke<AddAccountResult>(
           mode === 'outlook' ? 'account.addOutlookOAuth' : 'account.addGmailOAuth',
           {
+            ...(reconnectId ? { id: reconnectId } : {}),
             email: form.email,
             display_name: form.display_name,
             sender_name: form.display_name,
@@ -413,6 +423,7 @@ export function useAccountDialog() {
         createdId = added.account?.id ?? ''
       } else {
         const added = await invoke<AddAccountResult>('account.addPassword', {
+          ...(reconnectId ? { id: reconnectId } : {}),
           email: form.email,
           display_name: form.display_name,
           sender_name: form.sender_name,
@@ -424,7 +435,7 @@ export function useAccountDialog() {
           // Omitting the key entirely tells the core to keep the stored
           // password; sending "" would blank it. Only an explicitly typed
           // password replaces what the keychain already holds.
-          ...(editing && !form.password ? {} : { password: form.password }),
+          ...(editing && reconnectId && !form.password ? {} : { password: form.password }),
           tls: form.imap_security === 'tls',
           starttls: form.imap_security === 'starttls',
           smtp_tls: form.smtp_security === 'tls',
@@ -436,6 +447,7 @@ export function useAccountDialog() {
         })
         createdId = added.account?.id ?? ''
       }
+      if (reconnectId) clearSyncErrorFor(createdId || reconnectId)
       ui$.setupOpen.set(false)
       ui$.reconnectAccountId.set('')
       await boot()
@@ -479,7 +491,7 @@ export function useAccountDialog() {
       ? !exchangedTokens && !form.auth_code
       : mode === 'rss'
         ? !form.display_name
-        : !form.email || (!form.password && !editing))
+        : !form.email || (!form.password && !(editing && reconnectIdFor(form.email))))
 
   return {
     mode,

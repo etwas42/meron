@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { cleanup, fireEvent, render } from '@testing-library/react'
 import { accounts$ } from '../../states/accounts'
 import { mail$ } from '../../states/mail'
+import { settings$ } from '../../states/settings'
 import { ui$ } from '../../states/ui'
 import type { Message } from '../../types'
 import { MessageBubble } from './MessageBubble'
@@ -25,7 +26,7 @@ const sent: Message = {
 }
 
 function openDetails(message: Message) {
-  const view = render(<MessageBubble message={message} galleryOffset={0} onOpenContextMenu={() => undefined} />)
+  const view = render(<MessageBubble message={message} galleryOffset={0} />)
   fireEvent.click(view.getByTitle('Show details'))
   return view.getByText('From:').parentElement?.parentElement
 }
@@ -66,5 +67,30 @@ describe('MessageBubble details', () => {
     ui$.selectedThread.set('thread-1')
 
     expect(openDetails({ ...sent, body_html: '<p>Body</p>' })?.classList.contains('max-w-full')).toBe(true)
+  })
+})
+
+describe('MessageBubble long messages', () => {
+  afterEach(() => {
+    cleanup()
+    settings$.chatFullMessages.set(false)
+  })
+
+  function bodyBox() {
+    const view = render(<MessageBubble message={sent} galleryOffset={0} />)
+    return view.getByText('Body').closest('div')!
+  }
+
+  it('caps a long body and scrolls it inside the bubble by default', () => {
+    const box = bodyBox()
+    expect(box.classList.contains('overflow-y-auto')).toBe(true)
+    expect(box.style.maxHeight).toBe('360px')
+  })
+
+  it('shows the body in full when full message content is on', () => {
+    settings$.chatFullMessages.set(true)
+    const box = bodyBox()
+    expect(box.classList.contains('overflow-y-auto')).toBe(false)
+    expect(box.style.maxHeight).toBe('')
   })
 })

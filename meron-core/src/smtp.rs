@@ -111,7 +111,7 @@ pub(crate) async fn starttls_socket(tcp: tokio::net::TcpStream) -> Result<tokio:
         "smtp greeting",
         SmtpTransport::new(
             SmtpClient::new(),
-            BufReader::new(crate::imap::Stream::Plain(tcp)),
+            BufReader::new(crate::imap::Stream::plain(tcp)),
         ),
     )
     .await?
@@ -120,8 +120,8 @@ pub(crate) async fn starttls_socket(tcp: tokio::net::TcpStream) -> Result<tokio:
         .await?
         .context("SMTP STARTTLS")?;
     match inner.into_inner() {
-        crate::imap::Stream::Plain(tcp) => Ok(tcp),
-        crate::imap::Stream::Tls(_) => Err(anyhow::anyhow!(
+        crate::imap::Stream::Plain(tcp, _) => Ok(tcp),
+        crate::imap::Stream::Tls(_, _) => Err(anyhow::anyhow!(
             "STARTTLS requested on an already-TLS stream"
         )),
     }
@@ -361,6 +361,43 @@ pub async fn send(
         &message_id,
     )?;
 
+    submit(creds, from, &to_list, &cc_list, &bcc_list, &raw).await?;
+
+    // Return the copy to file in Sent: identical to the transmitted message
+    // unless there's a Bcc, in which case we rebuild with the `Bcc:` header (and
+    // the same Message-ID) so the user's Sent folder records who they bcc'd.
+    if bcc_list.is_empty() {
+        Ok(raw)
+    } else {
+        build_message(
+            sender_name,
+            from,
+            to,
+            cc,
+            bcc,
+            true,
+            subject,
+            body,
+            html,
+            attachments,
+            in_reply_to,
+            references,
+            reply_to,
+            &message_id,
+        )
+    }
+}
+
+/// Hand one built message to the account's SMTP server: connect, upgrade,
+/// authenticate, and deliver `raw` to every To/Cc/Bcc entry's bare address.
+async fn submit(
+    creds: &Creds,
+    from: &str,
+    to_list: &[String],
+    cc_list: &[String],
+    bcc_list: &[String],
+    raw: &[u8],
+) -> Result<()> {
     // Fall back to the IMAP host if SMTP settings were not provided.
     let host = if creds.smtp_host.is_empty() {
         creds.host.as_str()
@@ -401,8 +438,8 @@ pub async fn send(
             .await?
             .context("SMTP STARTTLS")?;
         let tcp = match inner.into_inner() {
-            crate::imap::Stream::Plain(tcp) => tcp,
-            crate::imap::Stream::Tls(_) => {
+            crate::imap::Stream::Plain(tcp, _) => tcp,
+            crate::imap::Stream::Tls(_, _) => {
                 return Err(anyhow::anyhow!(
                     "STARTTLS requested on an already-TLS stream"
                 ));
@@ -411,7 +448,7 @@ pub async fn send(
         let tls = crate::imap::upgrade_to_tls(host, tcp, creds.smtp_cert_pin.as_deref())
             .await
             .map_err(as_smtp_cert_error)?;
-        let upgraded = crate::imap::Stream::Tls(Box::new(tls));
+        let upgraded = crate::imap::Stream::tls(Box::new(tls));
         transport = with_timeout(
             SMTP_COMMAND_TIMEOUT,
             "smtp ehlo",
@@ -485,10 +522,10 @@ pub async fn send(
     }
 
     // SMTP envelope addresses must be bare ("addr@host"); MIME header entries
-    // may carry a display name. The header form survives in `to_list`/`cc_list`
-    // for the builder above; here we strip down to the address for RCPT TO.
+    // may carry a display name, which the built message already has; here we
+    // strip down to the address for RCPT TO.
     let mut recipients = Vec::new();
-    for addr in envelope_recipients(&to_list, &cc_list, &bcc_list) {
+    for addr in envelope_recipients(to_list, cc_list, bcc_list) {
         recipients.push(EmailAddress::new(addr).context("recipient address")?);
     }
     let envelope = Envelope::new(
@@ -499,35 +536,83 @@ pub async fn send(
     with_timeout(
         SMTP_DATA_TIMEOUT,
         "smtp send",
-        transport.send(SendableEmail::new(envelope, raw.clone())),
+        transport.send(SendableEmail::new(envelope, raw.to_vec())),
     )
     .await?
     .context("smtp send")?;
     let _ = with_timeout(Duration::from_secs(10), "smtp quit", transport.quit()).await;
+    Ok(())
+}
 
-    // Return the copy to file in Sent: identical to the transmitted message
-    // unless there's a Bcc, in which case we rebuild with the `Bcc:` header (and
-    // the same Message-ID) so the user's Sent folder records who they bcc'd.
-    if bcc_list.is_empty() {
-        Ok(raw)
-    } else {
-        build_message(
-            sender_name,
-            from,
-            to,
-            cc,
-            bcc,
-            true,
-            subject,
-            body,
-            html,
-            attachments,
-            in_reply_to,
-            references,
-            reply_to,
-            &message_id,
-        )
+/// Build the answer to a calendar invitation (RFC 6047 2.4): a readable line
+/// and the `METHOD:REPLY` calendar as alternatives of one another, threaded
+/// onto the invitation so the organizer's client files it alongside.
+pub fn build_invite_reply(
+    sender_name: &str,
+    from: &str,
+    reply: &crate::calendar::ReplyMail,
+    in_reply_to: &str,
+    references: &str,
+) -> Result<Vec<u8>> {
+    use mail_builder::headers::content_type::ContentType;
+    use mail_builder::mime::MimePart;
+
+    let to_pairs: Vec<(String, String)> = parse_addrs(&reply.to)
+        .iter()
+        .map(|s| split_name_addr(s))
+        .collect();
+    let domain = from.rsplit('@').next().unwrap_or("localhost");
+    let mut builder = MessageBuilder::new()
+        .from((sender_name, from))
+        .to(to_pairs)
+        .subject(reply.subject.as_str())
+        .message_id(format!("{}@{}", uuid::Uuid::new_v4(), domain))
+        .body(MimePart::new(
+            "multipart/alternative",
+            vec![
+                MimePart::new("text/plain", reply.body.as_str()),
+                MimePart::new(
+                    ContentType::new("text/calendar")
+                        .attribute("method", "REPLY")
+                        .attribute("charset", "utf-8"),
+                    reply.ics.as_str(),
+                ),
+            ],
+        ));
+    let in_reply_to = bare_id(in_reply_to);
+    if !in_reply_to.is_empty() {
+        builder = builder.in_reply_to(in_reply_to.as_str());
     }
+    let refs: Vec<String> = references
+        .split_whitespace()
+        .chain(std::iter::once(in_reply_to.as_str()))
+        .map(bare_id)
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    if !refs.is_empty() {
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        builder = builder.references(refs.as_slice());
+    }
+    builder.write_to_vec().context("build MIME message")
+}
+
+/// Send [`build_invite_reply`]'s message. Returns it for the Sent copy.
+pub async fn send_invite_reply(
+    creds: &Creds,
+    from_addr: &str,
+    sender_name: &str,
+    reply: &crate::calendar::ReplyMail,
+    in_reply_to: &str,
+    references: &str,
+) -> Result<Vec<u8>> {
+    let from = if from_addr.trim().is_empty() {
+        creds.user.as_str()
+    } else {
+        from_addr.trim()
+    };
+    let raw = build_invite_reply(sender_name, from, reply, in_reply_to, references)?;
+    submit(creds, from, &parse_addrs(&reply.to), &[], &[], &raw).await?;
+    Ok(raw)
 }
 
 /// Flatten to/cc/bcc header entries into the bare envelope address list,

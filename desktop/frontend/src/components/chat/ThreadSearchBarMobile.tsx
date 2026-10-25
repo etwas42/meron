@@ -2,28 +2,19 @@ import type { RefObject } from 'react'
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react'
 import { useValue } from '@legendapp/state/react'
 import { useTranslation } from '../../lib/i18n'
-import { thread$ } from '../../states/thread'
+import { goToSearchMatch, thread$ } from '../../states/thread'
 
 // The narrow-viewport in-thread search bar (the desktop equivalent lives inside
 // ConversationHeader). Rendered only while thread search is open.
-export function ThreadSearchBarMobile({
-  matchCount,
-  activeSearchIndex,
-  goToSearchMatch,
-  inputRef,
-}: {
-  /** Total occurrences in the thread, not matching messages. */
-  matchCount: number
-  activeSearchIndex: number
-  goToSearchMatch: (direction: -1 | 1) => void
-  inputRef: RefObject<HTMLInputElement | null>
-}) {
+export function ThreadSearchBarMobile({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) {
   const { t } = useTranslation()
   const threadSearch = useValue(thread$.search)
+  const matchCount = useValue(thread$.searchMatchCount)
+  const activeSearchIndex = useValue(thread$.activeSearchIndex)
   const normalizedThreadSearch = threadSearch.trim().toLowerCase()
 
   return (
-    <div className="min-[900px]:hidden flex h-11 shrink-0 items-center gap-1 border-b border-border bg-header px-3 z-10">
+    <div className="min-[900px]:hidden flex h-11 shrink-0 items-center gap-1 border-b border-border/60 bg-header px-3 z-10">
       <div className="flex flex-1 items-center gap-2 rounded-xl bg-hover px-2 py-1.5 border border-transparent focus-within:border-accent/40 focus-within:bg-chats">
         <Search size={14} className="text-secondary shrink-0" />
         <input

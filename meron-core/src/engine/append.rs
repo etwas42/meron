@@ -114,6 +114,7 @@ pub(super) async fn refresh_sent_copy(
     copy: &SentCopy,
 ) -> anyhow::Result<bool> {
     let folder = copy.folder.as_str();
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let batch = fetch_recent_resilient(engine, account, folder, 20).await?;
     let db = engine.db.lock().unwrap();
     store_folder_tail(&db, account, folder, &batch)?;
@@ -302,8 +303,13 @@ pub async fn append_to_drafts(
         .await?;
     // Refresh local Drafts envelopes so an autosaved reply appears in the
     // existing cross-folder thread view immediately. Read-only, and the draft
-    // is already written, so it runs on its own session.
-    let batch = fetch_recent_resilient(engine, account, &drafts, 20).await?;
+    // is already written, so it runs on its own session — and a refresh that
+    // fails must not report the save as failed: the caller would drop the id
+    // it just wrote under, and nothing would ever discard that copy.
+    let Some(refresh) = refresh_written_folder(engine, account, &drafts, 20).await else {
+        return Ok(());
+    };
+    let batch = &refresh.batch;
     {
         let db = engine.db.lock().unwrap();
         store_folder_tail(&db, account, &drafts, &batch)?;

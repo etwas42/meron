@@ -29,7 +29,7 @@ html-to-markdown-rs = { version = "3.4.1", default-features = false }
 anyhow = "1.0.102"
 rusqlite = { version = "0.39.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 async-smtp = { version = "0.10.2", default-features = false, features = ["runtime-tokio"] }
-mail-builder = "0.4.4"
+mail-builder = "1.0.0"
 base64 = "0.22.1"
 ureq = { version = "3.3.0", features = ["socks-proxy"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
@@ -38,6 +38,8 @@ quick-xml = "0.37.5"
 scraper = "0.27.0"
 ego-tree = "0.11.0"
 ammonia = "4.1.2"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+psl = "2"
 sha2 = "0.11.0"
 chrono = "0.4.44"
 url = "2.5.8"
@@ -45,6 +47,8 @@ uuid = { version = "1.23.1", features = ["v4"] }
 hickory-resolver = { version = "0.26.1", features = ["system-config"] }
 ring = "0.17"
 x509-parser = "0.18.1"
+calcard = { version = "0.3.14", default-features = false }
+iana-time-zone = "0.1.65"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 oo7 = { version = "0.6.0", default-features = false, features = ["tokio", "native_crypto"] }
@@ -55,3 +59,10 @@ ndk-context = "0.1.1"
 # Fork adds a `gmail_thread_id()` accessor (X-GM-THRID) missing from upstream.
 [patch.crates-io]
 async-imap = { git = "https://github.com/nonbili/async-imap.git", rev = "d04be74" }
+
+# Xcode 27's strip corrupts macOS proc-macro dylibs, and release strips
+# debuginfo by default, so rustc then fails with "can't find crate for
+# `jni_macros`". Host artifacts don't ship; the Android .so is stripped by
+# package-rust-core-android.sh with the NDK's llvm-strip.
+[profile.release.build-override]
+strip = false

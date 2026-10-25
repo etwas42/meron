@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { CheckCheck, Copy } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
+import { copyText } from '../../lib/native'
 
 import { parseAddressList, type AddressItem } from './messageHelpers'
 
@@ -10,7 +11,7 @@ export function AddressPill({ name, original }: AddressItem) {
 
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation()
-    navigator.clipboard.writeText(original)
+    copyText(original).catch(() => undefined)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }

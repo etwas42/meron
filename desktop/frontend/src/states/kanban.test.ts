@@ -1,17 +1,33 @@
-import { beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import { accounts$ } from './accounts'
+import { compose$ } from './composeState'
+import type { MessageTab } from '../types'
 import {
   kanban$,
+  closeCurrentConversation,
+  kanbanPaneThreadId,
+  kanbanColumnKey,
+  kanbanBoardColumnKey,
+  selectAdjacentKanbanThread,
   focusKanbanThreadFolder,
   markColumnAllRead,
   markBoardAllRead,
   openCorrespondentMail,
   removeKanbanBoard,
   removeKanbanColumnsForFolder,
+  reorderKanbanColumn,
+  selectKanbanBoard,
+  setKanbanBoardWallpaper,
   switchKanbanColumnFolder,
 } from './kanban'
 import { mail$ } from './mail'
+import {
+  applyMutationFolderUnreads,
+  holdFolderUnread,
+  refreshAccountFoldersCache,
+  updateCachedFolderUnread,
+} from './mailFolders'
 import { settings$ } from './settings'
 import { ui$ } from './ui'
 import { thread$ } from './thread'
@@ -143,6 +159,122 @@ describe('markColumnAllRead', () => {
     }
   })
 
+  it('holds synthesized lowercase inbox counts against uppercase folder refreshes', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    const settle = holdFolderUnread('acc1', 'inbox')
+    updateCachedFolderUnread('acc1', 'inbox', 0, 'local')
+    ;(window as any).go.main.App.Invoke = async () => ({
+      folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 6 }],
+    })
+    await refreshAccountFoldersCache('acc1')
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+    settle(0, true)
+  })
+
+  it('publishes a failed column rollback while a sibling still holds the folder', () => {
+    updateCachedFolderUnread('acc1', 'inbox', 0)
+    const failed = holdFolderUnread('acc1', 'inbox')
+    const sibling = holdFolderUnread('acc1', 'INBOX')
+    failed(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(6)
+    sibling(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(6)
+  })
+
+  it('preserves confirmed counts when a later sibling cannot refresh after failure', () => {
+    updateCachedFolderUnread('acc1', 'inbox', 0)
+    const succeeded = holdFolderUnread('acc1', 'inbox')
+    const failed = holdFolderUnread('acc1', 'INBOX')
+    succeeded(2, true)
+    failed(6, false)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(2)
+  })
+
+  it('lets a post-write refresh supersede a mutation observed before that refresh started', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    let release = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.markAllRead') await gate
+      if (command === 'mail.folderList') {
+        return { folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 0 }] }
+      }
+      return { ok: true }
+    }
+    const pending = markColumnAllRead({ accountId: 'acc1', folderId: 'inbox' })
+    applyMutationFolderUnreads({ folder_unreads: { acc1: { INBOX: 5 } } })
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(5)
+    release()
+    await pending
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+  })
+
+  it('keeps a concurrent mutation result when a column settles with an older refresh', async () => {
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    let release = () => {}
+    let started = () => {}
+    const gate = new Promise<void>((resolve) => (release = resolve))
+    const refreshing = new Promise<void>((resolve) => (started = resolve))
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.folderList') {
+        started()
+        await gate
+        return { folders: [{ id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 3 }] }
+      }
+      return { ok: true }
+    }
+    const pending = markColumnAllRead({ accountId: 'acc1', folderId: 'inbox' })
+    await refreshing
+    applyMutationFolderUnreads({ folder_unreads: { acc1: { INBOX: 1 } } })
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
+    release()
+    await pending
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
+  })
+
+  it('keeps navigation counts cleared when stale folder and thread refreshes race a write', async () => {
+    const folder = { id: 'INBOX', account_id: 'acc1', name: 'Inbox', role: 'inbox', unread: 6 }
+    mail$.foldersByAccount.set({ acc1: [folder] })
+    settings$.kanbanBoards.set([{ id: 'board', name: 'Board', columns: [{ accountId: 'acc1', folderId: 'INBOX' }] }])
+    let releaseWrite = () => {}
+    let releaseStale = () => {}
+    const writeGate = new Promise<void>((resolve) => (releaseWrite = resolve))
+    const staleGate = new Promise<void>((resolve) => (releaseStale = resolve))
+    let written = false
+    let delayRefresh = false
+    ;(window as any).go.main.App.Invoke = async (command: string) => {
+      if (command === 'mail.markAllRead') {
+        await writeGate
+        written = true
+      }
+      if (command === 'mail.folderList') {
+        const unread = written ? 0 : 6
+        if (delayRefresh) await staleGate
+        return { folders: [{ ...folder, unread }] }
+      }
+      return { ok: true }
+    }
+
+    const pending = markBoardAllRead('board')
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+    await refreshAccountFoldersCache('acc1')
+    updateCachedFolderUnread('acc1', 'inbox', 6)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+
+    delayRefresh = true
+    const stale = refreshAccountFoldersCache('acc1')
+    delayRefresh = false
+    releaseWrite()
+    await pending
+    releaseStale()
+    await stale
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(0)
+
+    // Once the operation is over, fresh incoming mail can raise the badge.
+    updateCachedFolderUnread('acc1', 'inbox', 1)
+    expect(mail$.foldersByAccount.acc1.get()[0].unread).toBe(1)
+  })
+
   it('marks all board columns including unloaded and minimized folders, deduplicating unified overlap', async () => {
     settings$.kanbanBoards.set([
       {
@@ -162,6 +294,27 @@ describe('markColumnAllRead', () => {
     expect(calls.filter((call) => call.command === 'mail.markAllRead').map((call) => call.payload)).toEqual([
       { account_id: 'unified', folder_id: 'inbox' },
       { account_id: 'acc2', folder_id: 'Archive' },
+    ])
+  })
+
+  it('marks only the matches of a saved search, never widening an account folder write to unified', async () => {
+    settings$.kanbanBoards.set([
+      {
+        id: 'board',
+        name: 'Board',
+        columns: [
+          { accountId: 'acc1', folderId: 'INBOX' },
+          { accountId: 'unified', folderId: 'inbox', query: 'invoice' },
+        ],
+      },
+    ])
+    kanban$.threads['unified\ninbox\ninvoice'].set([message({ thread_id: 'match' })])
+    await markBoardAllRead('board')
+    expect(calls.filter((call) => call.command === 'mail.markAllRead').map((call) => call.payload)).toEqual([
+      { account_id: 'acc1', folder_id: 'INBOX' },
+    ])
+    expect(calls.filter((call) => call.command === 'mail.markRead').map((call) => call.payload)).toEqual([
+      { thread_id: 'match' },
     ])
   })
 
@@ -437,6 +590,29 @@ describe('switchKanbanColumnFolder', () => {
   })
 })
 
+describe('reorderKanbanColumn', () => {
+  const inbox = { accountId: 'acc1', folderId: 'INBOX' }
+  const archive = { accountId: 'acc1', folderId: 'Archive' }
+  const sent = { accountId: 'acc1', folderId: 'Sent' }
+  const order = () => settings$.kanbanBoards.get()[0].columns.map((column) => column.folderId)
+
+  beforeEach(() => {
+    settings$.kanbanBoards.set([{ id: 'b1', name: 'Board', columns: [inbox, archive, sent] }])
+  })
+
+  it('moves a column into the slot of the one it was dropped on, in either direction', () => {
+    reorderKanbanColumn('b1', inbox, sent)
+    expect(order()).toEqual(['Archive', 'Sent', 'INBOX'])
+    reorderKanbanColumn('b1', inbox, archive)
+    expect(order()).toEqual(['INBOX', 'Archive', 'Sent'])
+  })
+
+  it('leaves the board alone for a column it does not have', () => {
+    reorderKanbanColumn('b1', inbox, { accountId: 'acc2', folderId: 'INBOX' })
+    expect(order()).toEqual(['INBOX', 'Archive', 'Sent'])
+  })
+})
+
 describe('removeKanbanColumnsForFolder', () => {
   it("drops the folder's columns on every board and forgets its cache", () => {
     settings$.kanbanBoards.set([
@@ -494,5 +670,244 @@ describe('removeKanbanBoard', () => {
 
     expect(settings$.kanbanBoards.get()).toEqual([])
     expect(kanban$.activeBoardId.get()).toBe('')
+  })
+})
+
+describe('closeCurrentConversation', () => {
+  const tab = (threadId: string): MessageTab => ({
+    id: `thread-${threadId}`,
+    kind: 'thread',
+    messageId: '',
+    threadId,
+    subject: threadId,
+    from: 'sender@example.com',
+    body: '',
+    viewMode: 'plain',
+  })
+
+  beforeEach(() => {
+    kanban$.activeBoardId.set('b1')
+    kanban$.paneThreadId.set('t-card')
+    kanban$.paneColumnKey.set('b1:INBOX')
+    ui$.selectedThread.set('t-card')
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+  })
+
+  afterEach(() => {
+    kanban$.activeBoardId.set('')
+  })
+
+  it('closes the pane when the card conversation is all it holds', () => {
+    closeCurrentConversation()
+
+    expect(kanban$.paneThreadId.get()).toBe('')
+    expect(ui$.selectedThread.get()).toBe('')
+    expect(ui$.mobilePane.get()).toBe('threads')
+  })
+
+  it('keeps the pane on a still-open tab instead of hiding it', () => {
+    compose$.tabs.set([tab('t-tab')])
+
+    closeCurrentConversation()
+
+    expect(kanban$.paneThreadId.get()).toBe('')
+    expect(compose$.activeTab.get()).toBe('thread-t-tab')
+    expect(ui$.selectedThread.get()).toBe('t-tab')
+    expect(compose$.conversationThread.get()).toBe('')
+  })
+
+  it('leaves an active tab alone and only closes the card conversation', () => {
+    compose$.tabs.set([tab('t-tab')])
+    compose$.activeTab.set('thread-t-tab')
+    ui$.selectedThread.set('t-tab')
+
+    closeCurrentConversation()
+
+    expect(kanban$.paneThreadId.get()).toBe('')
+    expect(compose$.activeTab.get()).toBe('thread-t-tab')
+    expect(ui$.selectedThread.get()).toBe('t-tab')
+  })
+})
+
+describe('setKanbanBoardWallpaper', () => {
+  it('clears the background when Plain is picked', () => {
+    settings$.kanbanBoards.set([
+      { id: 'b1', name: 'Board', columns: [], wallpaper: { kind: 'preset', presetId: 'dots' } },
+    ])
+
+    setKanbanBoardWallpaper('b1', { kind: 'preset', presetId: 'plain' })
+
+    expect(settings$.kanbanBoards.get()[0]).not.toHaveProperty('wallpaper')
+  })
+})
+
+describe('selectKanbanBoard', () => {
+  const tab = (threadId: string): MessageTab => ({
+    id: `thread-${threadId}`,
+    kind: 'thread',
+    messageId: '',
+    threadId,
+    subject: threadId,
+    from: 'sender@example.com',
+    body: '',
+    viewMode: 'plain',
+  })
+
+  beforeEach(() => {
+    settings$.kanbanBoards.set([{ id: 'b1', name: 'Board', columns: [{ accountId: 'acc1', folderId: 'INBOX' }] }])
+    kanban$.activeBoardId.set('')
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+  })
+
+  afterEach(() => {
+    kanban$.activeBoardId.set('')
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+  })
+
+  it('clears the mail view selection when no tab is on screen', () => {
+    ui$.selectedThread.set('t-mail')
+
+    selectKanbanBoard('b1')
+
+    expect(kanban$.activeBoardId.get()).toBe('b1')
+    expect(ui$.selectedThread.get()).toBe('')
+  })
+
+  it('keeps the active thread tab rendering when switching from the mail view', () => {
+    compose$.tabs.set([tab('t-tab')])
+    compose$.activeTab.set('thread-t-tab')
+    ui$.selectedThread.set('t-tab')
+
+    selectKanbanBoard('b1')
+
+    expect(kanban$.activeBoardId.get()).toBe('b1')
+    expect(ui$.selectedThread.get()).toBe('t-tab')
+  })
+})
+
+describe('kanbanPaneThreadId', () => {
+  const tab = (id: string, kind: MessageTab['kind'], threadId: string): MessageTab => ({
+    id,
+    kind,
+    messageId: '',
+    threadId,
+    subject: threadId,
+    from: 'sender@example.com',
+    body: '',
+    viewMode: 'plain',
+  })
+
+  beforeEach(() => {
+    kanban$.paneThreadId.set('t-card')
+    compose$.tabs.set([
+      tab('thread-t-tab', 'thread', 't-tab'),
+      tab('item-1', 'reader', 't-feed'),
+      tab('compose-1', 'compose', ''),
+    ])
+    compose$.activeTab.set('')
+  })
+
+  afterEach(() => {
+    kanban$.paneThreadId.set('')
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+  })
+
+  it('is the card conversation while no tab is active', () => {
+    expect(kanbanPaneThreadId()).toBe('t-card')
+  })
+
+  it('is the active thread or reader tab rather than the card behind it', () => {
+    compose$.activeTab.set('thread-t-tab')
+    expect(kanbanPaneThreadId()).toBe('t-tab')
+    compose$.activeTab.set('item-1')
+    expect(kanbanPaneThreadId()).toBe('t-feed')
+  })
+
+  it('finds a tab opened while the pane was closed', () => {
+    kanban$.paneThreadId.set('')
+    compose$.activeTab.set('thread-t-tab')
+    expect(kanbanPaneThreadId()).toBe('t-tab')
+  })
+
+  it('falls back to the card conversation behind a compose tab', () => {
+    compose$.activeTab.set('compose-1')
+    expect(kanbanPaneThreadId()).toBe('t-card')
+  })
+})
+
+describe('selectAdjacentKanbanThread', () => {
+  const inbox = { accountId: 'acc1', folderId: 'INBOX' }
+  const starred = { accountId: 'unified', folderId: 'starred' }
+  const card = (n: number) => message({ id: `m${n}`, thread_id: `t${n}`, subject: `S${n}`, unread: false })
+  // Items of one feed share a thread_id.
+  const item = (n: number) =>
+    message({ id: `rss-1:item${n}`, account_id: 'rss-1', folder_id: 'feed', thread_id: 'feed-1', unread: false })
+  const threadTab = (threadId: string): MessageTab => ({
+    id: `thread-${threadId}`,
+    kind: 'thread',
+    messageId: '',
+    threadId,
+    subject: threadId,
+    from: 'sender@example.com',
+    body: '',
+    viewMode: 'plain',
+  })
+
+  beforeEach(() => {
+    settings$.kanbanBoards.set([{ id: 'b1', name: 'Board', columns: [inbox, starred] }])
+    kanban$.activeBoardId.set('b1')
+    kanban$.threads.set({
+      [kanbanColumnKey(inbox)]: [card(1), card(2), card(3)],
+      [kanbanColumnKey(starred)]: [item(1), item(2), item(3)],
+    })
+    kanban$.paneThreadId.set('')
+    kanban$.paneColumnKey.set('')
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+    ui$.selectedThread.set('')
+  })
+
+  afterEach(() => {
+    kanban$.activeBoardId.set('')
+    kanban$.threads.set({})
+    compose$.tabs.set([])
+    compose$.activeTab.set('')
+  })
+
+  it('steps from the thread tab on screen, not the card conversation behind it', () => {
+    kanban$.paneThreadId.set('t1')
+    compose$.tabs.set([threadTab('t2')])
+    compose$.activeTab.set('thread-t2')
+    ui$.selectedThread.set('t2')
+
+    selectAdjacentKanbanThread(1)
+
+    expect(kanban$.paneThreadId.get()).toBe('t3')
+    expect(compose$.activeTab.get()).toBe('')
+  })
+
+  it('steps from a tab opened over a closed pane', () => {
+    compose$.tabs.set([threadTab('t2')])
+    compose$.activeTab.set('thread-t2')
+    ui$.selectedThread.set('t2')
+
+    selectAdjacentKanbanThread(-1)
+
+    expect(kanban$.paneThreadId.get()).toBe('t1')
+  })
+
+  it('walks feed items by their own id and keeps them out of the card conversation', () => {
+    kanban$.paneColumnKey.set(kanbanBoardColumnKey('b1', starred))
+    compose$.tabs.set([{ ...threadTab('feed-1'), id: 'rss-1:item2', kind: 'reader', messageId: 'rss-1:item2' }])
+    compose$.activeTab.set('rss-1:item2')
+
+    selectAdjacentKanbanThread(1)
+
+    expect(compose$.activeTab.get()).toBe('rss-1:item3')
+    expect(kanban$.paneThreadId.get()).toBe('')
   })
 })

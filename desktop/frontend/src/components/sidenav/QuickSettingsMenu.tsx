@@ -40,7 +40,7 @@ export function QuickSettingsMenu({
       placement={anchor.placement}
       onClose={onClose}
       overlay
-      className="fixed z-50 max-h-[calc(100dvh-16px)] w-60 overflow-y-auto rounded-lg border border-border bg-chats p-2 shadow-2xl animate-fade-in text-primary"
+      className="fixed z-50 max-h-[calc(100dvh-16px)] w-60 overflow-y-auto rounded-lg p-2"
       onContextMenu={(e) => {
         e.preventDefault()
         e.stopPropagation()

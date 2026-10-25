@@ -3,7 +3,7 @@ import {
   chordFromEvent,
   DEFAULT_SHORTCUTS,
   formatShortcut,
-  isBareShortcut,
+  isBareKeystroke,
   isMac,
   isShortcutCustomized,
   matchShortcut,
@@ -53,13 +53,26 @@ describe('matchShortcut', () => {
     expect(matchShortcut(keydown('q'))).toBeNull()
     expect(matchShortcut(keydown('j', modKey))).toBeNull()
   })
+
+  it('matches ⌘/Ctrl+Q as quit, a chord no other default uses', () => {
+    expect(matchShortcut(keydown('q', modKey))).toBe('app.quit')
+    expect(shortcutConflict('app.quit', DEFAULT_SHORTCUTS['app.quit'])).toBeNull()
+  })
+
+  it('matches bare H as the HTML / plain text switch, a key no other default uses', () => {
+    expect(matchShortcut(keydown('h'))).toBe('thread.viewMode')
+    expect(shortcutConflict('thread.viewMode', DEFAULT_SHORTCUTS['thread.viewMode'])).toBeNull()
+    expect(SHORTCUT_GROUPS.find((group) => group.title === 'Threads')?.ids).toContain('thread.viewMode')
+  })
 })
 
-describe('isBareShortcut', () => {
-  it('is true for single-key and shift-only chords, false for mod chords', () => {
-    expect(isBareShortcut('thread.next')).toBe(true)
-    expect(isBareShortcut('thread.delete')).toBe(true)
-    expect(isBareShortcut('palette.open')).toBe(false)
+describe('isBareKeystroke', () => {
+  it('is true for single-key and shift-only keystrokes, false for mod or Alt ones', () => {
+    expect(isBareKeystroke(keydown('j'))).toBe(true)
+    expect(isBareKeystroke(keydown('#', { shiftKey: true }))).toBe(true)
+    expect(isBareKeystroke(keydown('k', modKey))).toBe(false)
+    expect(isBareKeystroke(keydown('K', { ...modKey, shiftKey: true }))).toBe(false)
+    expect(isBareKeystroke(keydown('j', { altKey: true }))).toBe(false)
   })
 })
 
@@ -100,12 +113,6 @@ describe('custom bindings', () => {
     expect(isShortcutCustomized('thread.prev')).toBe(false)
   })
 
-  it('re-evaluates bareness from the bound chord', () => {
-    setShortcutOverrides({ 'thread.next': { mod: true, key: 'j' }, 'palette.open': { key: 'p' } })
-    expect(isBareShortcut('thread.next')).toBe(false)
-    expect(isBareShortcut('palette.open')).toBe(true)
-  })
-
   it('reports the shortcut already holding a chord', () => {
     expect(shortcutConflict('thread.next', { key: 'k' })).toBe('thread.prev')
     expect(shortcutConflict('thread.next', { key: 'j' })).toBeNull()
@@ -125,6 +132,19 @@ describe('shortcutForChord', () => {
     expect(shortcutForChord({ key: 'ArrowDown' })).toBeNull()
     setShortcutOverrides({ 'thread.archive': { key: 'ArrowDown' } })
     expect(shortcutForChord({ key: 'ArrowDown' })).toBe('thread.archive')
+  })
+
+  it('opens the palette on the mod+shift+K alias too, unless something is bound there', () => {
+    expect(matchShortcut(keydown('K', { ...modKey, shiftKey: true }))).toBe('palette.open')
+    setShortcutOverrides({ 'palette.open': { mod: true, key: 'p' } })
+    expect(shortcutForChord({ mod: true, shift: true, key: 'k' })).toBe('palette.open')
+    setShortcutOverrides({ 'compose.new': { mod: true, shift: true, key: 'k' } })
+    expect(shortcutForChord({ mod: true, shift: true, key: 'k' })).toBe('compose.new')
+  })
+
+  it("lets a user's override win over another shortcut's default on the same chord", () => {
+    setShortcutOverrides({ 'thread.delete': { mod: true, key: 'q' } })
+    expect(shortcutForChord({ mod: true, key: 'q' })).toBe('thread.delete')
   })
 })
 
@@ -172,6 +192,9 @@ describe('sanitizeShortcutOverrides', () => {
 describe('SHORTCUT_GROUPS', () => {
   it('lists every shortcut exactly once, so all of them are visible and rebindable', () => {
     const listed = SHORTCUT_GROUPS.flatMap((group) => group.ids)
-    expect([...listed].sort()).toEqual([...SHORTCUT_IDS].sort())
+    // Except quit on macOS, where the native ⌘Q owns the chord and a rebind
+    // would do nothing.
+    const expected = SHORTCUT_IDS.filter((id) => !(isMac && id === 'app.quit'))
+    expect([...listed].sort()).toEqual([...expected].sort())
   })
 })

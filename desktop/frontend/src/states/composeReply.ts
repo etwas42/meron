@@ -10,16 +10,17 @@ import { compose$ } from './composeState'
 
 /** Pick the source message to reply to: the most recent loaded message in the
  * active thread that wasn't sent by us — its Reply-To/Cc are the headers we
- * should honor. Falls back to the thread header when no loaded message matches. */
+ * should honor — preferring one that accepts replies, so a no-reply
+ * notification or a bounce doesn't take the reply (the core decides which, see
+ * `accepts_replies`). Falls back to the thread header when no loaded message
+ * matches. */
 export function pickReplyTarget(activeT: Message, excludedId = ''): Message {
   const messages = mail$.messages.get()
   const ownAddrs = ownAddressSet(accounts$.get())
   const inThread = messages.filter((m) => m.thread_id === activeT.thread_id && m.id !== excludedId)
-  for (let i = inThread.length - 1; i >= 0; i--) {
-    const m = inThread[i]
-    if (!sentByUs(m, ownAddrs)) return m
-  }
-  return inThread[inThread.length - 1] ?? activeT
+  const received = inThread.filter((m) => !sentByUs(m, ownAddrs))
+  const replyable = received.filter((m) => m.reply?.accepts_replies !== false)
+  return replyable[replyable.length - 1] ?? received[received.length - 1] ?? inThread[inThread.length - 1] ?? activeT
 }
 
 /** Whether a loaded message is one we sent, as opposed to one we received.

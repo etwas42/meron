@@ -25,7 +25,7 @@ internal fun MeronMobileState.addOAuthAccount() {
     }
     val refreshToken = oauthRefreshToken.trim()
     if (refreshToken.isBlank()) {
-        status = "OAuth refresh token is required."
+        status = trs("mobile.status.oauthRefreshTokenRequired")
         return
     }
     val params =
@@ -38,7 +38,7 @@ internal fun MeronMobileState.addOAuthAccount() {
             refreshToken = refreshToken,
             tokenExpiresAt = oauthExpiresAt.trim().toLongOrNull() ?: 0,
         )
-    status = "Adding ${oauthProvider.replaceFirstChar { it.uppercase() }} account..."
+    status = trs("mobile.status.addingProviderAccount", mapOf("provider" to oauthProvider.replaceFirstChar { it.uppercase() }))
     scope.launch {
         runCatching {
             withContext(ioDispatcher) {
@@ -50,11 +50,11 @@ internal fun MeronMobileState.addOAuthAccount() {
             applyAccounts(it, preferEmail = params.email)
             screen = Screen.Mail
             errorBanner = null
-            status = "Added ${params.email}"
+            status = trs("mobile.status.accountAdded", mapOf("account" to params.email))
             syncCoreThreads(accountOverride = selectedCoreAccountId, folderOverride = INBOX_FOLDER, syncFirst = true)
         }.onFailure {
-            errorBanner = it.message ?: "Add OAuth failed"
-            status = "Add OAuth failed: ${it.message}"
+            errorBanner = it.message ?: trs("mobile.status.addAccountFailed")
+            status = trsError("mobile.status.addAccountFailed", it)
         }
     }
 }
@@ -79,7 +79,7 @@ internal fun MeronMobileState.connectGoogleDeviceAccount() {
             }
 
             GoogleDeviceAccountResult.Cancelled -> {
-                status = "Google sign-in cancelled."
+                status = trs("mobile.status.googleSignInCancelled")
             }
 
             is GoogleDeviceAccountResult.Failed -> {
@@ -88,14 +88,14 @@ internal fun MeronMobileState.connectGoogleDeviceAccount() {
                     status =
                         listOf(
                             deviceAuthError,
-                            "Google browser sign-in requires a configured HTTPS redirect URI.",
+                            trs("mobile.status.googleRedirectMissing"),
                         ).filter { it.isNotBlank() }.joinToString(" ")
                     return@connectGoogleDeviceAccount
                 }
                 status =
                     listOf(
                         deviceAuthError,
-                        "Opening Google sign-in in browser...",
+                        trs("mobile.status.openingGoogleSignIn"),
                     ).filter { it.isNotBlank() }.joinToString(" ")
                 launchOAuthFlow()
             }
@@ -104,7 +104,7 @@ internal fun MeronMobileState.connectGoogleDeviceAccount() {
 }
 
 private fun MeronMobileState.addGoogleDeviceAccount(account: GoogleDeviceAccount) {
-    status = "Connecting ${account.email}..."
+    status = trs("mobile.status.connectingAccount", mapOf("account" to account.email))
     scope.launch {
         runCatching {
             val params =
@@ -133,12 +133,12 @@ private fun MeronMobileState.addGoogleDeviceAccount(account: GoogleDeviceAccount
             applyAccounts(accounts, preferEmail = account.email)
             screen = Screen.Mail
             errorBanner = null
-            status = "Connected ${account.email}"
+            status = trs("mobile.status.accountConnected", mapOf("account" to account.email))
             // Fetch the inbox immediately instead of waiting for a manual sync.
             syncCoreThreads(accountOverride = accountId, folderOverride = INBOX_FOLDER, syncFirst = true)
         }.onFailure {
-            errorBanner = it.message ?: "Google sign-in failed"
-            status = "Google sign-in failed: ${it.message}"
+            errorBanner = it.message ?: trs("mobile.status.googleSignInFailed")
+            status = trsError("mobile.status.googleSignInFailed", it)
         }
     }
 }
@@ -182,7 +182,7 @@ internal suspend fun MeronMobileState.ensureManagedGoogleToken(
         ManagedTokenRefresh.Failed -> {
             // OS could not silently mint a token (e.g. consent revoked).
             googleReauthAccountId = accountId
-            errorBanner = "Google sign-in expired. Reconnect the account on this device."
+            errorBanner = trs("mobile.status.googleSignInExpired")
         }
 
         ManagedTokenRefresh.TransientError -> {
@@ -225,12 +225,12 @@ internal fun MeronMobileState.exchangeOAuthCode() {
     }
     val code = oauthAuthorizationCode.trim()
     if (code.isBlank()) {
-        status = "OAuth authorization code is required."
+        status = trs("mobile.status.oauthCodeRequired")
         return
     }
     val clientId = bakedOAuthClientId()
     if (clientId.isBlank()) {
-        status = "OAuth client ID is required."
+        status = trs("mobile.status.oauthClientIdRequired")
         return
     }
     val params =
@@ -253,7 +253,7 @@ internal fun MeronMobileState.exchangeOAuthCode() {
             "tokenUrlPresent=${params.tokenUrl.isNotBlank()} codeLength=${params.code.length} " +
             "verifierPresent=${params.codeVerifier.isNotBlank()}",
     )
-    status = "Exchanging OAuth code..."
+    status = trs("mobile.status.exchangingOAuthCode")
     val previousAccountIds = coreAccounts.map { it.id }.toSet()
     scope.launch {
         runCatching {
@@ -275,8 +275,8 @@ internal fun MeronMobileState.exchangeOAuthCode() {
             connectedAccount?.let { selectedCoreAccountId = it.id }
             screen = Screen.Mail
             errorBanner = null
-            status = connectedAccount?.email?.takeIf { it.isNotBlank() }?.let { "Connected $it" }
-                ?: if (params.email.isBlank()) "Connected account" else "Connected ${params.email}"
+            status = connectedAccount?.email?.takeIf { it.isNotBlank() }?.let { trs("mobile.status.accountConnected", mapOf("account" to it)) }
+                ?: if (params.email.isBlank()) trs("mobile.status.accountConnectedUnnamed") else trs("mobile.status.accountConnected", mapOf("account" to params.email))
             val syncAccountId = connectedAccount?.id ?: selectedCoreAccountId
             Log.i(
                 "Meron.OAuth",
@@ -287,8 +287,8 @@ internal fun MeronMobileState.exchangeOAuthCode() {
         }.onFailure {
             Log.w("Meron.OAuth", "exchange failed provider=${params.provider}: ${it.message}", it)
             oauthAuthorizationCode = ""
-            errorBanner = it.message ?: "OAuth exchange failed"
-            status = "OAuth exchange failed: ${it.message}"
+            errorBanner = it.message ?: trs("mobile.status.oauthExchangeFailed")
+            status = trsError("mobile.status.oauthExchangeFailed", it)
         }
     }
 }
@@ -297,7 +297,7 @@ internal fun MeronMobileState.exchangeOAuthCode() {
 internal fun MeronMobileState.launchOAuthFlow() {
     val clientId = bakedOAuthClientId()
     if (clientId.isBlank()) {
-        status = "OAuth client ID is required."
+        status = trs("mobile.status.oauthClientIdRequired")
         return
     }
     val redirectUri = resolvedOAuthRedirectUri()
@@ -325,12 +325,12 @@ internal fun MeronMobileState.launchOAuthFlow() {
                 loginHint = oauthEmail.trim(),
             ),
         )
-    status = "Opened ${oauthProvider.replaceFirstChar { it.uppercase() }} sign-in"
+    status = trs("mobile.status.openedProviderSignIn", mapOf("provider" to oauthProvider.replaceFirstChar { it.uppercase() }))
     services.openOAuthUrl(
         url = url,
         callbackScheme = redirectUri.substringBefore(':', missingDelimiterValue = ""),
         onCallback = ::handleOAuthCallback,
-        onFailure = { message -> status = "OAuth browser launch failed: $message" },
+        onFailure = { message -> status = withReason(trs("mobile.android.oauthBrowserLaunchFailed"), message) { key, args -> trs(key, args) } },
     )
 }
 
@@ -363,16 +363,16 @@ internal fun MeronMobileState.handleOAuthCallback(rawUrl: String) {
             addSection = 0
             passwordServerSettingsOpen = false
             screen = Screen.AddAccount
-            status = "Finishing ${oauthProvider.replaceFirstChar { it.uppercase() }} sign-in..."
+            status = trs("accounts.oauth.finishingSignIn")
             clearPendingOAuthFlow(prefs)
             exchangeOAuthCode()
         } else {
             Log.w("Meron.OAuth", "callback did not match redirectUri=$oauthRedirectUri")
-            status = "OAuth callback did not match expected redirect URI."
+            status = trs("mobile.status.oauthCallbackMismatch")
         }
     }.onFailure {
         Log.w("Meron.OAuth", "callback parse failed: ${it.message}", it)
-        status = "OAuth callback failed: ${it.message}"
+        status = trsError("mobile.status.oauthCallbackFailed", it)
     }
 }
 

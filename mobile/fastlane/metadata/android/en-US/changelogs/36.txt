@@ -1,0 +1,7 @@
+- Support Material You dynamic color themes on Android
+- Add match-system theme following OS appearance and support dark message bodies
+- Auto-fit chat bubbles and add bottom reader actions
+- Reorganize settings into General, Messages, and Composer pages
+- Share attachments and files via system share sheet on iOS
+- Mark read only messages actually seen in the viewport
+- Recover from closed pooled IMAP sessions and replay dropped flag writes

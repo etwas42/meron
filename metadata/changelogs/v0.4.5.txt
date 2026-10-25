@@ -1,0 +1,2 @@
+- Redesign the reader tab, frost content under floating controls
+- Route Flatpak save and open dialogs through the file chooser portal

@@ -1,0 +1,4 @@
+- Custom title bar
+- Theme polish with Meron Dark as default and tonal panes
+- Support Ctrl+Q to quit on Linux and Windows
+- Fix sliced thread prints on Linux

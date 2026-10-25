@@ -11,12 +11,11 @@ import {
   Search,
   SquarePen,
   Users,
-  X,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
 import { useEscapeKey } from '../../lib/useEscapeKey'
-import { openExternal } from '../../lib/native'
+import { copyText, openExternal } from '../../lib/native'
 import { downloadAttachment, openAttachment } from '../../states/mail'
 import { Avatar } from '../avatar/Avatar'
 import { IconButton } from '../button/IconButton'
@@ -68,6 +67,9 @@ interface ConversationDetailsPanelProps {
   onComposeTo: (person: Participant) => void
   onViewMessagesWith: (person: Participant) => void
   onClose: () => void
+  /** True while the panel slides shut: it is still mounted, but Escape is no
+   * longer its to take. */
+  closing?: boolean
 }
 
 type View = 'overview' | 'media' | 'files'
@@ -84,6 +86,7 @@ export function ConversationDetailsPanel({
   onComposeTo,
   onViewMessagesWith,
   onClose,
+  closing = false,
 }: ConversationDetailsPanelProps) {
   const { t } = useTranslation()
   const [view, setView] = useState<View>('overview')
@@ -93,8 +96,8 @@ export function ConversationDetailsPanel({
     setView('overview')
   }, [scopeTitle])
 
-  // Close the overlay drawer on Escape (matches the gallery/search behavior).
-  useEscapeKey(onClose)
+  // Close the details pane on Escape (matches the gallery/search behavior).
+  useEscapeKey(onClose, !closing)
 
   return (
     <>
@@ -105,16 +108,12 @@ export function ConversationDetailsPanel({
         className="
           absolute inset-y-0 right-0 z-30 w-[340px] max-w-[85vw] shadow-2xl
           min-[1100px]:relative min-[1100px]:inset-auto min-[1100px]:z-auto min-[1100px]:shadow-none min-[1100px]:max-w-none
-          flex shrink-0 flex-col border-l border-border bg-header
+          flex shrink-0 flex-col bg-header
           animate-slide-in-right
         "
       >
         {/* Header */}
-        {view === 'overview' ? (
-          <div className="flex h-12 shrink-0 items-center justify-end border-b border-border px-4">
-            <IconButton icon={X} iconSize={18} label={t('chat.closeEsc')} onClick={onClose} />
-          </div>
-        ) : (
+        {view !== 'overview' && (
           <div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-border px-4 py-3">
             <div className="min-w-0">
               <h3 className="truncate text-sm font-bold text-primary">
@@ -136,7 +135,6 @@ export function ConversationDetailsPanel({
                 label={t('buttons.back')}
                 onClick={() => setView('overview')}
               />
-              <IconButton icon={X} iconSize={18} label={t('chat.closeEsc')} onClick={onClose} />
             </div>
           </div>
         )}
@@ -274,7 +272,7 @@ export function ConversationDetailsPanel({
           onClose={() => setPersonMenu(null)}
           overlay
           overlayClassName="fixed inset-0 z-[80]"
-          className="fixed z-[81] min-w-[180px] rounded-xl border border-border bg-header p-1 shadow-xl"
+          className="fixed z-[81] min-w-[180px] bg-header shadow-xl"
           onContextMenu={(event) => event.preventDefault()}
         >
           <MenuItem
@@ -289,7 +287,7 @@ export function ConversationDetailsPanel({
             icon={<Copy size={13} className="text-accent" />}
             label={t('chat.copyEmailAddress')}
             onClick={() => {
-              navigator.clipboard?.writeText(personMenu.person.email).catch(() => undefined)
+              copyText(personMenu.person.email).catch(() => undefined)
               setPersonMenu(null)
             }}
           />

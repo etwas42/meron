@@ -2,14 +2,16 @@ import { useEffect, useRef } from 'react'
 import { useValue } from '@legendapp/state/react'
 import { boot } from './boot'
 import { invoke } from './lib/bridge'
+import { installWindowChrome, syncWindowFrame } from './lib/windowChrome'
 import { ui$, showToast } from './states/ui'
 import { mail$, loadThreads, loadThread, findLocalThread } from './states/mail'
 import { loadFolders, refreshAccountFoldersCache, inboxUnread } from './states/mailFolders'
 import { openMailtoCompose, openThreadTabById } from './states/compose'
 import { accounts$ } from './states/accounts'
+import type { Account } from './types'
 import { kanban$ } from './states/kanban'
 import { setSyncError, clearSyncErrorFor } from './states/connectivity'
-import { settings$, applyDocumentLanguage } from './states/settings'
+import { settings$, applyDocumentLanguage, watchSystemAppearance } from './states/settings'
 import { configurationRefresh } from './lib/configurationRefresh'
 import { applyUpdateStatus, loadUpdateStatus, runUpdateCheck } from './states/update'
 import type { UpdateStatus } from './lib/update'
@@ -32,6 +34,7 @@ const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
 // mailbox/thread loading, and the tray unread badge. Kept out of the component so
 // App stays a layout shell.
 export function useAppEffects() {
+  useEffect(() => watchSystemAppearance(), [])
   useEffect(() => {
     const eventsOn = (window as any).runtime?.EventsOn
     if (typeof eventsOn !== 'function') return
@@ -51,6 +54,7 @@ export function useAppEffects() {
   const selectedThread = useValue(ui$.selectedThread)
   const query = useValue(ui$.query)
   const filterMode = useValue(ui$.filterMode)
+  const attachmentsOnly = useValue(ui$.attachmentsOnly)
   const activeBoardId = useValue(kanban$.activeBoardId)
   const startupSyncDone = useRef(false)
   const language = useValue(settings$.language)
@@ -78,6 +82,31 @@ export function useAppEffects() {
     applyDocumentLanguage(targetLanguage)
   }, [language])
 
+  // The backend samples the window on every resize (the webview fires at most
+  // one per frame) and saves once it settles. Sampling has to keep pace: a
+  // debounced sample taken after a maximise would miss the unmaximised size.
+  // The reply also says whether to round the window's bottom corners (Linux,
+  // while the window floats; see roundedWindowCorners in Go). GTK's state can
+  // settle after the resize (tiling), so window.stateChanged asks again. A
+  // first sample is taken before the first render (main.tsx).
+  useEffect(() => {
+    const onResize = () => {
+      void syncWindowFrame().catch(() => {})
+    }
+    window.addEventListener('resize', onResize)
+    const eventsOn = (window as any).runtime?.EventsOn
+    const offStateChanged = typeof eventsOn === 'function' ? eventsOn('window.stateChanged', onResize) : null
+    // The window may have changed between the pre-render sample and now (main.go
+    // maximises it on DOM ready), with neither event heard yet.
+    onResize()
+    return () => {
+      window.removeEventListener('resize', onResize)
+      if (typeof offStateChanged === 'function') offStateChanged()
+    }
+  }, [])
+
+  useEffect(() => installWindowChrome(), [])
+
   useEffect(() => {
     void boot().catch((error) => {
       const message = error instanceof Error ? error.message : String(error)
@@ -90,12 +119,14 @@ export function useAppEffects() {
     const unsubAccount = ui$.selectedAccount.onChange(() => mail$.readThreads.set({}))
     const unsubFolder = ui$.selectedFolder.onChange(() => mail$.readThreads.set({}))
     const unsubFilter = ui$.filterMode.onChange(() => mail$.readThreads.set({}))
+    const unsubAttachments = ui$.attachmentsOnly.onChange(() => mail$.readThreads.set({}))
     const unsubBoard = kanban$.activeBoardId.onChange(() => mail$.readThreads.set({}))
     const unsubGlobalFilter = kanban$.globalFilter.onChange(() => mail$.readThreads.set({}))
     return () => {
       unsubAccount()
       unsubFolder()
       unsubFilter()
+      unsubAttachments()
       unsubBoard()
       unsubGlobalFilter()
     }
@@ -262,7 +293,7 @@ export function useAppEffects() {
       void loadThreads()
     }, SEARCH_DEBOUNCE_MS)
     return () => window.clearTimeout(timer)
-  }, [selectedAccount, selectedFolder, query, filterMode, activeBoardId])
+  }, [selectedAccount, selectedFolder, query, filterMode, attachmentsOnly, activeBoardId])
 
   useEffect(() => {
     if (!selectedThread) return
@@ -315,27 +346,44 @@ export function useAppEffects() {
       },
     )
 
-    const offNew = eventsOn('mail.newMessages', (detail: { account?: string; folder?: string; count?: number }) => {
-      // A successful fetch proves connectivity is back for this account.
-      clearSyncErrorFor(detail?.account ?? null)
-      // New mail arrived somewhere, so the tray should reflect unread immediately —
-      // independent of which account/folder is selected. Clearing back to "read" is
-      // handled by the reactive tray effect once the folder cache refreshes.
-      setTrayUnread(true)
-      // Keep the side navigation's per-account (and unified) unread badges honest for
-      // *every* account, not just the selected one. get_folders recomputes unread
-      // live, so this cache-only refresh picks up the new mail even when the
-      // account is only visible as a Kanban column. Without it the badge stays
-      // dark while the column (which falls back to counting loaded cards) shows
-      // the real count. Done before the selection early-return below.
-      if (detail?.account) void refreshAccountFoldersCache(detail.account, false)
-      refreshOpenThread(detail?.account)
-      if (detail?.account && selectedAccount !== 'unified' && detail.account !== selectedAccount) return
-      const folder = detail?.folder ?? 'inbox'
-      const count = detail?.count ?? 1
-      showToast(`New mail in ${folder} (+${count})`)
-      if (selectedAccount) void refreshCurrentMailbox().catch(console.error)
+    // Core refused to use this account's sign-in (missing, or rejected by the
+    // provider). Re-read the list so its avatar shows "needs reconnect" without
+    // a restart. Watchers repeat this while they retry, so only the first one
+    // for an account does anything.
+    const offNeedsReconnect = eventsOn('account.needsReconnect', (detail: { account?: string }) => {
+      const flagged = accounts$.get().find((account) => account.id === detail?.account)
+      if (!flagged || flagged.needs_reconnect === true) return
+      void invoke<{ accounts: Account[] }>('account.list')
+        .then((res) => {
+          if (res.accounts.length) accounts$.set(res.accounts)
+        })
+        .catch(console.error)
     })
+
+    const offNew = eventsOn(
+      'mail.newMessages',
+      (detail: { account?: string; folder?: string; folderName?: string; count?: number }) => {
+        // A successful fetch proves connectivity is back for this account.
+        clearSyncErrorFor(detail?.account ?? null)
+        // New mail arrived somewhere, so the tray should reflect unread immediately —
+        // independent of which account/folder is selected. Clearing back to "read" is
+        // handled by the reactive tray effect once the folder cache refreshes.
+        setTrayUnread(true)
+        // Keep the side navigation's per-account (and unified) unread badges honest for
+        // *every* account, not just the selected one. get_folders recomputes unread
+        // live, so this cache-only refresh picks up the new mail even when the
+        // account is only visible as a Kanban column. Without it the badge stays
+        // dark while the column (which falls back to counting loaded cards) shows
+        // the real count. Done before the selection early-return below.
+        if (detail?.account) void refreshAccountFoldersCache(detail.account, false)
+        refreshOpenThread(detail?.account)
+        if (detail?.account && selectedAccount !== 'unified' && detail.account !== selectedAccount) return
+        const folder = detail?.folderName || (detail?.folder ?? 'inbox')
+        const count = detail?.count ?? 1
+        showToast(`New mail in ${folder} (+${count})`)
+        if (selectedAccount) void refreshCurrentMailbox().catch(console.error)
+      },
+    )
 
     const offSynced = eventsOn('mail.synced', (detail: { account?: string; folders?: boolean }) => {
       clearSyncErrorFor(detail?.account ?? null)
@@ -368,6 +416,7 @@ export function useAppEffects() {
     return () => {
       if (typeof offError === 'function') offError()
       if (typeof offNew === 'function') offNew()
+      if (typeof offNeedsReconnect === 'function') offNeedsReconnect()
       if (typeof offSynced === 'function') offSynced()
       if (typeof offSentCopy === 'function') offSentCopy()
     }

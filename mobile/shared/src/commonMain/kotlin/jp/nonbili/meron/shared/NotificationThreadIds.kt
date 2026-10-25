@@ -38,9 +38,44 @@ fun notificationThreadId(
     return "$accountId#$coreFolder#t.$encoded"
 }
 
-/** True when a thread key survives being moved between folders.
+/** The account, folder and thread key a composite `thread_id` was built from. */
+data class ParsedThreadId(
+    val accountId: String,
+    val folder: String,
+    val threadKey: String,
+)
+
+/**
+ * The inverse of [notificationThreadId]: split a stored `thread_id` back into
+ * the fields a thread-open needs.
  *
- *  Header-derived keys are stable, so undoing an archive can address the thread
- *  in its new folder. A uid-derived key cannot: IMAP assigns fresh uids in the
- *  target mailbox, so the old uid names nothing there. */
-fun notificationThreadKeyIsStableAcrossMove(threadKey: String): Boolean = threadKey.isNotBlank() && !threadKey.startsWith("uid:")
+ * A Tasks entry keeps only the composite id — that is all the core hands the
+ * clients — but reopening the thread on mobile needs the folder to load and the
+ * key to match against, so the id has to come apart again.
+ *
+ * Returns null for anything that is not the three-part shape. Feed ids preserve
+ * their subscription key when the middle segment is `rss`.
+ */
+@OptIn(ExperimentalEncodingApi::class)
+fun parseNotificationThreadId(threadId: String): ParsedThreadId? {
+    val separator = threadId.lastIndexOf('#')
+    if (separator <= 0) return null
+    val head = threadId.substring(0, separator)
+    val key = threadId.substring(separator + 1)
+    val folderSeparator = head.indexOf('#')
+    if (folderSeparator <= 0) return null
+    val accountId = head.substring(0, folderSeparator)
+    val folder = head.substring(folderSeparator + 1)
+    if (accountId.isBlank() || folder.isBlank() || key.isBlank()) return null
+    val threadKey =
+        if (accountIdIsRss(accountId) && folder == "rss") {
+            key
+        } else if (key.startsWith("t.")) {
+            val padded = key.substring(2).padEnd((key.length - 2 + 3) / 4 * 4, '=')
+            runCatching { Base64.UrlSafe.decode(padded).decodeToString() }.getOrNull() ?: return null
+        } else {
+            "uid:$key"
+        }
+    if (threadKey.isBlank()) return null
+    return ParsedThreadId(accountId, folder, threadKey)
+}

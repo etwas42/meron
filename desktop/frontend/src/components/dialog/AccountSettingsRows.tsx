@@ -12,14 +12,16 @@ function Switch({ checked, onChange, label }: { checked: boolean; onChange: () =
       aria-checked={checked}
       aria-label={label}
       onClick={onChange}
-      className={`relative inline-flex h-5.5 w-10 shrink-0 cursor-pointer rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
+      className={`relative inline-flex h-5.5 w-10 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
         checked ? 'bg-accent' : 'bg-active'
       }`}
     >
+      {/* Slides by margin, not translate: WebKitGTK's accelerated transform
+          transitions paint the start position for one frame as they finish. */}
       <span
-        className={`pointer-events-none inline-block h-4.5 w-4.5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-          checked ? 'translate-x-4.5' : 'translate-x-0.2'
-        } relative top-[1px]`}
+        className={`pointer-events-none inline-block h-4.5 w-4.5 rounded-full bg-white shadow ring-0 transition-[margin] duration-200 ease-in-out ${
+          checked ? 'ml-4.5' : 'ml-0.5'
+        }`}
       />
     </button>
   )

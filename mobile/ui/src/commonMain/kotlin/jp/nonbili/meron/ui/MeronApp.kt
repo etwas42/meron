@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
@@ -184,6 +185,7 @@ import jp.nonbili.meron.shared.parseThreadListResponse
 import jp.nonbili.meron.shared.parseThreadReadPage
 import jp.nonbili.meron.shared.recipientTail
 import jp.nonbili.meron.shared.replaceRecipientTail
+import jp.nonbili.meron.shared.threadIdIsRss
 import jp.nonbili.meron.shared.toReplyMailParams
 import jp.nonbili.meron.shared.toSaveDraftParams
 import jp.nonbili.meron.shared.toSendMailParams
@@ -219,6 +221,7 @@ fun MeronApp(
     incomingOAuthCallbackUrl: String? = null,
     onOAuthCallbackConsumed: () -> Unit = {},
     incomingNotificationThreadTarget: NotificationThreadTarget? = null,
+    onNotificationThreadTargetConsumed: () -> Unit = {},
     /**
      * Notified after the language has been stored and pushed to the OS, for hosts
      * that must react — Android recreates its Activity to reload resources.
@@ -258,7 +261,9 @@ fun MeronApp(
     // go through `backedPrefs` like every other setting. `putString` stages
     // synchronously, which is what makes them survive the Activity recreation the
     // language change triggers.
-    var appearanceMode by remember(backedPrefs) { mutableStateOf(loadAppearanceMode(backedPrefs)) }
+    var customThemes by remember(backedPrefs) { mutableStateOf(loadCustomThemes(backedPrefs)) }
+    var themeChoice by remember(backedPrefs) { mutableStateOf(loadThemeChoice(backedPrefs, customThemes)) }
+    val systemDark = isSystemInDarkTheme()
     // Android 13+ lets the language be changed from system settings while the app
     // is not running; that choice outranks the stored tag.
     val systemLanguageTag = remember(locale) { locale.systemLanguageTag() }
@@ -276,9 +281,20 @@ fun MeronApp(
         }
     }
     val deviceLanguageTag = remember(locale) { resolveDeviceLanguageTag(locale.deviceLanguageTag()) }
-    val onAppearanceModeChange: (AppAppearanceMode) -> Unit = { mode ->
-        appearanceMode = mode
-        saveAppearanceMode(backedPrefs, mode)
+    val onThemeChoiceChange: (ThemeChoice) -> Unit = { choice ->
+        themeChoice = choice
+        saveThemeChoice(backedPrefs, choice)
+    }
+    // An imported theme is applied straight away, the way picking a swatch is.
+    val onImportCustomTheme: (CustomTheme) -> Unit = { theme ->
+        customThemes = customThemes + theme
+        saveCustomThemes(backedPrefs, customThemes)
+        onThemeChoiceChange(themeChoice.select(theme))
+    }
+    val onDeleteCustomTheme: (CustomTheme) -> Unit = { theme ->
+        customThemes = customThemes.filterNot { it.id == theme.id }
+        saveCustomThemes(backedPrefs, customThemes)
+        onThemeChoiceChange(themeChoice.without(theme))
     }
     val onAppLanguageChange: (String) -> Unit = { tag ->
         appLanguageTag = tag
@@ -304,8 +320,15 @@ fun MeronApp(
         // rather than to English.
         LocalAppLocale provides appLanguageTag.ifBlank { deviceLanguageTag },
         LocalPlatformServices provides services,
+        LocalAvatarCore provides core,
     ) {
-        MeronTheme(appearanceMode = appearanceMode, messageFontScale = state.messageFontScale) {
+        MeronTheme(
+            appearanceMode = themeChoice.resolve(systemDark),
+            messageFontScale = state.messageFontScale,
+            darkMailBodies = state.darkMailBodies,
+            autoFitMessages = state.autoFitMessages,
+            chatFullMessages = state.chatFullMessages,
+        ) {
             MeronMobileScreenContent(
                 state = state,
                 drawerState = drawerState,
@@ -315,8 +338,13 @@ fun MeronApp(
                 incomingOAuthCallbackUrl = incomingOAuthCallbackUrl,
                 onOAuthCallbackConsumed = onOAuthCallbackConsumed,
                 incomingNotificationThreadTarget = incomingNotificationThreadTarget,
-                appearanceMode = appearanceMode,
-                onAppearanceModeChange = onAppearanceModeChange,
+                onNotificationThreadTargetConsumed = onNotificationThreadTargetConsumed,
+                themeChoice = themeChoice,
+                systemDark = systemDark,
+                onThemeChoiceChange = onThemeChoiceChange,
+                customThemes = customThemes,
+                onImportCustomTheme = onImportCustomTheme,
+                onDeleteCustomTheme = onDeleteCustomTheme,
                 appLanguageTag = appLanguageTag,
                 onAppLanguageChange = onAppLanguageChange,
                 packageName = mobileHost.packageName,
@@ -364,8 +392,13 @@ private fun MeronMobileScreenContent(
     incomingOAuthCallbackUrl: String?,
     onOAuthCallbackConsumed: () -> Unit,
     incomingNotificationThreadTarget: NotificationThreadTarget?,
-    appearanceMode: AppAppearanceMode,
-    onAppearanceModeChange: (AppAppearanceMode) -> Unit,
+    onNotificationThreadTargetConsumed: () -> Unit,
+    themeChoice: ThemeChoice,
+    systemDark: Boolean,
+    onThemeChoiceChange: (ThemeChoice) -> Unit,
+    customThemes: List<CustomTheme>,
+    onImportCustomTheme: (CustomTheme) -> Unit,
+    onDeleteCustomTheme: (CustomTheme) -> Unit,
     appLanguageTag: String,
     onAppLanguageChange: (String) -> Unit,
     packageName: String,
@@ -373,6 +406,7 @@ private fun MeronMobileScreenContent(
     coreProtocolVersion: Int,
 ) {
     with(state) {
+        MailTaskListPicker(state)
         val navController = rememberNavController()
         val currentBackStackEntry by navController.currentBackStackEntryAsState()
         val startRoute = remember { screen.route() }
@@ -489,6 +523,10 @@ private fun MeronMobileScreenContent(
                                 }
                             }
 
+                            "account.needsReconnect" -> {
+                                refreshAccountReconnectState(event.detailJson.jsonStringValue("account"))
+                            }
+
                             "error" -> {
                                 // Watcher/runtime failures are regular core events,
                                 // not `log` events. Keep them visible in Logcat and
@@ -575,14 +613,14 @@ private fun MeronMobileScreenContent(
                     .onSuccess { opml ->
                         val accountId = selectedCoreAccountId
                         if (accountId == UNIFIED_ACCOUNT_ID || accountId.isBlank()) {
-                            status = "Select an RSS account first."
+                            status = trs("mobile.status.selectRssAccountFirst")
                             return@onSuccess
                         }
                         if (!coreLoaded) {
                             status = coreUnavailableMessage
                             return@onSuccess
                         }
-                        scope.launch {
+                        scope.launchThreadListRead(threadRemovalGuard) { read ->
                             runCatching {
                                 withContext(ioDispatcher) {
                                     val client = MobileMailCommandClient(core)
@@ -596,6 +634,7 @@ private fun MeronMobileScreenContent(
                                                 folderId = INBOX_FOLDER,
                                                 query = mailSearch.trim(),
                                                 filter = mailFilter.protocolValue(),
+                                                attachments = mailAttachmentsOnly,
                                             ),
                                         )
                                     Triple(importJson, foldersJson, threadsJson)
@@ -603,18 +642,18 @@ private fun MeronMobileScreenContent(
                             }.onSuccess { (importJson, foldersJson, threadsJson) ->
                                 val imported = parseOpmlImportCountResponse(importJson)
                                 coreFolders = parseFolderListResponse(foldersJson)
-                                coreThreads = withLocalDraftFlags(parseThreadListResponse(threadsJson))
+                                coreThreads = withLocalDraftFlags(read.filter(parseThreadListResponse(threadsJson)))
                                 selectedCoreFolder = INBOX_FOLDER
                                 visibleMailboxKey =
-                                    mailboxCacheKey(accountId, INBOX_FOLDER, mailSearch, mailFilter)
+                                    mailboxCacheKey(accountId, INBOX_FOLDER, mailSearch, mailFilter, mailAttachmentsOnly)
                                 mailboxPageDepth = MAILBOX_PAGE_SIZE
-                                status = if (imported == 0) "No new feeds imported" else "Imported $imported feed(s)"
+                                status = if (imported == 0) trs("feeds.toast.noNewFeedsToImport") else trs("feeds.toast.importedFeeds", mapOf("count" to imported))
                             }.onFailure {
-                                status = "OPML import failed: ${it.message}"
+                                status = trsError("mobile.status.opmlImportFailed", it)
                             }
                         }
                     }.onFailure {
-                        status = "OPML file read failed: ${it.message}"
+                        status = trsError("mobile.status.opmlReadFailed", it)
                     }
             }
         }
@@ -625,9 +664,9 @@ private fun MeronMobileScreenContent(
                     .onSuccess { saved ->
                         if (saved) {
                             pendingOpmlExport = ""
-                            status = "Exported OPML"
+                            status = trs("feeds.toast.feedsExported")
                         }
-                    }.onFailure { status = "OPML export failed: ${it.message}" }
+                    }.onFailure { status = trsError("mobile.status.opmlExportFailed", it) }
             }
         }
         launchBackupExport = { fileName ->
@@ -637,7 +676,7 @@ private fun MeronMobileScreenContent(
                 result
                     .onSuccess { saved ->
                         if (saved) status = trs("settings.backup.exported")
-                    }.onFailure { status = "Backup export failed: ${it.message}" }
+                    }.onFailure { status = trsError("mobile.status.backupExportFailed", it) }
             }
         }
         // Restore starts at the file picker; the core decides whether what came
@@ -647,7 +686,7 @@ private fun MeronMobileScreenContent(
                 if (picked != null) {
                     runCatching { picked.bytes.decodeToString() }
                         .onSuccess { document -> importBackup(document) }
-                        .onFailure { status = "${trs("settings.backup.restoreFailed")}: ${it.message}" }
+                        .onFailure { status = trsError("settings.backup.restoreFailed", it) }
                 }
             }
         }
@@ -662,11 +701,11 @@ private fun MeronMobileScreenContent(
                         services.saveFile(bytes, fileName, attachment.mimeType.ifBlank { "application/octet-stream" }) { result ->
                             result
                                 .onSuccess { saved ->
-                                    if (saved) status = "Saved ${attachment.filename.ifBlank { "attachment" }}"
-                                }.onFailure { status = "Attachment save failed: ${it.message}" }
+                                    if (saved) status = trs("chat.savedAttachment", mapOf("filename" to attachment.filename.ifBlank { fileName }))
+                                }.onFailure { status = trsError("mobile.status.attachmentSaveFailed", it) }
                         }
                     }.onFailure {
-                        status = "Attachment save failed: ${it.message}"
+                        status = trsError("mobile.status.attachmentSaveFailed", it)
                     }
                 }
             }
@@ -677,9 +716,9 @@ private fun MeronMobileScreenContent(
                     runCatching { picked.toDraftAttachment() }
                         .onSuccess {
                             onPicked(it)
-                            status = "Attached ${it.displayName}"
+                            status = trs("mobile.status.attachedFile", mapOf("name" to it.displayName))
                         }.onFailure {
-                            status = "Attachment failed: ${it.message}"
+                            status = trsError("mobile.status.attachFailed", it)
                         }
                 }
             }
@@ -724,13 +763,13 @@ private fun MeronMobileScreenContent(
                             }.onSuccess {
                                 accountJson = it
                                 coreAccounts = parseAccountListResponse(it)
-                                status = if (target.wallpaper) "Updated chat wallpaper" else "Updated avatar"
+                                status = trs(if (target.wallpaper) "mobile.status.chatWallpaperUpdated" else "mobile.status.avatarUpdated")
                             }.onFailure {
-                                status = "Media upload failed: ${it.message}"
+                                status = trsError(if (target.wallpaper) "wallpaper.uploadFailed" else "settings.toast.failedToUploadAvatar", it)
                             }
                         }
                     }.onFailure {
-                        status = "Media read failed: ${it.message}"
+                        status = trsError("mobile.status.mediaReadFailed", it)
                     }
                 }
             }
@@ -750,7 +789,7 @@ private fun MeronMobileScreenContent(
                             "",
                             mediaUrl,
                         )
-                        status = "Updated board wallpaper"
+                        status = trs("mobile.status.boardWallpaperUpdated")
                     } else {
                         updateKanbanBoard(
                             target.board.id,
@@ -759,7 +798,7 @@ private fun MeronMobileScreenContent(
                             target.board.wallpaperPresetId,
                             target.board.wallpaperUrl,
                         )
-                        status = "Updated board avatar"
+                        status = trs("mobile.status.boardAvatarUpdated")
                     }
                 }
             }
@@ -772,9 +811,14 @@ private fun MeronMobileScreenContent(
             }
         }
 
-        LaunchedEffect(status) {
+        LaunchedEffect(status, statusIsError) {
             if (status.isNotBlank()) {
-                snackbarHost.showSnackbar(status)
+                snackbarHost.showSnackbar(
+                    message = status,
+                    withDismissAction = statusIsError,
+                    duration = if (statusIsError) SnackbarDuration.Indefinite else SnackbarDuration.Short,
+                )
+                if (statusIsError) status = ""
             }
         }
 
@@ -787,7 +831,7 @@ private fun MeronMobileScreenContent(
             incomingMailtoDraft?.let { draft ->
                 openMailtoCompose(draft) {
                     onMailtoDraftConsumed()
-                    status = "Loaded compose draft"
+                    status = trs("mobile.status.composeDraftLoaded")
                 }
             }
         }
@@ -800,7 +844,10 @@ private fun MeronMobileScreenContent(
         }
 
         LaunchedEffect(incomingNotificationThreadTarget) {
-            incomingNotificationThreadTarget?.let(::openNotificationThread)
+            incomingNotificationThreadTarget?.let { target ->
+                openNotificationThread(target)
+                onNotificationThreadTargetConsumed()
+            }
         }
 
         // Load persisted accounts once on startup so they survive app restarts.
@@ -841,10 +888,10 @@ private fun MeronMobileScreenContent(
                 conversationHtmlOverrides[account.id] ?: account.conversationHtml
             } ?: true
         val activeKanbanBoard = kanbanBoards.firstOrNull { it.id == activeKanbanBoardId } ?: kanbanBoards.firstOrNull()
-        val appBarTitle = if (selectedCoreAccountId == UNIFIED_ACCOUNT_ID) "Unified inbox" else "Inbox"
+        val appBarTitle = tr(if (selectedCoreAccountId == UNIFIED_ACCOUNT_ID) "kanban.columns.unifiedInbox" else "folders.roles.inbox")
         val appBarSubtitle =
             if (selectedCoreAccountId == UNIFIED_ACCOUNT_ID) {
-                "All accounts"
+                tr("kanban.allAccounts")
             } else {
                 selectedAccount?.email?.ifBlank { selectedAccount.displayName }.orEmpty()
             }
@@ -920,21 +967,38 @@ private fun MeronMobileScreenContent(
                             selectedCoreThread = t.copy(starred = !t.starred)
                         }
                     },
-                    moveFolders =
+                    onAddToTasks =
                         selectedCoreThread
-                            ?.let { thread -> foldersByAccount[thread.accountId].orEmpty() }
-                            .orEmpty(),
+                            ?.takeIf { tasksEnabled && !threadIdIsRss(it.id) }
+                            ?.let { thread ->
+                                {
+                                    scope.launch {
+                                        requestAddMailToTasks(thread)
+                                    }
+                                    Unit
+                                }
+                            },
+                    moveFolders =
+                        coreAccounts
+                            .filterNot { accountSummaryIsRss(it) }
+                            .flatMap { account -> foldersByAccount[account.id].orEmpty() },
+                    transferAccounts = coreAccounts.filterNot { accountSummaryIsRss(it) },
+                    loadTransferFolders = {
+                        selectedCoreThread?.let { thread -> ensureThreadActionFolders(thread, includeAllMailAccounts = true) {} }
+                    },
                     copyFolders =
                         coreAccounts
                             .filterNot { accountSummaryIsRss(it) }
                             .flatMap { account -> foldersByAccount[account.id].orEmpty() },
                     onMoveToFolder = { folder ->
                         selectedCoreThread?.let { thread ->
-                            moveThreadToFolder(thread, folder.name) {
+                            moveThreadToFolder(thread, folder.name, folder.accountId.ifBlank { thread.accountId }) {
                                 popAppBack()
                             }
                         }
                     },
+                    recentTransfers = recentTransferItems(selectedCoreThread),
+                    loadRecentTransferFolders = { loadRecentTransferFolders(selectedCoreThread) },
                     onCreateFolderAndMove = { name ->
                         selectedCoreThread?.let { thread ->
                             createFolderAndMoveThread(thread, name) {
@@ -993,9 +1057,11 @@ private fun MeronMobileScreenContent(
                         if (quickReplyDraftSaved) autoSaveQuickReplyDraft()
                     },
                     onForward = { openMessageCompose(it, forward = true) },
+                    onReplyToMessage = { replyToMessage(it, replyAll = false) },
                     onReplyAllToMessage = ::replyAllToMessage,
                     canReplyAllToMessage = ::canReplyAllToMessage,
                     onEditAsNew = { openMessageCompose(it, forward = false) },
+                    readerBottomActions = readerBottomActions,
                     onOpenDraft = { message ->
                         selectedCoreThread?.let { thread ->
                             openDraftCompose(message, thread, returnScreen = Screen.Thread)
@@ -1032,9 +1098,12 @@ private fun MeronMobileScreenContent(
                     },
                     onCopyMessageText = { label, value ->
                         services.copyText(label, value)
-                        status = "Copied ${label.lowercase()}"
+                        status = trs("common.copied")
                     },
                     onRetryLoadMessages = { retryOpenThreadLoad() },
+                    onRespondToInvite = { message, response -> scope.launch { respondToInvite(message, response) } },
+                    onRemoveInviteEvent = { message -> scope.launch { removeInviteFromCalendar(message) } },
+                    onAddInviteToCalendar = { message -> scope.launch { addInviteToCalendar(message) } },
                     onMessagesRead = ::markMessagesReadOnScroll,
                     onViewedToBottom = ::markThreadReadOnScroll,
                     snackbarHost = snackbarHost,
@@ -1073,6 +1142,15 @@ private fun MeronMobileScreenContent(
                     onSubjectChange = { subject = it },
                     body = body,
                     onBodyChange = { body = it },
+                    hasFoldedQuote = composeFoldedQuote != null,
+                    onExpandQuote = {
+                        expandComposeQuote()
+                        autoSaveComposeDraft()
+                    },
+                    onRemoveQuote = {
+                        removeComposeQuote()
+                        autoSaveComposeDraft()
+                    },
                     attachments = attachments,
                     recipientSuggestionField = recipientSuggestionField,
                     recipientSuggestions = recipientSuggestions,
@@ -1107,6 +1185,9 @@ private fun MeronMobileScreenContent(
                 AddAccountScreen(
                     onBack = popAppBack,
                     initialSection = addSection,
+                    // Reconnect pre-fills the address of an account core can no
+                    // longer sign in to; any other address is a new account.
+                    reconnecting = coreAccounts.any { it.needsReconnect && it.email.equals(email.trim(), ignoreCase = true) },
                     displayName = displayName,
                     onDisplayNameChange = { displayName = it },
                     senderName = senderName,
@@ -1260,14 +1341,39 @@ private fun MeronMobileScreenContent(
                     onMoveAccountUp = { account -> moveAccount(account, -1) },
                     onMoveAccountDown = { account -> moveAccount(account, 1) },
                     onRemoveAccount = ::removeAccount,
-                    appearanceMode = appearanceMode,
-                    onAppearanceModeChange = onAppearanceModeChange,
+                    themeChoice = themeChoice,
+                    systemDark = systemDark,
+                    onThemeChoiceChange = onThemeChoiceChange,
+                    customThemes = customThemes,
+                    onImportCustomTheme = onImportCustomTheme,
+                    onDeleteCustomTheme = onDeleteCustomTheme,
+                    onShareCustomTheme = { theme -> mobileHost.shareText(serializeThemeSource(theme.source)) },
                     appLanguageTag = appLanguageTag,
                     onAppLanguageChange = onAppLanguageChange,
                     showSenderImages = showSenderImages,
                     onToggleSenderImages = {
                         showSenderImages = !showSenderImages
                         saveAppBoolean(prefs, SHOW_SENDER_IMAGES_PREF, showSenderImages)
+                    },
+                    darkMailBodies = darkMailBodies,
+                    onToggleDarkMailBodies = {
+                        darkMailBodies = !darkMailBodies
+                        saveAppBoolean(prefs, DARK_MAIL_BODIES_PREF, darkMailBodies)
+                    },
+                    chatFullMessages = chatFullMessages,
+                    onToggleChatFullMessages = {
+                        chatFullMessages = !chatFullMessages
+                        saveAppBoolean(prefs, CHAT_FULL_MESSAGES_PREF, chatFullMessages)
+                    },
+                    autoFitMessages = autoFitMessages,
+                    onToggleAutoFitMessages = {
+                        autoFitMessages = !autoFitMessages
+                        saveAppBoolean(prefs, AUTO_FIT_MESSAGES_PREF, autoFitMessages)
+                    },
+                    readerBottomActions = readerBottomActions,
+                    onToggleReaderBottomActions = {
+                        readerBottomActions = !readerBottomActions
+                        saveAppBoolean(prefs, READER_BOTTOM_ACTIONS_PREF, readerBottomActions)
                     },
                     showUnreadBadges = showUnreadBadges,
                     onToggleUnreadBadges = {
@@ -1279,11 +1385,28 @@ private fun MeronMobileScreenContent(
                         showUnifiedInboxNav = !showUnifiedInboxNav
                         saveAppBoolean(prefs, SHOW_UNIFIED_INBOX_PREF, showUnifiedInboxNav)
                     },
+                    tasksEnabled = tasksEnabled,
+                    onToggleTasks = {
+                        tasksEnabled = !tasksEnabled
+                        saveAppBoolean(prefs, TASKS_ENABLED_PREF, tasksEnabled)
+                        if (!tasksEnabled && screen == Screen.Tasks) screen = Screen.Mail
+                    },
+                    calendarEnabled = calendarEnabled,
+                    onToggleCalendar = {
+                        calendarEnabled = !calendarEnabled
+                        saveAppBoolean(prefs, CALENDAR_ENABLED_PREF, calendarEnabled)
+                        if (!calendarEnabled && screen == Screen.Calendar) screen = Screen.Mail
+                    },
                     sendShortcutMode = sendShortcutMode,
                     onToggleSendShortcut = {
                         val next = sendShortcutMode.next()
                         sendShortcutMode = next
                         saveSendShortcutMode(prefs, next)
+                    },
+                    quoteReplies = quoteReplies,
+                    onToggleQuoteReplies = {
+                        quoteReplies = !quoteReplies
+                        saveAppBoolean(prefs, QUOTE_REPLIES_PREF, quoteReplies)
                     },
                     conversationLayout = conversationLayout,
                     onToggleConversationLayout = {
@@ -1305,6 +1428,16 @@ private fun MeronMobileScreenContent(
                     onSaveAccountSignature = ::saveAccountSignature,
                     onSaveAccountProxy = ::saveAccountProxy,
                     onSaveAccountServerSettings = ::saveAccountServerSettings,
+                    foldersByAccount = foldersByAccount,
+                    onRequestAccountFolders = { account -> ensureAccountFolders(account.id) },
+                    onSetFolderNotify = { folder, enabled ->
+                        setMailFolderNotify(
+                            accountId = folder.accountId,
+                            folderId = folder.name,
+                            folderName = folder.displayName,
+                            enabled = enabled,
+                        )
+                    },
                     kanbanColumnWidth = kanbanColumnWidth,
                     onCycleKanbanColumnWidth = {
                         val next = nextKanbanColumnWidth(kanbanColumnWidth)
@@ -1323,7 +1456,7 @@ private fun MeronMobileScreenContent(
                         liveMailPushEnabled = next
                         saveAppBoolean(prefs, LIVE_MAIL_PUSH_PREF, next)
                         mobileHost.syncLiveMailPush(next)
-                        status = if (next) "Live mail push enabled" else "Live mail push disabled"
+                        status = trs(if (next) "mobile.status.liveMailPushEnabled" else "mobile.ios.liveMailPushDisabled")
                     },
                     backgroundSyncEnabled = backgroundSyncEnabled,
                     onToggleBackgroundSync = {
@@ -1331,11 +1464,11 @@ private fun MeronMobileScreenContent(
                         backgroundSyncEnabled = next
                         saveAppBoolean(prefs, BACKGROUND_SYNC_ENABLED_PREF, next)
                         mobileHost.syncBackgroundRefresh(next)
-                        status = if (next) "Background sync enabled" else "Background sync disabled"
+                        status = trs(if (next) "mobile.status.backgroundSyncEnabled" else "mobile.status.backgroundSyncDisabled")
                     },
                     onRefreshBackground = {
                         mobileHost.runBackgroundRefreshOnce()
-                        status = "Queued background refresh"
+                        status = trs("mobile.status.backgroundRefreshQueued")
                     },
                     readDiagnosticLog = { mobileHost.readDiagnosticLog() },
                     onShareDiagnosticLog = { mobileHost.shareDiagnosticLog() },
@@ -1384,6 +1517,22 @@ private fun MeronMobileScreenContent(
                 )
             }
 
+            composable(AppRoutes.Tasks) {
+                TasksRouteContent(
+                    state = state,
+                    drawerState = drawerState,
+                    drawerFolders = drawerFolders,
+                )
+            }
+
+            composable(AppRoutes.Calendar) {
+                CalendarRouteContent(
+                    state = state,
+                    drawerState = drawerState,
+                    drawerFolders = drawerFolders,
+                )
+            }
+
             composable(AppRoutes.Mail) {
                 MailRouteContent(
                     state = state,
@@ -1421,13 +1570,14 @@ private fun MeronMobileScreenContent(
         selectedMailMoveThread?.let { thread ->
             MoveThreadDialog(
                 thread = thread,
+                accounts = coreAccounts.filterNot { accountSummaryIsRss(it) },
                 folders =
-                    foldersByAccount[thread.accountId]
-                        .orEmpty()
-                        .filterNot { folder -> folder.name.equals(thread.folder, ignoreCase = true) },
+                    coreAccounts
+                        .filterNot { accountSummaryIsRss(it) }
+                        .flatMap { account -> foldersByAccount[account.id].orEmpty() },
                 onMove = { folder ->
                     selectedMailMoveThread = null
-                    moveThreadToFolder(thread, folder.name) {
+                    moveThreadToFolder(thread, folder.name, folder.accountId.ifBlank { thread.accountId }) {
                         selectedMailThreadIds = emptySet()
                     }
                 },
@@ -1600,8 +1750,8 @@ private fun MeronMobileScreenContent(
                 },
                 onCopyFeedUrl = {
                     kanbanActionThread = null
-                    services.copyText("Feed URL", thread.feedUrl)
-                    status = "Copied feed URL"
+                    services.copyText(trs("chat.feedUrl"), thread.feedUrl)
+                    status = trs("common.copied")
                 },
                 onMove = { target ->
                     kanbanActionThread = null

@@ -42,9 +42,10 @@ interface PlatformServices {
         url: String,
         callbackScheme: String,
         onCallback: (String) -> Unit,
+        /** Why the browser couldn't open, blank if there is nothing to add. */
         onFailure: (String) -> Unit,
     ) {
-        if (!tryOpenUrl(url)) onFailure("OAuth browser launch failed")
+        if (!tryOpenUrl(url)) onFailure("")
     }
 
     fun copyText(

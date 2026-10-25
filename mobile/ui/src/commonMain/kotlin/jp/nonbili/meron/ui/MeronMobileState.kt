@@ -5,9 +5,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import jp.nonbili.meron.shared.AccountSummary
+import jp.nonbili.meron.shared.CalendarItem
 import jp.nonbili.meron.shared.ChangelogRelease
 import jp.nonbili.meron.shared.ContactSuggestion
 import jp.nonbili.meron.shared.DraftAttachment
+import jp.nonbili.meron.shared.FORWARD_QUOTE_MARKER
 import jp.nonbili.meron.shared.FolderSummary
 import jp.nonbili.meron.shared.MeronCore
 import jp.nonbili.meron.shared.MessageAttachment
@@ -17,6 +19,8 @@ import jp.nonbili.meron.shared.SignatureMark
 import jp.nonbili.meron.shared.SignatureTracking
 import jp.nonbili.meron.shared.StarredItemSummary
 import jp.nonbili.meron.shared.StorageUsage
+import jp.nonbili.meron.shared.TaskListSummary
+import jp.nonbili.meron.shared.TaskSummary
 import jp.nonbili.meron.shared.ThreadSummary
 import jp.nonbili.meron.shared.coercePollIntervalMinutes
 import jp.nonbili.meron.shared.defaultOAuthRedirectUri
@@ -61,7 +65,12 @@ internal class MeronMobileState(
      *  authoritative `settings` table. See MobileSettings.kt. */
     val settingsMirror: SettingsMirror,
 ) {
+    init {
+        migrateLegacyMailFolder(prefs)
+    }
+
     val snackbarHost = SnackbarHostState()
+    var recentThreadTransfers by mutableStateOf(loadRecentThreadTransfers(prefs))
 
     /** Error for actions that need the native core when it failed to load;
      *  includes the host's load diagnostics (ABIs, missing split APK, ...) so a
@@ -123,11 +132,16 @@ internal class MeronMobileState(
     var accountJson by mutableStateOf("")
     var coreAccounts by mutableStateOf(emptyList<AccountSummary>())
     var selectedCoreAccountId by mutableStateOf(loadLastMailAccountId(prefs))
+    internal val folderReadGuard = FolderReadGuard()
+    internal val threadRemovalGuard = ThreadRemovalGuard()
     var coreFolders by mutableStateOf(emptyList<FolderSummary>())
     var foldersByAccount by mutableStateOf(emptyMap<String, List<FolderSummary>>())
     var selectedCoreFolder by mutableStateOf(loadLastMailFolder(prefs))
     var mailSearch by mutableStateOf("")
     var mailFilter by mutableStateOf(FilterMode.All)
+
+    /** Keep only threads with attachments; combines with [mailFilter]. */
+    var mailAttachmentsOnly by mutableStateOf(false)
     var coreThreads by mutableStateOf(emptyList<ThreadSummary>())
     var mailboxCache by mutableStateOf(emptyMap<MailboxCacheKey, MailboxLoadResult>())
 
@@ -177,6 +191,13 @@ internal class MeronMobileState(
     var loadingMoreThreads by mutableStateOf(false)
     var selectedCoreThread by mutableStateOf<ThreadSummary?>(null)
     var activeThreadReadToken by mutableStateOf(0L)
+
+    // Refreshes of the open conversation, numbered as they start, and the
+    // newest one to have written. A refresh writes page by page, so it must
+    // stop once a later one has put fresher pages on screen — but not before:
+    // a later refresh that fails writes nothing.
+    var threadRefreshGeneration = 0L
+    var threadRefreshApplied = 0L
     var conversationHtmlOverrides by mutableStateOf(emptyMap<String, Boolean>())
     var previousTopScreen by mutableStateOf(Screen.Mail)
     var composeReturnScreen by mutableStateOf(Screen.Mail)
@@ -195,6 +216,7 @@ internal class MeronMobileState(
      *  stale card back. */
     val kanbanColumnLoadTokens = mutableMapOf<String, Long>()
     var kanbanFilter by mutableStateOf(loadKanbanFilter(kanbanPrefs))
+    var kanbanAttachmentsOnly by mutableStateOf(loadKanbanAttachmentsOnly(kanbanPrefs))
     var kanbanSearch by mutableStateOf(loadKanbanSearch(kanbanPrefs))
     var kanbanSearchScope by mutableStateOf(loadKanbanSearchScope(kanbanPrefs))
     var kanbanActionThread by mutableStateOf<ThreadSummary?>(null)
@@ -229,15 +251,38 @@ internal class MeronMobileState(
     var composeSignaturePending by mutableStateOf(false)
     val composeSaveMutex = Mutex()
 
+    // Serializes read-state writes on mail — scroll-driven marks and the
+    // reader's own toggles — so they reach the server in the order they were
+    // made (a whole-thread mark queued behind a per-message one cannot overtake
+    // a newer "mark unread"), and a per-message mark's rollback lands before a
+    // whole-thread mark launched after it settles.
+    val readMarkMutex = Mutex()
+
+    // What the open conversation's messages show while those writes overlap.
+    val readLedger = MessageReadLedger()
+
     var composeInReplyTo by mutableStateOf("")
     var composeReferences by mutableStateOf("")
 
-    // The quoted original of a forward, as HTML, plus the inline images it
-    // references. The composer itself edits plain text; these ride alongside so
-    // the send path can rebuild the HTML alternative. Both are empty for every
-    // other kind of draft, which stays plain-text-only.
+    // The quoted original of a forward or a quoted reply, as HTML, plus the
+    // inline images it references. The composer itself edits plain text; these
+    // ride alongside so the send path can rebuild the HTML alternative. Both are
+    // empty for every other kind of draft, which stays plain-text-only.
     var composeForwardHtml by mutableStateOf("")
     var composeForwardInlineAttachments by mutableStateOf(emptyList<DraftAttachment>())
+
+    // Where the quote starts in the plain body: the forward header, or a quoted
+    // reply's attribution line (see forwardHtmlForSend).
+    var composeQuoteMarker by mutableStateOf(FORWARD_QUOTE_MARKER)
+
+    // The quote a reply was opened with, as the plain body holds it. While it is
+    // still there untouched it is no more the user's writing than the seeded
+    // signature is (see composeIsBlank).
+    var composeReplyQuote by mutableStateOf("")
+
+    // The message a reply answers, quoted but folded away: it goes out under the
+    // body until the user unfolds it into the body or removes it.
+    var composeFoldedQuote by mutableStateOf<ReplyQuote?>(null)
     var locallyDraftedThreadIds by mutableStateOf(emptySet<String>())
     var locallyDiscardedThreadIds by mutableStateOf(emptySet<String>())
     var subject by mutableStateOf("")
@@ -284,20 +329,64 @@ internal class MeronMobileState(
     // settles. The copy on the server outlives the send until its discard
     // returns, and reopening the conversation in that window would otherwise
     // hydrate the just-sent text straight back into the reply bar. Normalized
-    // draft ids; dropped once the send lifecycle finishes, so a discard that
-    // genuinely failed leaves its draft reachable again. Not UI state, so a
-    // plain set rather than mutableStateOf.
+    // draft ids; dropped once the discard succeeds — a failed one is retried
+    // (see retrySentDraftDiscard) and its stale copy stays held meanwhile. Not
+    // UI state, so a plain set rather than mutableStateOf.
     val quickReplyConsumedDraftIds = mutableSetOf<String>()
+
+    /** Gaps between further attempts at discarding a sent message's draft after
+     * the one following the send failed. */
+    internal var sentDraftDiscardRetryDelaysMs = listOf(5_000L, 30_000L, 120_000L, 600_000L)
 
     /** Thread id and draft id an autosave landed for a send that was waiting on
      * the save lock, where the reply bar had already moved on and could not
      * carry the id across. Consumed by that send when it takes the lock. */
     var quickReplySendDraftHandover: Pair<String, String>? = null
-    var status by mutableStateOf("")
+    private var statusMessage by mutableStateOf("")
+    internal var statusIsError by mutableStateOf(false)
+        private set
+    var status: String
+        get() = statusMessage
+        set(value) {
+            statusIsError = false
+            statusMessage = value
+        }
+
+    internal fun showTransferFailure(
+        key: String,
+        error: Throwable,
+    ) {
+        Log.w("Mail", "Mail transfer failed", error)
+        status = mailTransferError(error, trs(key)) { template, fields -> trs(template, fields) }
+        statusIsError = true
+    }
+
     var syncing by mutableStateOf(false)
     var showUnreadBadges by mutableStateOf(loadAppBoolean(prefs, SHOW_UNREAD_BADGES_PREF, true))
     var showUnifiedInboxNav by mutableStateOf(loadAppBoolean(prefs, SHOW_UNIFIED_INBOX_PREF, true))
+    var tasksEnabled by mutableStateOf(loadAppBoolean(prefs, TASKS_ENABLED_PREF, false))
+    var calendarEnabled by mutableStateOf(loadAppBoolean(prefs, CALENDAR_ENABLED_PREF, false))
+
+    /** The calendar screen's month (1-12) and what is in it; empty until opened. */
+    var calendarYear by mutableStateOf(localDateParts(currentTimeMillis()).year)
+    var calendarMonth by mutableStateOf(localDateParts(currentTimeMillis()).month)
+    var calendarItems by mutableStateOf(emptyList<CalendarItem>())
+
+    /** Lists and items for the Tasks screen; empty until it is first opened. */
+    var taskLists by mutableStateOf(emptyList<TaskListSummary>())
+    var pendingTaskThread by mutableStateOf<ThreadSummary?>(null)
+
+    /** A thread is being filed in Tasks; a second tap meanwhile is dropped. */
+    internal var filingMailToTasks = false
+    var activeTaskListId by mutableStateOf("")
+    var tasks by mutableStateOf(emptyList<TaskSummary>())
+    var tasksLoading by mutableStateOf(false)
     var showSenderImages by mutableStateOf(loadAppBoolean(prefs, SHOW_SENDER_IMAGES_PREF, false))
+    var darkMailBodies by mutableStateOf(loadAppBoolean(prefs, DARK_MAIL_BODIES_PREF, false))
+    var autoFitMessages by mutableStateOf(loadAppBoolean(prefs, AUTO_FIT_MESSAGES_PREF, false))
+    var chatFullMessages by mutableStateOf(loadAppBoolean(prefs, CHAT_FULL_MESSAGES_PREF, false))
+    var readerBottomActions by mutableStateOf(loadAppBoolean(prefs, READER_BOTTOM_ACTIONS_PREF, false))
+    var quoteReplies by mutableStateOf(loadAppBoolean(prefs, QUOTE_REPLIES_PREF, false))
     var liveMailPushEnabled by mutableStateOf(loadAppBoolean(prefs, LIVE_MAIL_PUSH_PREF, false))
     var backgroundSyncEnabled by mutableStateOf(loadAppBoolean(prefs, BACKGROUND_SYNC_ENABLED_PREF, true))
     var pollIntervalMinutes by mutableStateOf(
@@ -311,7 +400,16 @@ internal class MeronMobileState(
             .coerceIn(KANBAN_COLUMN_MIN_WIDTH, KANBAN_COLUMN_MAX_WIDTH),
     )
     var hiddenNavigationAccountIds by mutableStateOf(loadAppStringSet(prefs, HIDDEN_NAV_ACCOUNTS_PREF))
-    var messages by mutableStateOf(emptyList<MessageBody>())
+    private var messagesState by mutableStateOf(emptyList<MessageBody>())
+
+    // Whatever installs the open conversation's messages — a reload from the
+    // core, another action restoring its snapshot — they show the read state of
+    // writes still in flight (see readLedger), which the core does not have yet.
+    var messages: List<MessageBody>
+        get() = messagesState
+        set(value) {
+            messagesState = readLedger.overlay(value, { it.id }, { it.unread }) { message, unread -> message.copy(unread = unread) }
+        }
     var messageCursor by mutableStateOf("")
     var loadingMoreMessages by mutableStateOf(false)
     var attachments by mutableStateOf(emptyList<DraftAttachment>())
@@ -327,7 +425,7 @@ internal class MeronMobileState(
         get() = screenState
         set(value) {
             screenState = value
-            if (value == Screen.Mail || value == Screen.Kanban) {
+            if (value == Screen.Mail || value == Screen.Kanban || value == Screen.Tasks || value == Screen.Calendar) {
                 saveLastTopScreen(prefs, value)
             }
         }

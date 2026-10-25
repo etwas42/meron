@@ -6,8 +6,8 @@ plugins {
 kotlin {
     android {
         namespace = "jp.nonbili.meron.shared"
-        compileSdk = 36
-        minSdk = 23
+        compileSdk = 37
+        minSdk = 24
         withHostTest {}
     }
 

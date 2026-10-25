@@ -6,6 +6,7 @@ import jp.nonbili.meron.shared.MessageBody
 import jp.nonbili.meron.shared.MobileMailCommandClient
 import jp.nonbili.meron.shared.RssThreadParams
 import jp.nonbili.meron.shared.SendStatus
+import jp.nonbili.meron.shared.ThreadReadPage
 import jp.nonbili.meron.shared.ThreadReadParams
 import jp.nonbili.meron.shared.ThreadSummary
 import jp.nonbili.meron.shared.attachmentToDraftAttachment
@@ -23,9 +24,23 @@ import jp.nonbili.meron.shared.parseThreadReadPage
 import jp.nonbili.meron.shared.rewriteMediaRefsToCid
 import jp.nonbili.meron.shared.splitAddressList
 import jp.nonbili.meron.shared.threadIdIsRss
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
+
+// The quote a saved reply was written with, rebuilt from the message it answers
+// when that is loaded and the draft still ends in it unchanged. The draft's own
+// HTML can't give it back: the reader serves it sanitized.
+private suspend fun MeronMobileState.savedReplyQuote(
+    draft: MessageBody,
+    accountId: String,
+): ReplyQuote? {
+    val parentId = draft.inReplyTo.normalizedComposeDraftId()
+    if (parentId.isBlank()) return null
+    val parent = messages.firstOrNull { it.messageId.normalizedComposeDraftId() == parentId } ?: return null
+    return buildReplyQuote(parent, accountId)?.takeIf { it.endsBody(draft.body) }
+}
 
 internal fun MeronMobileState.openDraftCompose(
     message: MessageBody,
@@ -75,7 +90,10 @@ internal fun MeronMobileState.openDraftCompose(
                     inlineImages.map { (image, data) -> inlineImageToDraftAttachment(image, data) },
                 )
             }
-        }.onSuccess { (copiedAttachments, forwardHtml, inlineAttachments) ->
+        }.mapCatching { restored ->
+            restored to savedReplyQuote(message, thread.accountId)
+        }.onSuccess { (restored, replyQuote) ->
+            val (copiedAttachments, forwardHtml, inlineAttachments) = restored
             if (generation != composeSessionGeneration) return@onSuccess
             // Start from a clean composer: a draft opened after a reply would
             // otherwise inherit that reply's threading headers and be sent into
@@ -94,6 +112,12 @@ internal fun MeronMobileState.openDraftCompose(
             attachments = copiedAttachments
             composeForwardHtml = forwardHtml
             composeForwardInlineAttachments = inlineAttachments
+            // A saved quoted reply folds its quote away again, rebuilt from the
+            // message it answers, as long as the quote still ends it unchanged.
+            replyQuote?.let { quote ->
+                body = body.trim().removeSuffix(quote.text.trim()).trimEnd()
+                composeFoldedQuote = quote
+            }
             composeFromAccountId = thread.accountId
             composeFromEmail = ""
             // A draft with no Message-ID of its own — imported, or written by
@@ -111,10 +135,10 @@ internal fun MeronMobileState.openDraftCompose(
             composeReturnScreen = returnScreen
             rememberComposeSeed()
             screen = Screen.Compose
-            status = "Draft ready"
+            status = trs("mobile.status.draftReady")
         }.onFailure {
             if (generation != composeSessionGeneration) return@onFailure
-            status = "Draft open failed: ${it.message}"
+            status = trsError("compose.toast.couldNotOpenDraft", it)
         }
     }
 }
@@ -202,7 +226,7 @@ internal fun MeronMobileState.readCoreThread(
             }
         }.onFailure {
             if (activeThreadReadToken != readToken) return@onFailure
-            status = "Could not open message: ${it.message}"
+            status = trsError("mobile.status.openMessageFailed", it)
         }
     }
 }
@@ -282,32 +306,111 @@ internal fun ThreadSummary.rssItemKeys(): List<String> = listOf(id).takeIf { thr
 // canonical copy from the core. Used after sending a quick reply so the stored
 // sent message replaces the optimistic one. Runs on ioDispatcher; guards against
 // the user having switched threads while the read was in flight.
-internal suspend fun MeronMobileState.reloadCurrentThreadMessages() {
+internal suspend fun MeronMobileState.reloadCurrentThreadMessages(reportOlderPageFailure: Boolean = false) {
     val thread = selectedCoreThread ?: return
     if (!coreLoaded) return
-    val response =
+    val generation = ++threadRefreshGeneration
+    val boundary = oldestServerMessage(messages)
+
+    suspend fun readPage(before: String?): ThreadReadPage =
         withContext(ioDispatcher) {
             val client = MobileMailCommandClient(core)
-            if (threadIdIsRss(thread.id)) {
-                client.readRssThread(RssThreadParams(threadId = thread.id))
-            } else {
-                withManagedGoogleAuth(client, thread.accountId) {
-                    client.readThread(ThreadReadParams(threadId = thread.id))
-                }
-            }
+            parseThreadReadPage(
+                if (threadIdIsRss(thread.id)) {
+                    client.readRssThread(RssThreadParams(threadId = thread.id, beforeCursor = before))
+                } else {
+                    withManagedGoogleAuth(client, thread.accountId) {
+                        client.readThread(ThreadReadParams(threadId = thread.id, beforeCursor = before))
+                    }
+                },
+            )
         }
-    if (selectedCoreThread?.id != thread.id) return
-    val page = parseThreadReadPage(response)
-    messages = mergeLocalSendMessages(messages, page.messages)
-    messageCursor = page.nextCursor
+    var page = readPage(null)
+    var loaded = page.messages
+    // The newest page is shown as soon as it is read. Older pages the user
+    // scrolled back to are then re-read one at a time: replacing the list with
+    // the newest page alone would drop them from under the reader, and waiting
+    // on all of them would hold a new message back behind a slow download.
+    while (true) {
+        // A newer refresh has already written fresher pages than these.
+        if (selectedCoreThread?.id != thread.id || threadRefreshApplied > generation) return
+        threadRefreshApplied = generation
+        // Until a page is re-read its messages stay as they were, and so does
+        // the cursor that continues from them. That covers a load-more landing
+        // meanwhile too: its pages reach further back than this refresh.
+        val wholeThread = page.nextCursor.isBlank()
+        val older = if (wholeThread) emptyList() else messagesOlderThan(messages, loaded)
+        messages = mergeLocalSendMessages(messages, older + loaded)
+        if (older.isEmpty()) messageCursor = page.nextCursor
+        if (wholeThread || page.messages.isEmpty() || refreshReachedBoundary(loaded, boundary)) return
+        // An older page that cannot be read keeps what it showed before; the
+        // newer pages above are already refreshed. Only a caller with somewhere
+        // to say so hears about it.
+        page =
+            try {
+                readPage(page.nextCursor)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (reportOlderPageFailure) throw e
+                return
+            }
+        val known = loaded.map { it.id }.toSet()
+        loaded = (page.messages.filterNot { it.id in known } + loaded).sortedBy { it.dateEpochSeconds }
+    }
+}
+
+// The messages on screen that sit further back than a refresh has read so
+// far: everything ahead of the first one it did read.
+internal fun messagesOlderThan(
+    current: List<MessageBody>,
+    loaded: List<MessageBody>,
+): List<MessageBody> {
+    val oldest = loaded.firstOrNull() ?: return emptyList()
+    val loadedIds = loaded.map { it.id }.toSet()
+    // A row the core has since collapsed into its copy in another folder was
+    // read again under that copy's id.
+    val loadedMessageIds = loaded.mapNotNull { it.messageId.normalizedMessageId().takeIf(String::isNotBlank) }.toSet()
+    val at = current.indexOfFirst { it.id in loadedIds }
+    val older =
+        if (at >= 0) {
+            // Not one the refresh passed over: that was deleted meanwhile.
+            current.take(at).filter { it.dateEpochSeconds <= oldest.dateEpochSeconds }
+        } else {
+            current.filter { it.dateEpochSeconds < oldest.dateEpochSeconds }
+        }
+    return older.filter { isServerMessage(it) && it.messageId.normalizedMessageId() !in loadedMessageIds }
+}
+
+private fun isServerMessage(message: MessageBody): Boolean = !message.id.startsWith("local-send-") && !message.id.startsWith("local-draft-")
+
+// The oldest message that came from the core: how far back the reader has
+// paged. Optimistic sends and local drafts are not on any page.
+internal fun oldestServerMessage(messages: List<MessageBody>): MessageBody? = messages.firstOrNull(::isServerMessage)
+
+// Whether a refresh has re-read as far back as `boundary`. By identity, since
+// one timestamp can span pages: its own id, or its Message-ID when the core
+// has since collapsed it into its copy in another folder. A strictly older
+// message covers a boundary that was deleted and will never come back.
+internal fun refreshReachedBoundary(
+    loaded: List<MessageBody>,
+    boundary: MessageBody?,
+): Boolean {
+    if (boundary == null) return true
+    val messageId = boundary.messageId.normalizedMessageId()
+    return loaded.any {
+        it.id == boundary.id ||
+            it.dateEpochSeconds < boundary.dateEpochSeconds ||
+            (messageId.isNotBlank() && it.messageId.normalizedMessageId() == messageId)
+    }
 }
 
 // Retry loading bodies for the open thread. Re-reading is enough: the core
 // re-attempts the on-demand IMAP fetch for any message without a cached body.
 internal fun MeronMobileState.retryOpenThreadLoad() {
     scope.launch {
-        runCatching { reloadCurrentThreadMessages() }
-            .onFailure { status = "Could not open message: ${it.message}" }
+        runCatching { reloadCurrentThreadMessages(reportOlderPageFailure = true) }
+            .onFailure { status = trsError("mobile.status.openMessageFailed", it) }
     }
 }
 
@@ -442,8 +545,8 @@ internal suspend fun MeronMobileState.refreshOpenThreadFor(eventAccount: String)
 /** Opens the conversation a tapped notification names, layered over whatever
  *  the user was looking at: the mailbox behind it keeps its account, folder,
  *  search and filter, so backing out returns to the Mail or Kanban view the tap
- *  interrupted rather than to the notification's own folder. The thread list is
- *  loaded only to find the thread and is then discarded. */
+ *  interrupted rather than to the notification's own folder. The thread is
+ *  opened directly by composite id without searching the mailbox. */
 internal fun MeronMobileState.openNotificationThread(target: NotificationThreadTarget) {
     if (!coreLoaded) {
         status = coreUnavailableMessage
@@ -453,56 +556,7 @@ internal fun MeronMobileState.openNotificationThread(target: NotificationThreadT
         openNotificationMailbox(target)
         return
     }
-    scope.launch {
-        runCatching {
-            withContext(ioDispatcher) {
-                val client = MobileMailCommandClient(core)
-                val accounts =
-                    coreAccounts.takeIf { accounts -> accounts.any { it.id == target.accountId } }
-                        ?: parseAccountListResponse(client.listAccounts())
-                val account =
-                    accounts.firstOrNull { it.id == target.accountId }
-                        ?: error("Account not found: ${target.accountId}")
-                val expectedThreadId = notificationThreadId(target.accountId, target.folder, target.threadKey)
-                var result =
-                    loadAccountInbox(
-                        client = client,
-                        account = account,
-                        requestedFolder = target.folder,
-                        query = "",
-                        filter = FilterMode.All,
-                        syncFirst = false,
-                    )
-                var thread = result.threads.firstOrNull { it.id == expectedThreadId }
-                if (thread == null) {
-                    result =
-                        loadAccountInbox(
-                            client = client,
-                            account = account,
-                            requestedFolder = target.folder,
-                            query = "",
-                            filter = FilterMode.All,
-                            syncFirst = true,
-                        )
-                    thread = result.threads.firstOrNull { it.id == expectedThreadId }
-                }
-                Triple(accounts, result, thread ?: error("Thread not found"))
-            }
-        }.onSuccess { (accounts, result, thread) ->
-            // Only what the thread view itself needs, never the mailbox state:
-            // the account list a cold start has not fetched yet, and the folder
-            // names the notification's account is filed under.
-            if (coreAccounts.isEmpty()) {
-                coreAccounts = accounts
-            }
-            if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
-            }
-            readCoreThread(thread)
-        }.onFailure {
-            status = "Could not open notification: ${it.message}"
-        }
-    }
+    openLinkedThread(notificationThreadId(target.accountId, target.folder, target.threadKey), target.accountId)
 }
 
 /** A group summary names an account and folder but no conversation, so this one
@@ -511,10 +565,12 @@ internal fun MeronMobileState.openNotificationThread(target: NotificationThreadT
 private fun MeronMobileState.openNotificationMailbox(target: NotificationThreadTarget) {
     mailSearch = ""
     mailFilter = FilterMode.All
+    mailAttachmentsOnly = false
     selectedCoreAccountId = target.accountId
     selectedCoreFolder = target.folder
     syncing = true
-    scope.launch {
+    scope.launchThreadListRead(threadRemovalGuard) { read ->
+        val folderReadVersion = folderReadGuard.version
         runCatching {
             withContext(ioDispatcher) {
                 val client = MobileMailCommandClient(core)
@@ -539,12 +595,12 @@ private fun MeronMobileState.openNotificationMailbox(target: NotificationThreadT
             if (coreAccounts.isEmpty()) {
                 coreAccounts = accounts
             }
-            coreFolders = result.folders
+            coreFolders = reconcileFolderUnread(result.folders, folderReadVersion)
             if (result.folders.isNotEmpty()) {
-                foldersByAccount = foldersByAccount + result.folders.groupBy { it.accountId }
+                foldersByAccount = foldersByAccount + reconcileFolderUnread(result.folders, folderReadVersion).groupBy { it.accountId }
             }
             selectedCoreFolder = result.folder
-            coreThreads = withLocalDraftFlags(result.threads)
+            coreThreads = withLocalDraftFlags(read.filter(result.threads))
             visibleMailboxKey = mailboxCacheKey(target.accountId, result.folder, "", FilterMode.All)
             mailboxCursor = result.nextCursor
             mailboxAccountCursors = result.accountCursors
@@ -560,7 +616,7 @@ private fun MeronMobileState.openNotificationMailbox(target: NotificationThreadT
             screen = Screen.Mail
         }.onFailure {
             syncing = false
-            status = "Could not open notification: ${it.message}"
+            status = trsError("compose.toast.couldNotOpenNotificationThread", it)
         }
     }
 }
@@ -589,10 +645,10 @@ internal fun MeronMobileState.loadMoreThreadMessages() {
             messages = (older + messages).sortedBy { message -> message.dateEpochSeconds }
             messageCursor = page.nextCursor
             loadingMoreMessages = false
-            if (older.isEmpty()) status = "No older messages in this thread."
+            if (older.isEmpty()) status = trs("mobile.status.noOlderMessagesInThread")
         }.onFailure {
             loadingMoreMessages = false
-            status = "Could not load older messages: ${it.message}"
+            status = trsError("mobile.status.loadOlderMessagesFailed", it)
         }
     }
 }

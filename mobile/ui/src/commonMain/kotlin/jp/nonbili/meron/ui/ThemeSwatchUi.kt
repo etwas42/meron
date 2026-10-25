@@ -18,10 +18,17 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -76,13 +83,18 @@ private fun ColumnScope.Pill(
     )
 }
 
-/** One selectable theme tile: the mock plus the theme name and a check when active. */
+/**
+ * One selectable theme tile: the mock plus the theme name and a check when
+ * active. A custom theme also gets a menu to share or delete it.
+ */
 @Composable
 internal fun ThemeSwatch(
-    mode: AppAppearanceMode,
+    mode: AppTheme,
     selected: Boolean,
     onSelect: () -> Unit,
     modifier: Modifier = Modifier,
+    onShare: (() -> Unit)? = null,
+    onDelete: (() -> Unit)? = null,
 ) {
     val colors = themePreviewColors(mode)
     Column(
@@ -119,6 +131,41 @@ internal fun ThemeSwatch(
                     modifier = Modifier.size(14.dp),
                     tint = MaterialTheme.colorScheme.primary,
                 )
+            }
+            if (onShare != null || onDelete != null) {
+                var menuOpen by remember { mutableStateOf(false) }
+                Box {
+                    Icon(
+                        Icons.Filled.MoreVert,
+                        contentDescription = tr("common.more"),
+                        modifier =
+                            Modifier
+                                .clip(CircleShape)
+                                .clickable { menuOpen = true }
+                                .size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        if (onShare != null) {
+                            DropdownMenuItem(
+                                text = { Text(tr("theme.share")) },
+                                onClick = {
+                                    menuOpen = false
+                                    onShare()
+                                },
+                            )
+                        }
+                        if (onDelete != null) {
+                            DropdownMenuItem(
+                                text = { Text(tr("theme.delete")) },
+                                onClick = {
+                                    menuOpen = false
+                                    onDelete()
+                                },
+                            )
+                        }
+                    }
+                }
             }
         }
     }

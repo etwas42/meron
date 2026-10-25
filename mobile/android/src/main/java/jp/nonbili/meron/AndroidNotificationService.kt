@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import jp.nonbili.meron.shared.accountIdIsRss
+import jp.nonbili.meron.shared.backgroundRefreshSummaryKey
 import org.json.JSONObject
 import java.util.Locale
 
@@ -92,7 +93,9 @@ object AndroidNotificationService {
 
     fun notifyRefreshComplete(
         base: Context,
-        body: String,
+        refreshed: Int,
+        skipped: Int,
+        failed: Int,
     ) {
         // Notifications are built from service/application contexts, which carry
         // the per-app language only on API 33+ (where the platform applies it).
@@ -101,6 +104,22 @@ object AndroidNotificationService {
         val context = localizedAppContext(base)
         if (!canNotify(context)) return
         ensureChannels(context)
+        // Only the placeholder messages are in the generated helper; the one
+        // without any is an ordinary string resource.
+        val body =
+            when (val key = backgroundRefreshSummaryKey(refreshed = refreshed, skipped = skipped, failed = failed)) {
+                "mobile.refresh.noAccounts" -> {
+                    context.getString(R.string.mobile_refresh_no_accounts)
+                }
+
+                else -> {
+                    generatedIcuString(
+                        context.resourceLanguageTag(),
+                        key,
+                        mapOf("refreshed" to refreshed, "skipped" to skipped, "failed" to failed),
+                    )
+                }
+            }
         val notification =
             NotificationCompat
                 .Builder(context, CHANNEL_ID)

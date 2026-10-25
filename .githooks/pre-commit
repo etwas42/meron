@@ -1,53 +1,68 @@
-#!/bin/sh
-# Auto-formats staged files per-language, then re-stages them.
+#!/usr/bin/env bash
+# Auto-formats fully staged files per-language, then checks the staged changes.
 # Installed via: git config core.hooksPath .githooks (see package.json predev/prebuild)
 
-set -e
+set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-staged_files() {
-    git diff --cached --name-only --diff-filter=ACM -- "$@"
+format_staged() {
+    local label=$1 tool=$2 file status=0
+    shift 2
+    local files=()
+
+    while IFS= read -r -d '' file; do
+        # Never stage edits the user deliberately left out of the index.
+        if ! git diff --quiet -- "$file" || [ -L "$file" ]; then
+            printf 'pre-commit: skipping %q (unstaged changes or symlink)\n' "$file" >&2
+            continue
+        fi
+        files+=("$file")
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z -- "$@")
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        return
+    fi
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'pre-commit: skipping %s formatting (%s unavailable)\n' "$label" "$tool" >&2
+        return
+    fi
+
+    case "$label" in
+        Go) "$tool" -w -- "${files[@]}" ;;
+        # Child modules may contain unstaged edits or be outside the selection.
+        Rust) "$tool" --edition 2024 --config skip_children=true -- "${files[@]}" ;;
+        Frontend) "$tool" --write "${files[@]}" ;;
+        Kotlin) "$tool" -F --relative "${files[@]}" ;;
+        Swift) "$tool" "${files[@]}" ;;
+    esac || status=$?
+    # Formatters can rewrite files before reporting an error. These files were
+    # fully staged, so preserve their fixes in the index even on failure.
+    git add -- "${files[@]}"
+    return "$status"
 }
 
-restage() {
-    [ "$#" -gt 0 ] && git add -- "$@"
-}
+format_staged Go gofmt '*.go'
+format_staged Rust rustfmt 'meron-core/*.rs'
+format_staged Frontend desktop/frontend/node_modules/.bin/prettier \
+    'desktop/frontend/src/*.ts' 'desktop/frontend/src/*.tsx' \
+    'desktop/frontend/src/*.css' 'desktop/frontend/src/*.json'
+format_staged Kotlin ktlint 'mobile/*.kt' 'mobile/*.kts'
+format_staged Swift swiftformat 'mobile/ios/*.swift'
 
-# Go
-go_files=$(staged_files '*.go')
-if [ -n "$go_files" ] && command -v gofmt >/dev/null 2>&1; then
-    echo "$go_files" | xargs gofmt -w
-    restage $go_files
+git diff --cached --check
+
+# Include deletions and both sides of renames when deciding to validate.
+if ! git diff --cached --quiet --no-renames -- locales scripts/i18n/catalog.ts scripts/i18n/catalog.test.ts; then
+    if ! command -v bun >/dev/null 2>&1; then
+        echo 'pre-commit: Bun is required to validate staged localization changes.' >&2
+        exit 1
+    fi
+    # Validate the index, including partial staging and deleted catalogs.
+    catalog_dir=$(mktemp -d)
+    trap 'rm -rf -- "$catalog_dir"' EXIT
+    git ls-files -z -- locales scripts/i18n/catalog.ts |
+        git checkout-index -z --stdin --prefix="$catalog_dir/"
+    bun "$catalog_dir/scripts/i18n/catalog.ts" validate
 fi
-
-# Rust (meron-core)
-rust_files=$(staged_files 'meron-core/*.rs')
-if [ -n "$rust_files" ] && command -v rustfmt >/dev/null 2>&1; then
-    echo "$rust_files" | xargs rustfmt --edition 2024
-    restage $rust_files
-fi
-
-# Frontend (TS/TSX/CSS/JSON)
-frontend_files=$(staged_files 'desktop/frontend/src/*.ts' 'desktop/frontend/src/*.tsx' 'desktop/frontend/src/*.css' 'desktop/frontend/src/*.json')
-if [ -n "$frontend_files" ] && [ -x desktop/frontend/node_modules/.bin/prettier ]; then
-    echo "$frontend_files" | xargs desktop/frontend/node_modules/.bin/prettier --write
-    restage $frontend_files
-fi
-
-# Android (Kotlin)
-kotlin_files=$(staged_files 'mobile/*.kt' 'mobile/*.kts')
-if [ -n "$kotlin_files" ] && command -v ktlint >/dev/null 2>&1; then
-    echo "$kotlin_files" | xargs ktlint -F --relative || true
-    restage $kotlin_files
-fi
-
-# iOS (Swift)
-swift_files=$(staged_files 'mobile/ios/*.swift')
-if [ -n "$swift_files" ] && command -v swiftformat >/dev/null 2>&1; then
-    echo "$swift_files" | xargs swiftformat
-    restage $swift_files
-fi
-
-exit 0

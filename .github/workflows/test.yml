@@ -15,10 +15,29 @@ jobs:
           go-version-file: desktop/go.mod
       # Wails (package main) links against GTK/WebKitGTK via cgo.
       - name: Install GTK/WebKitGTK headers
-        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xauth
       - name: Create desktop/frontend/dist placeholder
         run: mkdir -p desktop/frontend/dist && touch desktop/frontend/dist/placeholder
       - run: go test -tags webkit2_41 ./...
+        working-directory: desktop
+      - name: Test native titlebar startup under Xvfb
+        run: xvfb-run -a go test -tags webkit2_41 -run '^TestNativeTitlebarStartup$' -count=1 -v .
+        working-directory: desktop
+        env:
+          MERON_TEST_NATIVE_TITLEBAR: '1'
+          MERON_REQUIRE_NATIVE_DISPLAY: '1'
+
+  windows-update:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop/go.mod
+      - name: Create desktop/frontend/dist placeholder
+        shell: bash
+        run: mkdir -p desktop/frontend/dist && touch desktop/frontend/dist/placeholder
+      - run: go test -run 'TestWindowsUpdate|TestExtractExeFromZip' .
         working-directory: desktop
 
   rust:
@@ -41,6 +60,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - name: Test pre-commit hook
+        run: bun run test:hooks
       - run: bun install --frozen-lockfile
         working-directory: desktop/frontend
       - name: Generate localization catalogs
@@ -63,7 +84,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - run: ./mobile/gradlew -p mobile :shared:allTests :ui:allTests
 
-  # Full-stack suite: Rust sidecar against a real maddy mail server in Docker.
+  # Full-stack suite: Rust sidecar against a Postfix/Dovecot mail server in Docker.
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -82,7 +103,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev perl
       - name: Create desktop/frontend/dist placeholder
         run: mkdir -p desktop/frontend/dist && touch desktop/frontend/dist/placeholder
-      - run: docker pull foxcpp/maddy:0.8
+      - run: docker pull ghcr.io/docker-mailserver/docker-mailserver:16.0.1
       - run: cargo build --manifest-path meron-core/Cargo.toml
       - run: go test -tags 'integration webkit2_41' -v -timeout 10m .
         working-directory: desktop

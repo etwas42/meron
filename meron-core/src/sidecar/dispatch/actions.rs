@@ -1,4 +1,3 @@
-use anyhow::Context as _;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -40,63 +39,61 @@ pub(crate) async fn dispatch(
                 })
                 .unwrap_or_default();
 
-            let uids = if !explicit_uids.is_empty() {
-                explicit_uids
-            } else if thread_key.is_empty() {
-                uid.into_iter().collect::<Vec<_>>()
-            } else if !seen {
-                // Marking a whole thread unread flags its newest message only.
+            // Marking a whole thread read reaches every folder it spans and only
+            // the messages still unread; everything else acts on this folder.
+            let whole_thread_read = explicit_uids.is_empty() && !thread_key.is_empty() && seen;
+            let by_folder = if whole_thread_read {
                 let db = engine.db.lock().unwrap();
-                store::newest_thread_uids(
+                // The store is only updated after the server write below, so
+                // skipping messages it already has read is safe to retry.
+                store::thread_uids_by_folder(
                     &db,
                     &account,
                     &folder,
                     &thread_key,
                     subject_filter.as_deref(),
+                    true,
                 )?
             } else {
-                // Only touch the thread's messages whose flag actually differs.
-                let db = engine.db.lock().unwrap();
-                store::get_thread_headers(&db, &account, &folder, &thread_key)?
-                    .into_iter()
-                    .filter(|header| header.seen != seen)
-                    .filter(|header| match subject_filter.as_deref() {
-                        Some(filter) => store::thread_grouping_subject(&header.subject) == filter,
-                        None => true,
-                    })
-                    .map(|header| header.uid)
-                    .collect::<Vec<_>>()
+                let uids = if !explicit_uids.is_empty() {
+                    explicit_uids
+                } else if thread_key.is_empty() {
+                    uid.into_iter().collect::<Vec<_>>()
+                } else {
+                    // Marking a whole thread unread flags its newest message only.
+                    let db = engine.db.lock().unwrap();
+                    store::newest_thread_uids(
+                        &db,
+                        &account,
+                        &folder,
+                        &thread_key,
+                        subject_filter.as_deref(),
+                    )?
+                };
+                std::collections::BTreeMap::from([(folder.clone(), uids)])
             };
 
-            if !uids.is_empty() {
-                engine
-                    .with_preflighted_write_session(
-                        &account,
-                        |session| {
-                            let folder = folder.clone();
-                            Box::pin(
-                                async move { imap::prepare_flag_update(session, &folder).await },
-                            )
-                        },
-                        |session| {
-                            let uids = uids.clone();
-                            Box::pin(async move { imap::store_seen(session, &uids, seen).await })
-                        },
-                    )
-                    .await?;
-            }
+            engine
+                .store_seen_by_folder(&account, &by_folder, seen)
+                .await?;
 
             {
                 let db = engine.db.lock().unwrap();
-                if thread_key.is_empty() || subject_filter.is_some() || !seen {
-                    // Branch-scoped: a whole-thread update would flip sibling
-                    // subject branches sharing the root thread_key. Marking
-                    // unread is per-uid for the same reason — only the newest
-                    // message was flagged.
-                    for marked_uid in &uids {
-                        store::update_message_seen(&db, &account, &folder, *marked_uid, seen)?;
+                // Per uid: a whole-thread update would flip sibling subject
+                // branches sharing the root thread_key, and marking unread only
+                // flagged the newest message.
+                for (marked_folder, uids) in &by_folder {
+                    for marked_uid in uids {
+                        store::update_message_seen(
+                            &db,
+                            &account,
+                            marked_folder,
+                            *marked_uid,
+                            seen,
+                        )?;
                     }
-                } else {
+                }
+                if whole_thread_read && subject_filter.is_none() {
                     store::update_thread_seen(&db, &account, &folder, &thread_key, seen)?;
                 }
             }
@@ -110,9 +107,10 @@ pub(crate) async fn dispatch(
                     .unwrap_or_else(|| thread_key.clone());
                 mail_model::format_thread_id(&account, &folder, &key)
             };
-            mail_model::mutation_result(
+            let db = engine.db.lock().unwrap();
+            let mut result = mail_model::mutation_result(
                 json!({ "ok": true }),
-                &engine.db.lock().unwrap(),
+                &db,
                 &account,
                 &changed_thread_id,
                 &folder,
@@ -120,7 +118,9 @@ pub(crate) async fn dispatch(
                 Some(!seen),
                 None,
                 false,
-            )
+            )?;
+            mail_model::add_folder_unreads(&mut result, &db, &account, by_folder.keys())?;
+            Ok(result)
         }
 
         "messages.markStarred" => {
@@ -242,8 +242,29 @@ pub(crate) async fn dispatch(
                 );
             }
 
+            let cached_ids =
+                store::cached_message_ids(&engine.db.lock().unwrap(), &account, &folder, &uids)?;
+            let moved_ids = moved_message_ids(engine, &account, &folder, &uids, cached_ids).await;
             // Mutating, so it never auto-retries.
             let trashed = delete_to_trash(engine, &account, &folder, &uids).await?;
+            // Undo moves exactly these copies back out of Trash.
+            let copies = match &trashed {
+                Some(trash) => {
+                    let copies = refresh_moved_copies(
+                        engine,
+                        &account,
+                        &trash.folder,
+                        uids.len(),
+                        trash.uid_next_before,
+                        moved_ids.as_deref(),
+                    )
+                    .await;
+                    copies.store(&engine.db.lock().unwrap(), &account, &trash.folder)?;
+                    Some(copies)
+                }
+                None => None,
+            };
+            let trash_folder = trashed.as_ref().map(|trash| trash.folder.as_str());
 
             {
                 let db = engine.db.lock().unwrap();
@@ -258,9 +279,14 @@ pub(crate) async fn dispatch(
             // The server delete/move-to-Trash completed for every resolved UID.
             // A concurrent source refresh may already have pruned the cache rows.
             let deleted = uids.len();
-            let result = match trashed.as_deref() {
-                None => json!({ "ok": true, "deleted": deleted, "permanent": true }),
-                Some(trash) => json!({ "ok": true, "deleted": deleted, "trash": trash }),
+            let result = match (trash_folder, &copies) {
+                (Some(trash), Some(copies)) => json!({
+                    "ok": true,
+                    "deleted": deleted,
+                    "trash": trash,
+                    "target_uids": copies.uids,
+                }),
+                _ => json!({ "ok": true, "deleted": deleted, "permanent": true }),
             };
             mail_model::mutation_result(
                 result,
@@ -268,7 +294,7 @@ pub(crate) async fn dispatch(
                 &account,
                 &changed_thread_id,
                 &folder,
-                trashed.as_deref(),
+                trash_folder,
                 None,
                 None,
                 true,
@@ -305,7 +331,8 @@ pub(crate) async fn dispatch(
                 mail_model::format_thread_id(&account, &folder, &key)
             };
 
-            if folder == target_folder {
+            let target_account = req_str(p, "target_account").unwrap_or_else(|_| account.clone());
+            if account == target_account && folder == target_folder {
                 return mail_model::mutation_result(
                     json!({ "ok": true, "moved": 0, "source_folder": folder, "target_folder": target_folder }),
                     &engine.db.lock().unwrap(),
@@ -346,7 +373,23 @@ pub(crate) async fn dispatch(
                 );
             }
 
-            engine
+            if target_account != account {
+                return move_between_accounts(
+                    engine,
+                    &account,
+                    &folder,
+                    &changed_thread_id,
+                    &target_account,
+                    &target_folder,
+                    &uids,
+                )
+                .await;
+            }
+
+            let cached_ids =
+                store::cached_message_ids(&engine.db.lock().unwrap(), &account, &folder, &uids)?;
+            let moved_ids = moved_message_ids(engine, &account, &folder, &uids, cached_ids).await;
+            let uid_next_before = engine
                 .with_write_session(&account, |session| {
                     let folder = folder.clone();
                     let target_folder = target_folder.clone();
@@ -356,25 +399,19 @@ pub(crate) async fn dispatch(
                     })
                 })
                 .await?;
-            // Read-only refresh, on its own session: the MOVE has landed and
-            // must not be retried, and a message the target folder holds that we
-            // cannot parse must not sink the whole move.
-            let target_batch =
-                fetch_recent_resilient(engine, &account, &target_folder, 50.max(uids.len() as u32))
-                    .await
-                    .context("refresh target folder after move")?;
+            let copies = refresh_moved_copies(
+                engine,
+                &account,
+                &target_folder,
+                uids.len(),
+                uid_next_before,
+                moved_ids.as_deref(),
+            )
+            .await;
 
             {
                 let db = engine.db.lock().unwrap();
-                store::ensure_folder(&db, &account, &target_folder)?;
-                store::upsert_messages(&db, &account, &target_folder, &target_batch.messages)?;
-                store::set_folder_state(
-                    &db,
-                    &account,
-                    &target_folder,
-                    target_batch.uidvalidity,
-                    target_batch.uid_next,
-                )?;
+                copies.store(&db, &account, &target_folder)?;
                 store::delete_messages_by_uid(&db, &account, &folder, &uids)?;
             }
             // The IMAP MOVE above completed for every resolved UID. A concurrent
@@ -382,7 +419,13 @@ pub(crate) async fn dispatch(
             // so the cache DELETE count is not the number moved on the server.
             let moved = uids.len();
             mail_model::mutation_result(
-                json!({ "ok": true, "moved": moved, "source_folder": folder, "target_folder": target_folder }),
+                json!({
+                    "ok": true,
+                    "moved": moved,
+                    "source_folder": folder,
+                    "target_folder": target_folder,
+                    "target_uids": copies.uids,
+                }),
                 &engine.db.lock().unwrap(),
                 &account,
                 &changed_thread_id,
@@ -464,22 +507,29 @@ pub(crate) async fn dispatch(
                     let target_folder = target_folder.clone();
                     let raw_messages = raw_messages.clone();
                     Box::pin(async move {
-                        for message in &raw_messages {
-                            imap::append_copied_message(session, &target_folder, message).await?;
-                        }
-                        anyhow::Ok(())
+                        imap::append_copied_messages(session, &target_folder, &raw_messages).await
                     })
                 })
                 .await?;
             // Read-only refresh, on its own session; see the move handler above.
-            let target_batch = fetch_recent_resilient(
+            let copied_result = json!({
+                "ok": true,
+                "copied": copied,
+                "source_folder": folder,
+                "target_account": target_account,
+                "target_folder": target_folder
+            });
+            let Some(refresh) = meron_core::engine::refresh_written_folder(
                 engine,
                 &target_account,
                 &target_folder,
                 50.max(raw_messages.len() as u32),
             )
             .await
-            .context("refresh target folder after copy")?;
+            else {
+                return Ok(copied_result);
+            };
+            let target_batch = &refresh.batch;
 
             {
                 let db = engine.db.lock().unwrap();
@@ -499,13 +549,7 @@ pub(crate) async fn dispatch(
                 )?;
             }
 
-            Ok(json!({
-                "ok": true,
-                "copied": copied,
-                "source_folder": folder,
-                "target_account": target_account,
-                "target_folder": target_folder
-            }))
+            Ok(copied_result)
         }
 
         // Mark every message in a folder as read: set \Seen on the server for the
@@ -522,7 +566,7 @@ pub(crate) async fn dispatch(
 
             if !uids.is_empty() {
                 engine
-                    .with_preflighted_write_session(
+                    .with_flag_write_session(
                         &account,
                         |session| {
                             let folder = folder.clone();

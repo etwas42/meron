@@ -3,10 +3,12 @@
 mod accounts;
 mod actions;
 mod backup;
+mod calendar;
 mod compose;
 mod feeds;
 mod folders;
 mod messages;
+mod tasks;
 mod watch;
 
 use serde_json::Value;
@@ -30,6 +32,14 @@ pub(crate) async fn dispatch(
         "mcp.delete" => meron_core::mcp_mail::delete(engine, p.clone()).await,
         "mcp.organize" => meron_core::mcp_mail::organize(engine, p.clone()).await,
         "ping" => Ok(ping_response()),
+        "search.parse" | "search.build" => meron_core::search_query::handle_request(&req.method, p)
+            .ok_or_else(|| anyhow::anyhow!("bad {} request", req.method)),
+        "avatar.resolve" => {
+            let params = p.clone();
+            let image =
+                tokio::task::spawn_blocking(move || meron_core::avatar::resolve(&params)).await?;
+            Ok(serde_json::to_value(image)?)
+        }
 
         // Fetch the in-app changelog from the GitHub releases atom feed. The
         // network call runs on the blocking pool.
@@ -72,9 +82,34 @@ pub(crate) async fn dispatch(
         | "rss.importOpml" | "rss.thread" | "rss.markRead" | "rss.markAllRead"
         | "rss.markStarred" => feeds::dispatch(engine, req, out).await,
 
+        "tasks.lists"
+        | "tasks.listCreate"
+        | "tasks.listRename"
+        | "tasks.listDelete"
+        | "tasks.listReorder"
+        | "tasks.items"
+        | "tasks.create"
+        | "tasks.update"
+        | "tasks.setDone"
+        | "tasks.delete"
+        | "tasks.reorder"
+        | "tasks.clearCompleted"
+        | "tasks.restore"
+        | "tasks.forThread" => tasks::dispatch(engine, req, out).await,
+
+        "calendar.events"
+        | "calendar.get"
+        | "calendar.create"
+        | "calendar.update"
+        | "calendar.delete"
+        | "calendar.restore"
+        | "invite.removeFromCalendar"
+        | "invite.addToCalendar" => calendar::dispatch(engine, req, out).await,
+
         "folders.list"
         | "folders.create"
         | "folders.delete"
+        | "folders.setNotify"
         | "folders.archive"
         | "messages.emptyFolder" => folders::dispatch(engine, req, out).await,
 
@@ -88,9 +123,13 @@ pub(crate) async fn dispatch(
         | "messages.thread"
         | "messages.threadHeaders" => messages::dispatch(engine, req, out).await,
 
-        "send" | "save_draft" | "discard_draft" | "messages.saveRaw" => {
-            compose::dispatch(engine, req, out).await
-        }
+        "send"
+        | "invite.respond"
+        | "save_draft"
+        | "discard_draft"
+        | "messages.saveRaw"
+        | "messages.exportUids"
+        | "messages.saveRawBatch" => compose::dispatch(engine, req, out).await,
 
         "messages.markRead"
         | "messages.markStarred"

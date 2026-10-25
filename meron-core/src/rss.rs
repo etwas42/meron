@@ -21,6 +21,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::search_query::{SearchQuery, local_midnight};
 use crate::store::{self, RssItemExtra, RssMedia};
 
 const RSS_FOLDER_ID: &str = "inbox";
@@ -504,6 +505,10 @@ fn sync_subscription(db: &Mutex<Connection>, sub: &Subscription) -> Result<Vec<N
 /// One bridge `Message` per subscription (subscription = thread), newest first.
 /// `filter` mirrors the mail thread list: "unread" keeps feeds with an unread
 /// item, "starred" keeps feeds with a starred item, anything else keeps all.
+///
+/// `query` keeps feeds with an item that matches it, operators included, as
+/// they read for a feed: `from:` is the feed or the item's author, `subject:`
+/// the item's title. A feed item is addressed to no one, so `to:` matches none.
 pub fn recent(
     conn: &Connection,
     account: &str,
@@ -512,7 +517,7 @@ pub fn recent(
     limit: i64,
 ) -> Result<Vec<Value>> {
     let limit = if limit <= 0 { 50 } else { limit };
-    let q = query.trim().to_lowercase();
+    let query = SearchQuery::parse(query);
     let mut sql = String::from(
         "SELECT s.id, s.account, s.url, s.title,
            COALESCE(MAX(NULLIF(json_extract(m.json,'$.published_at'),0)),
@@ -536,11 +541,49 @@ pub fn recent(
          WHERE s.account = ?1 AND s.enabled = 1",
     );
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(account.to_string())];
-    if !q.is_empty() {
-        sql.push_str(
-            " AND (lower(s.title) LIKE ?2 OR lower(m.subject) LIKE ?2 OR lower(json_extract(m.json,'$.summary')) LIKE ?2)",
+    // Each text condition: any of `columns` holds any of `values`.
+    let mut like = |columns: &[&str], values: &[String]| {
+        let mut clauses = Vec::new();
+        for value in values {
+            let pattern = format!("%{}%", value.to_lowercase());
+            for column in columns {
+                args.push(Box::new(pattern.clone()));
+                clauses.push(format!("lower({column}) LIKE ?"));
+            }
+        }
+        sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+    };
+    for text in &query.text {
+        like(
+            &["s.title", "m.subject", "json_extract(m.json,'$.summary')"],
+            std::slice::from_ref(text),
         );
-        args.push(Box::new(format!("%{q}%")));
+    }
+    for from in &query.from {
+        like(&["s.title", "m.from_name"], from);
+    }
+    for subject in &query.subject {
+        like(&["m.subject"], subject);
+    }
+    if !query.to.is_empty() {
+        sql.push_str(" AND 0");
+    }
+    if query.read {
+        sql.push_str(" AND m.seen <> 0");
+    }
+    if query.unread {
+        sql.push_str(" AND m.seen = 0");
+    }
+    if query.starred {
+        sql.push_str(" AND m.starred <> 0");
+    }
+    if let Some(after) = query.after {
+        sql.push_str(" AND m.date >= ?");
+        args.push(Box::new(local_midnight(after)));
+    }
+    if let Some(before) = query.before {
+        sql.push_str(" AND m.date < ?");
+        args.push(Box::new(local_midnight(before)));
     }
     sql.push_str(" GROUP BY s.id");
     match filter {
@@ -1013,13 +1056,6 @@ fn item_message(
             body = content.to_string();
         }
     }
-    if !link.is_empty() {
-        if !body.is_empty() {
-            body.push_str("\n\n");
-        }
-        body.push_str("Source: ");
-        body.push_str(link);
-    }
     let ts = if published != 0 {
         published
     } else if updated != 0 {
@@ -1041,6 +1077,8 @@ fn item_message(
         "thread_id": thread_id,
         "from_name": sub_title,
         "from_addr": feed_host_label(link),
+        // The item's original page; the reader offers to open or copy it.
+        "link": link,
         "subject": subject,
         "preview": first_line(summary),
         "body": body,

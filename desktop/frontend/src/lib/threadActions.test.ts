@@ -36,6 +36,17 @@ describe('filterThreads', () => {
   it('keeps threads listed in keepIds', () => {
     expect(filterThreads(threads, 'starred', undefined, { c: true }).map((t) => t.thread_id)).toEqual(['b', 'c'])
   })
+
+  it('combines the attachments toggle with the read-state mode', () => {
+    const files = [
+      thread({ thread_id: 'unread-files', unread: true, has_attachments: true }),
+      thread({ thread_id: 'read-files', has_attachments: true }),
+      thread({ thread_id: 'unread-plain', unread: true }),
+    ]
+    const ids = (list: Message[]) => list.map((t) => t.thread_id)
+    expect(ids(filterThreads(files, 'all', undefined, undefined, true))).toEqual(['unread-files', 'read-files'])
+    expect(ids(filterThreads(files, 'unread', undefined, undefined, true))).toEqual(['unread-files'])
+  })
 })
 
 describe('isRssAccount', () => {

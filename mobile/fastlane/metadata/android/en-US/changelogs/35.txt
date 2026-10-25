@@ -1,0 +1,6 @@
+- Show attachment chips on thread cards and add an attachments filter
+- Switch task lists from the header and drag to reorder tasks
+- Show completed tasks in a collapsible section
+- Tidy message headers and show actual recipients in the To line
+- Add open and copy link actions to RSS feed items
+- Resolve and display sender avatars in thread lists

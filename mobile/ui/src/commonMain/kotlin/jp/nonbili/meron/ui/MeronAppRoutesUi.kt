@@ -1,5 +1,6 @@
 package jp.nonbili.meron.ui
 
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,6 +25,7 @@ import androidx.compose.material.icons.filled.MarkEmailRead
 import androidx.compose.material.icons.filled.MarkEmailUnread
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SelectAll
@@ -48,10 +50,15 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -113,6 +120,48 @@ internal fun KanbanRouteContent(
     activeKanbanBoard: KanbanBoardSpec?,
 ) {
     with(state) {
+        var searchOptionsOpen by remember { mutableStateOf(false) }
+        if (searchOptionsOpen) {
+            SearchOptionsSheet(
+                state = state,
+                query = kanbanSearch,
+                onDismiss = { searchOptionsOpen = false },
+                onSearch = { query ->
+                    persistKanbanSearch(query)
+                    loadKanbanBoard(refresh = true)
+                },
+                // A search scoped to one column saves into it; a board-wide one picks.
+                // A saved search narrowed by it isn't saved again (see saveKanbanSearchColumn).
+                saveColumns =
+                    activeKanbanBoard?.columns.orEmpty().filter {
+                        it.query.isBlank() && (kanbanSearchScope.ifBlank { "all" } == "all" || kanbanColumnKey(it) == kanbanSearchScope)
+                    },
+                columnLabel = { column ->
+                    val account = coreAccounts.firstOrNull { it.id == column.accountId }
+                    searchScopeTitle(column, coreAccounts, foldersByAccount) to account?.let { it.displayName.ifBlank { it.email } }.orEmpty()
+                },
+                onSave = { query, column -> saveKanbanSearchColumn(column, query, clearsScopedSearch = false) },
+                contactsAccountId =
+                    activeKanbanBoard
+                        ?.columns
+                        ?.firstOrNull { kanbanColumnKey(it) == kanbanSearchScope }
+                        ?.accountId
+                        ?.takeUnless { it == UNIFIED_ACCOUNT_ID }
+                        .orEmpty(),
+            )
+        }
+        // A saved search column's query, edited in the same form.
+        var editingSearchColumn by remember { mutableStateOf<KanbanColumnSpec?>(null) }
+        editingSearchColumn?.let { column ->
+            SearchOptionsSheet(
+                state = state,
+                query = column.query,
+                onDismiss = { editingSearchColumn = null },
+                onSearch = { query -> editKanbanSearchColumn(column, query) },
+                contactsAccountId = column.accountId.takeUnless { it == UNIFIED_ACCOUNT_ID }.orEmpty(),
+                submitLabel = tr("buttons.save"),
+            )
+        }
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
@@ -125,19 +174,21 @@ internal fun KanbanRouteContent(
                     showUnifiedInboxNav = showUnifiedInboxNav,
                     kanbanBoards = kanbanBoards,
                     activeKanbanBoardId = activeKanbanBoardId,
+                    tasksEnabled = tasksEnabled,
+                    calendarEnabled = calendarEnabled,
                     onSelectUnified = {
                         screen = Screen.Mail
                         if (selectedCoreAccountId != UNIFIED_ACCOUNT_ID) {
-                            selectCoreMailbox(UNIFIED_ACCOUNT_ID, INBOX_FOLDER)
-                            syncCoreThreads(accountOverride = UNIFIED_ACCOUNT_ID, folderOverride = INBOX_FOLDER, syncFirst = false)
+                            selectCoreMailbox(UNIFIED_ACCOUNT_ID)
+                            syncCoreThreads(accountOverride = UNIFIED_ACCOUNT_ID, folderOverride = selectedCoreFolder, syncFirst = false)
                         }
                         scope.launch { drawerState.close() }
                     },
                     onSelectAccount = { account ->
                         screen = Screen.Mail
                         if (selectedCoreAccountId != account.id) {
-                            selectCoreMailbox(account.id, INBOX_FOLDER)
-                            syncCoreThreads(accountOverride = account.id, folderOverride = INBOX_FOLDER, syncFirst = false)
+                            selectCoreMailbox(account.id)
+                            syncCoreThreads(accountOverride = account.id, folderOverride = selectedCoreFolder, syncFirst = false)
                         }
                         scope.launch { drawerState.close() }
                     },
@@ -148,6 +199,18 @@ internal fun KanbanRouteContent(
                             loadKanbanBoard(refresh = false)
                         }
                         scope.launch { drawerState.close() }
+                    },
+                    onSelectTasks = {
+                        scope.launch {
+                            openTasks()
+                            drawerState.close()
+                        }
+                    },
+                    onSelectCalendar = {
+                        scope.launch {
+                            openCalendar()
+                            drawerState.close()
+                        }
                     },
                     onAddAccount = {
                         resetPasswordAccountForm()
@@ -189,6 +252,7 @@ internal fun KanbanRouteContent(
                                     onSearchChange = ::persistKanbanSearch,
                                     onSearchScopeChange = ::persistKanbanSearchScope,
                                     onSearchSubmit = { loadKanbanBoard(refresh = true) },
+                                    onOpenOptions = { searchOptionsOpen = true },
                                 )
                             }
                         },
@@ -285,7 +349,7 @@ internal fun KanbanRouteContent(
                                                     mailSelectionMenuOpen = false
                                                     ensureThreadActionFolders(
                                                         thread = singleSelectedMailThread,
-                                                        includeAllMailAccounts = false,
+                                                        includeAllMailAccounts = true,
                                                     ) {
                                                         selectedMailMoveThread = singleSelectedMailThread
                                                     }
@@ -304,6 +368,7 @@ internal fun KanbanRouteContent(
                                                     }
                                                 },
                                             )
+                                            RecentSelectionTransferMenuItems(singleSelectedMailThread)
                                         }
                                     }
                                 }
@@ -327,6 +392,13 @@ internal fun KanbanRouteContent(
                                                 Modifier
                                                     .fillMaxWidth()
                                                     .padding(horizontal = 12.dp, vertical = 8.dp),
+                                        )
+                                        AttachmentsOnlyMenuItem(
+                                            checked = kanbanAttachmentsOnly,
+                                            onCheckedChange = { on ->
+                                                persistKanbanAttachmentsOnly(on)
+                                                loadKanbanBoard(refresh = true)
+                                            },
                                         )
                                         HorizontalDivider(Modifier.padding(vertical = 4.dp))
                                         DropdownMenuItem(
@@ -403,6 +475,7 @@ internal fun KanbanRouteContent(
                     columns = kanbanColumns,
                     foldersByAccount = foldersByAccount,
                     filter = kanbanFilter,
+                    attachmentsOnly = kanbanAttachmentsOnly,
                     search = kanbanSearch,
                     searchScope = kanbanSearchScope,
                     onOpen = { thread, column -> readCoreThread(thread, sourceFolder = column.folderId) },
@@ -463,6 +536,8 @@ internal fun KanbanRouteContent(
                         persistKanbanSearchScope(kanbanColumnKey(column))
                         if (kanbanSearch.isNotBlank()) loadKanbanBoard(refresh = true)
                     },
+                    onSaveSearchColumn = ::saveKanbanSearchColumn,
+                    onEditSearchColumn = { column -> editingSearchColumn = column },
                     onRequestColumnFolders = { column -> ensureAccountFolders(column.accountId) },
                     onSwitchColumnFolder = ::switchKanbanColumnFolder,
                     onAddColumn = { showKanbanColumnDialog = true },
@@ -488,9 +563,22 @@ internal fun MailRouteContent(
     mailListStates: MutableMap<MailboxCacheKey, MailListPosition>,
 ) {
     with(state) {
+        var searchOptionsOpen by remember { mutableStateOf(false) }
+        if (searchOptionsOpen) {
+            SearchOptionsSheet(
+                state = state,
+                query = mailSearch,
+                onDismiss = { searchOptionsOpen = false },
+                onSearch = { query ->
+                    mailSearch = query
+                    syncCoreThreads(syncFirst = false)
+                },
+                contactsAccountId = selectedCoreAccountId.takeUnless { it == UNIFIED_ACCOUNT_ID }.orEmpty(),
+            )
+        }
         val mailListKey =
             visibleMailboxKey
-                ?: mailboxCacheKey(selectedCoreAccountId, selectedCoreFolder, mailSearch, mailFilter)
+                ?: mailboxCacheKey(selectedCoreAccountId, selectedCoreFolder, mailSearch, mailFilter, mailAttachmentsOnly)
         val mailListPosition =
             remember(mailListKey) {
                 // Keyed by search text and filter as well as the mailbox, so every
@@ -504,6 +592,13 @@ internal fun MailRouteContent(
                 ).forEach(mailListStates::remove)
                 mailListStates.getOrPut(mailListKey) { MailListPosition() }
             }
+        // Use the retained position so mailbox switches and returning from a
+        // conversation restore the tint without waiting for another swipe.
+        val listScrolled by remember(mailListPosition) { derivedStateOf { mailListPosition.listState.canScrollBackward } }
+        val appBarColors = TopAppBarDefaults.topAppBarColors()
+        val appBarColor by animateColorAsState(
+            targetValue = if (listScrolled) appBarColors.scrolledContainerColor else appBarColors.containerColor,
+        )
         ModalNavigationDrawer(
             drawerState = drawerState,
             drawerContent = {
@@ -516,18 +611,20 @@ internal fun MailRouteContent(
                     showUnifiedInboxNav = showUnifiedInboxNav,
                     kanbanBoards = kanbanBoards,
                     activeKanbanBoardId = activeKanbanBoardId,
+                    tasksEnabled = tasksEnabled,
+                    calendarEnabled = calendarEnabled,
                     onSelectUnified = {
                         if (selectedCoreAccountId != UNIFIED_ACCOUNT_ID) {
-                            selectCoreMailbox(UNIFIED_ACCOUNT_ID, INBOX_FOLDER)
-                            syncCoreThreads(accountOverride = UNIFIED_ACCOUNT_ID, folderOverride = INBOX_FOLDER, syncFirst = false)
+                            selectCoreMailbox(UNIFIED_ACCOUNT_ID)
+                            syncCoreThreads(accountOverride = UNIFIED_ACCOUNT_ID, folderOverride = selectedCoreFolder, syncFirst = false)
                         }
                         screen = Screen.Mail
                         scope.launch { drawerState.close() }
                     },
                     onSelectAccount = { account ->
                         if (selectedCoreAccountId != account.id) {
-                            selectCoreMailbox(account.id, INBOX_FOLDER)
-                            syncCoreThreads(accountOverride = account.id, folderOverride = INBOX_FOLDER, syncFirst = false)
+                            selectCoreMailbox(account.id)
+                            syncCoreThreads(accountOverride = account.id, folderOverride = selectedCoreFolder, syncFirst = false)
                         }
                         screen = Screen.Mail
                         scope.launch { drawerState.close() }
@@ -539,6 +636,18 @@ internal fun MailRouteContent(
                         previousTopScreen = Screen.Kanban
                         loadKanbanBoard(refresh = false)
                         scope.launch { drawerState.close() }
+                    },
+                    onSelectTasks = {
+                        scope.launch {
+                            openTasks()
+                            drawerState.close()
+                        }
+                    },
+                    onSelectCalendar = {
+                        scope.launch {
+                            openCalendar()
+                            drawerState.close()
+                        }
                     },
                     onAddAccount = {
                         resetPasswordAccountForm()
@@ -567,6 +676,7 @@ internal fun MailRouteContent(
             Scaffold(
                 topBar = {
                     TopAppBar(
+                        colors = appBarColors.copy(containerColor = appBarColor),
                         title = {
                             if (mailSelectionActive) {
                                 MailSelectionTitle(selectedMailThreads.size, height = 44.dp)
@@ -611,6 +721,19 @@ internal fun MailRouteContent(
                                             // out the search field next to it.
                                             modifier = Modifier.widthIn(max = 120.dp),
                                             fontSize = 14.sp,
+                                            onSetFolderNotify =
+                                                if (unifiedMailbox) {
+                                                    null
+                                                } else {
+                                                    { folder, enabled ->
+                                                        setMailFolderNotify(
+                                                            accountId = folder.accountId,
+                                                            folderId = folder.name,
+                                                            folderName = folder.displayName,
+                                                            enabled = enabled,
+                                                        )
+                                                    }
+                                                },
                                         )
                                     }
                                     Box(Modifier.weight(1f)) {
@@ -624,6 +747,8 @@ internal fun MailRouteContent(
                                                 },
                                             onSearchChange = { mailSearch = it },
                                             onSearchSubmit = { syncCoreThreads(syncFirst = false) },
+                                            // Feed search is plain text; the operators are mail's.
+                                            onOpenOptions = if (selectedAccountIsRss) null else ({ searchOptionsOpen = true }),
                                         )
                                     }
                                 }
@@ -719,7 +844,7 @@ internal fun MailRouteContent(
                                                     mailSelectionMenuOpen = false
                                                     ensureThreadActionFolders(
                                                         thread = singleSelectedMailThread,
-                                                        includeAllMailAccounts = false,
+                                                        includeAllMailAccounts = true,
                                                     ) {
                                                         selectedMailMoveThread = singleSelectedMailThread
                                                     }
@@ -738,6 +863,7 @@ internal fun MailRouteContent(
                                                     }
                                                 },
                                             )
+                                            RecentSelectionTransferMenuItems(singleSelectedMailThread)
                                         }
                                     }
                                 }
@@ -780,6 +906,12 @@ internal fun MailRouteContent(
                                     } else {
                                         deletableFolder(coreFolders, selectedCoreAccountId, selectedCoreFolder)
                                     }
+                                val notifiableMailboxFolder =
+                                    if (selectedAccountIsRss) {
+                                        null
+                                    } else {
+                                        notifiableFolder(coreFolders, selectedCoreAccountId, selectedCoreFolder)
+                                    }
                                 Box {
                                     IconButton(onClick = { mailboxMenuOpen = true }) {
                                         Icon(
@@ -807,6 +939,13 @@ internal fun MailRouteContent(
                                                 Modifier
                                                     .fillMaxWidth()
                                                     .padding(horizontal = 12.dp, vertical = 8.dp),
+                                        )
+                                        AttachmentsOnlyMenuItem(
+                                            checked = mailAttachmentsOnly,
+                                            onCheckedChange = { on ->
+                                                mailAttachmentsOnly = on
+                                                syncCoreThreads(syncFirst = false)
+                                            },
                                         )
                                         if (showMarkAllRead || showAccountActions) {
                                             HorizontalDivider(Modifier.padding(vertical = 4.dp))
@@ -851,6 +990,40 @@ internal fun MailRouteContent(
                                                             folderName = folder.displayName,
                                                             role = folder.role,
                                                         )
+                                                },
+                                            )
+                                        }
+                                        notifiableMailboxFolder?.let { folder ->
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text(
+                                                        tr(
+                                                            if (folder.notify) {
+                                                                "folders.notify.disable"
+                                                            } else {
+                                                                "folders.notify.enable"
+                                                            },
+                                                        ),
+                                                    )
+                                                },
+                                                leadingIcon = {
+                                                    Icon(
+                                                        if (folder.notify) {
+                                                            Icons.Filled.NotificationsOff
+                                                        } else {
+                                                            Icons.Outlined.NotificationsNone
+                                                        },
+                                                        contentDescription = null,
+                                                    )
+                                                },
+                                                onClick = {
+                                                    mailboxMenuOpen = false
+                                                    setMailFolderNotify(
+                                                        accountId = folder.accountId,
+                                                        folderId = folder.name,
+                                                        folderName = folder.displayName,
+                                                        enabled = !folder.notify,
+                                                    )
                                                 },
                                             )
                                         }
@@ -968,11 +1141,13 @@ internal fun MailRouteContent(
                     when {
                         reconnectAccount2 != null -> {
                             StatusBanner(
-                                message = "Can't sign in to ${reconnectAccount2.email.ifBlank {
-                                    reconnectAccount2.displayName
-                                }}. Update the credentials to reconnect.",
+                                message =
+                                    tr(
+                                        "mobile.status.cantSignIn",
+                                        mapOf("account" to reconnectAccount2.email.ifBlank { reconnectAccount2.displayName }),
+                                    ),
                                 isError = true,
-                                actionLabel = "Reconnect",
+                                actionLabel = tr("settings.account.reconnectButton"),
                                 onAction = { reconnectAccount(reconnectAccount2) },
                                 onDismiss = null,
                             )
@@ -1016,7 +1191,7 @@ internal fun MailRouteContent(
                                     when {
                                         untrustedCert -> tr("accounts.certificate.show")
                                         proxyEndpoint != null -> tr("settings.network.proxy")
-                                        authLike && failedAccount != null -> "Reconnect"
+                                        authLike && failedAccount != null -> tr("settings.account.reconnectButton")
                                         else -> tr("connectivity.retry")
                                     },
                                 onAction = {
@@ -1063,8 +1238,8 @@ internal fun MailRouteContent(
                                 actionLabel =
                                     when {
                                         untrustedCert -> tr("accounts.certificate.show")
-                                        authLike && selectedAccount != null -> "Reconnect"
-                                        else -> "Retry"
+                                        authLike && selectedAccount != null -> tr("settings.account.reconnectButton")
+                                        else -> tr("connectivity.retry")
                                     },
                                 onAction = {
                                     when {
@@ -1181,7 +1356,7 @@ internal fun MailRouteContent(
                             syncing = false
                             initialThreadsLoaded = true
                             blockingMailboxLoadSlow = false
-                            errorBanner = "Inbox load timed out. Pull to refresh or tap Retry."
+                            errorBanner = trs("mobile.status.inboxLoadTimedOut")
                         }
                     }
                     PullToRefreshBox(
@@ -1191,7 +1366,7 @@ internal fun MailRouteContent(
                     ) {
                         when {
                             !initialAccountsLoaded || accountsLoading -> {
-                                LoadingState("Loading your inbox…")
+                                LoadingState(tr("mobile.status.loadingInbox"))
                             }
 
                             coreAccounts.isEmpty() -> {
@@ -1212,37 +1387,53 @@ internal fun MailRouteContent(
                                 LoadingState(
                                     if (selectedAccountIsRss) {
                                         if (blockingMailboxLoadSlow) {
-                                            "Still syncing feeds… The first sync can take a while."
+                                            tr("mobile.status.stillSyncingFeeds")
                                         } else {
-                                            "Loading feeds…"
+                                            tr("mobile.status.loadingFeeds")
                                         }
                                     } else {
                                         if (blockingMailboxLoadSlow) {
-                                            "Still syncing your inbox… The first sync can take a while."
+                                            tr("mobile.status.stillSyncingInbox")
                                         } else {
-                                            "Loading your inbox…"
+                                            tr("mobile.status.loadingInbox")
                                         }
                                     },
                                 )
                             }
 
                             coreThreads.isEmpty() -> {
+                                val narrowed = mailSearch.isNotBlank() || mailFilter != FilterMode.All || mailAttachmentsOnly
+                                // A narrowed page can come back empty with older
+                                // mail still to read (the core stops reading on
+                                // after a few emptied pages): offer the next page
+                                // rather than a dead end.
+                                val canPageOn = narrowed && pageableCoreAccounts().isNotEmpty()
                                 EmptyState(
                                     icon = Icons.Outlined.Drafts,
                                     title =
-                                        if (mailSearch.isBlank() && mailFilter == FilterMode.All) {
+                                        if (!narrowed) {
                                             if (selectedAccountIsRss) tr("empty.noFeeds") else tr("empty.nothingHereYet")
                                         } else {
                                             tr("empty.noMatchingMail")
                                         },
                                     text =
-                                        if (mailSearch.isBlank() && mailFilter == FilterMode.All) {
+                                        if (!narrowed) {
                                             if (selectedAccountIsRss) tr("empty.addFeedToStart") else tr("empty.pullLatestMessages")
                                         } else {
                                             tr("empty.adjustSearchFilter")
                                         },
-                                    actionLabel = if (selectedAccountIsRss) null else tr("mobile.mail.syncMailbox"),
-                                    onAction = if (selectedAccountIsRss) null else ({ syncCoreThreads() }),
+                                    actionLabel =
+                                        when {
+                                            canPageOn -> tr("threads.actions.loadMore")
+                                            selectedAccountIsRss -> null
+                                            else -> tr("mobile.mail.syncMailbox")
+                                        },
+                                    onAction =
+                                        when {
+                                            canPageOn -> ({ loadMoreCoreThreads(quiet = false) })
+                                            selectedAccountIsRss -> null
+                                            else -> ({ syncCoreThreads() })
+                                        },
                                 )
                             }
 

@@ -100,6 +100,9 @@ interface MobileHost {
      *  is kept. */
     fun shareDiagnosticLog() {}
 
+    /** Offer [text] to other apps through the platform share sheet. */
+    fun shareText(text: String) {}
+
     /** One-line summary of a crash from a previous run that the user has not
      *  been asked about yet, or "" when the last run ended cleanly. Drives the
      *  next-launch "send report?" prompt; crash details stay on the device
@@ -214,4 +217,18 @@ open class DefaultMobileHost(
         accountId: String,
         expiresAtEpochSeconds: Long,
     ) {}
+}
+
+/** Reactive handoff for thread links arriving after the native controller exists. */
+class IncomingThreadEvents {
+    var target by mutableStateOf<NotificationThreadTarget?>(null)
+        private set
+
+    fun consume() {
+        target = null
+    }
+
+    fun offer(target: NotificationThreadTarget) {
+        this.target = target
+    }
 }

@@ -1,6 +1,25 @@
 import { useRef, useState } from 'react'
+import { MenuSurface } from '../menu/MenuSurface'
 import type { ReactNode } from 'react'
-import { MoreVertical, Inbox, Mail, Star, CheckCheck, EyeOff, FolderX, RefreshCw, Search, Trash2 } from 'lucide-react'
+import {
+  MoreHorizontal,
+  Inbox,
+  Mail,
+  Bell,
+  BellOff,
+  BookmarkPlus,
+  Pencil,
+  Star,
+  Paperclip,
+  Check,
+  CheckCheck,
+  Download,
+  EyeOff,
+  FolderX,
+  RefreshCw,
+  Search,
+  Trash2,
+} from 'lucide-react'
 import { useTranslation } from '../../lib/i18n'
 import type { FilterMode } from '../../states/ui'
 import { useDismissOnOutside } from '../menu/useDismissOnOutside'
@@ -10,6 +29,9 @@ import { menuItemBase } from '../menu/menuStyles'
 export type ThreadActionsMenuItemsProps = {
   filterMode: FilterMode
   onFilterChange: (mode: FilterMode) => void
+  /** The attachments toggle, independent of `filterMode`; hidden unless wired. */
+  attachmentsOnly?: boolean
+  onAttachmentsOnlyChange?: (on: boolean) => void
   hasUnread: boolean
   onMarkAllRead: () => void
   /** Only wired for a per-account Trash or Junk folder; the item is hidden otherwise. */
@@ -17,6 +39,11 @@ export type ThreadActionsMenuItemsProps = {
   emptyFolderLabel?: string
   /** Only wired for an ordinary folder of a single mail account; hidden otherwise. */
   onDeleteFolder?: () => void
+  /** Only wired for a folder of a single mail account; hidden otherwise. */
+  onExportFolder?: () => void
+  /** Only wired for a non-inbox folder of a single mail account; hidden otherwise. */
+  onToggleNotify?: () => void
+  notifyEnabled?: boolean
   onSync?: () => void
   syncing?: boolean
   syncLabel?: string
@@ -25,6 +52,10 @@ export type ThreadActionsMenuItemsProps = {
   onRemove?: () => void
   onSearch?: () => void
   searchLabel?: string
+  /** Only wired while a search is showing in a kanban column; hidden otherwise. */
+  onSaveSearch?: () => void
+  /** Only wired for a saved search kanban column; hidden otherwise. */
+  onEditSearch?: () => void
   /** Set where the filtered list isn't on screen (a collapsed kanban column). */
   hideFilters?: boolean
   closeMenu: () => void
@@ -33,11 +64,16 @@ export type ThreadActionsMenuItemsProps = {
 export function ThreadActionsMenuItems({
   filterMode,
   onFilterChange,
+  attachmentsOnly = false,
+  onAttachmentsOnlyChange,
   hasUnread,
   onMarkAllRead,
   onEmptyFolder,
   emptyFolderLabel,
   onDeleteFolder,
+  onExportFolder,
+  onToggleNotify,
+  notifyEnabled = false,
   onSync,
   syncing = false,
   syncLabel,
@@ -46,6 +82,8 @@ export function ThreadActionsMenuItems({
   onRemove,
   onSearch,
   searchLabel,
+  onSaveSearch,
+  onEditSearch,
   hideFilters = false,
   closeMenu,
 }: ThreadActionsMenuItemsProps) {
@@ -73,6 +111,28 @@ export function ThreadActionsMenuItems({
           {filterItem('all', allLabel ?? t('filters.all'), <Inbox size={13} className="text-secondary shrink-0" />)}
           {filterItem('unread', t('filters.unread'), <Mail size={13} className="text-secondary shrink-0" />)}
           {filterItem('starred', t('filters.starred'), <Star size={13} className="text-secondary shrink-0" />)}
+          {onAttachmentsOnlyChange && (
+            <>
+              {/* An on/off narrowing on top of the choice above, not a fourth
+                  choice: unread mail with attachments is a view of its own. */}
+              <div className="my-1 border-t border-border" />
+              <button
+                role="menuitemcheckbox"
+                aria-checked={attachmentsOnly}
+                className={`${menuItemBase} flex-nowrap ${
+                  attachmentsOnly ? 'bg-accent/10 dark:bg-accent/15 text-accent' : 'text-primary hover:bg-hover'
+                }`}
+                onClick={() => {
+                  onAttachmentsOnlyChange(!attachmentsOnly)
+                  closeMenu()
+                }}
+              >
+                <Paperclip size={13} className="text-secondary shrink-0" />
+                <span className="whitespace-nowrap shrink-0">{t('chat.attachments')}</span>
+                <Check size={13} className={`ml-auto shrink-0 ${attachmentsOnly ? '' : 'invisible'}`} />
+              </button>
+            </>
+          )}
           <div className="my-1 border-t border-border" />
         </>
       )}
@@ -114,7 +174,29 @@ export function ThreadActionsMenuItems({
           }}
         />
       )}
-      {(onSync || onRemove || onDeleteFolder) && (
+      {onSaveSearch && (
+        <MenuItem
+          className="flex-nowrap"
+          icon={<BookmarkPlus size={13} className="text-secondary shrink-0" />}
+          label={<span className="whitespace-nowrap shrink-0">{t('kanban.actions.saveSearchAsColumn')}</span>}
+          onClick={() => {
+            onSaveSearch()
+            closeMenu()
+          }}
+        />
+      )}
+      {onEditSearch && (
+        <MenuItem
+          className="flex-nowrap"
+          icon={<Pencil size={13} className="text-secondary shrink-0" />}
+          label={<span className="whitespace-nowrap shrink-0">{t('kanban.actions.editSearch')}</span>}
+          onClick={() => {
+            onEditSearch()
+            closeMenu()
+          }}
+        />
+      )}
+      {(onSync || onRemove || onDeleteFolder || onExportFolder || onToggleNotify) && (
         <>
           <div className="my-1 border-t border-border" />
           {onSync && (
@@ -135,6 +217,38 @@ export function ThreadActionsMenuItems({
               }
               onClick={() => {
                 onSync()
+                closeMenu()
+              }}
+            />
+          )}
+          {onToggleNotify && (
+            <MenuItem
+              className="flex-nowrap"
+              icon={
+                notifyEnabled ? (
+                  <BellOff size={13} className="text-secondary shrink-0" />
+                ) : (
+                  <Bell size={13} className="text-secondary shrink-0" />
+                )
+              }
+              label={
+                <span className="whitespace-nowrap shrink-0">
+                  {notifyEnabled ? t('folders.notify.disable') : t('folders.notify.enable')}
+                </span>
+              }
+              onClick={() => {
+                onToggleNotify()
+                closeMenu()
+              }}
+            />
+          )}
+          {onExportFolder && (
+            <MenuItem
+              className="flex-nowrap"
+              icon={<Download size={13} className="text-secondary shrink-0" />}
+              label={<span className="whitespace-nowrap shrink-0">{t('folders.exportEml')}</span>}
+              onClick={() => {
+                onExportFolder()
                 closeMenu()
               }}
             />
@@ -173,11 +287,16 @@ export function ThreadActionsMenuItems({
 export function ThreadActionsMenu({
   filterMode,
   onFilterChange,
+  attachmentsOnly = false,
+  onAttachmentsOnlyChange,
   hasUnread,
   onMarkAllRead,
   onEmptyFolder,
   emptyFolderLabel,
   onDeleteFolder,
+  onExportFolder,
+  onToggleNotify,
+  notifyEnabled = false,
   onSync,
   syncing = false,
   syncLabel,
@@ -186,16 +305,23 @@ export function ThreadActionsMenu({
   onRemove,
   onSearch,
   searchLabel,
+  onSaveSearch,
+  onEditSearch,
   size = 16,
   triggerClassName = 'h-8 w-8',
 }: {
   filterMode: FilterMode
   onFilterChange: (mode: FilterMode) => void
+  attachmentsOnly?: boolean
+  onAttachmentsOnlyChange?: (on: boolean) => void
   hasUnread: boolean
   onMarkAllRead: () => void
   onEmptyFolder?: () => void
   emptyFolderLabel?: string
   onDeleteFolder?: () => void
+  onExportFolder?: () => void
+  onToggleNotify?: () => void
+  notifyEnabled?: boolean
   onSync?: () => void
   syncing?: boolean
   syncLabel?: string
@@ -204,6 +330,10 @@ export function ThreadActionsMenu({
   onRemove?: () => void
   onSearch?: () => void
   searchLabel?: string
+  /** Only wired while a search is showing in a kanban column; hidden otherwise. */
+  onSaveSearch?: () => void
+  /** Only wired for a saved search kanban column; hidden otherwise. */
+  onEditSearch?: () => void
   size?: number
   triggerClassName?: string
 }) {
@@ -217,7 +347,7 @@ export function ThreadActionsMenu({
     () => setOpen(false),
   )
 
-  const filterActive = filterMode !== 'all'
+  const filterActive = filterMode !== 'all' || attachmentsOnly
 
   return (
     <div ref={rootRef} className="relative">
@@ -231,21 +361,26 @@ export function ThreadActionsMenu({
         }}
         title={t('threads.actions.title')}
       >
-        <MoreVertical size={size} />
+        <MoreHorizontal size={size} />
       </button>
       {open && (
-        <div
-          className="absolute right-0 mt-1.5 z-50 min-w-[160px] w-max rounded-xl border border-border bg-chats p-1 shadow-2xl animate-fade-in select-none"
+        <MenuSurface
+          className="absolute right-0 mt-1.5 z-50 min-w-[160px] w-max select-none"
           onClick={(event) => event.stopPropagation()}
         >
           <ThreadActionsMenuItems
             filterMode={filterMode}
             onFilterChange={onFilterChange}
+            attachmentsOnly={attachmentsOnly}
+            onAttachmentsOnlyChange={onAttachmentsOnlyChange}
             hasUnread={hasUnread}
             onMarkAllRead={onMarkAllRead}
             onEmptyFolder={onEmptyFolder}
             emptyFolderLabel={emptyFolderLabel}
             onDeleteFolder={onDeleteFolder}
+            onExportFolder={onExportFolder}
+            onToggleNotify={onToggleNotify}
+            notifyEnabled={notifyEnabled}
             onSync={onSync}
             syncing={syncing}
             syncLabel={syncLabel}
@@ -254,9 +389,11 @@ export function ThreadActionsMenu({
             onRemove={onRemove}
             onSearch={onSearch}
             searchLabel={searchLabel}
+            onSaveSearch={onSaveSearch}
+            onEditSearch={onEditSearch}
             closeMenu={() => setOpen(false)}
           />
-        </div>
+        </MenuSurface>
       )}
     </div>
   )

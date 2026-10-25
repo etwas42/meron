@@ -121,7 +121,7 @@ class MailboxReloadDeferralTest {
             assertEquals(emptyList(), state.coreThreads)
             assertEquals(emptyList(), state.kanbanColumns[starredKey]?.threads)
             assertEquals(listOf(row.copy(starred = false)), state.kanbanColumns[inboxKey]?.threads)
-            waitUntil { state.status.startsWith("Unstar failed") }
+            waitUntil { state.status.startsWith("Couldn't remove star") }
             assertEquals(listOf(row), state.coreThreads)
             assertEquals(listOf(row), state.kanbanColumns[starredKey]?.threads)
             assertEquals(listOf(row), state.kanbanColumns[inboxKey]?.threads)
@@ -161,7 +161,7 @@ class MailboxReloadDeferralTest {
             assertEquals(emptyList(), state.coreThreads)
             assertEquals(false, state.messages.single().starred)
             assertEquals(false, state.selectedCoreThread?.starred)
-            waitUntil { state.status.startsWith("Star failed") }
+            waitUntil { state.status.startsWith("Couldn't remove star") }
             assertEquals(listOf(row), state.coreThreads)
             assertEquals(listOf(message), state.messages)
             assertEquals(row, state.selectedCoreThread)
@@ -181,13 +181,13 @@ class MailboxReloadDeferralTest {
             state.messages = listOf(message)
 
             state.toggleStar(row)
-            waitUntil { state.status == "Unstar complete" }
+            waitUntil { state.status == "Star removed" }
             assertEquals(cached, state.mailboxCache)
             assertEquals(0, core.threadListCalls)
             assertEquals(0, core.starredListCalls)
 
             state.toggleMessageStarred(message)
-            waitUntil { state.status == "Unstarred" }
+            waitUntil { state.status == "Star removed" }
             assertEquals(cached, state.mailboxCache)
             assertEquals(0, core.threadListCalls)
             assertEquals(0, core.starredListCalls)

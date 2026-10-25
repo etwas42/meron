@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/godbus/dbus/v5"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 func TestPortalFilePaths(t *testing.T) {
@@ -76,5 +77,32 @@ func TestPortalOpenFileOptions(t *testing.T) {
 	}
 	if token, ok := options["handle_token"].Value().(string); !ok || token == "" {
 		t.Fatalf("handle_token = %#v", options["handle_token"].Value())
+	}
+}
+
+func TestAddPortalFilters(t *testing.T) {
+	options := map[string]dbus.Variant{}
+	addPortalFilters(options, []wailsRuntime.FileFilter{
+		{DisplayName: "OPML files", Pattern: "*.opml; *.xml"},
+		{DisplayName: "Empty", Pattern: " ; "},
+	})
+	want := []portalFilter{{
+		Name:  "OPML files",
+		Rules: []portalFilterRule{{Kind: 0, Pattern: "*.opml"}, {Kind: 0, Pattern: "*.xml"}},
+	}}
+	if got := options["filters"].Value(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("filters = %#v, want %#v", got, want)
+	}
+	if sig := options["filters"].Signature().String(); sig != "a(sa(us))" {
+		t.Fatalf("filters signature = %s, want a(sa(us))", sig)
+	}
+	if sig := options["current_filter"].Signature().String(); sig != "(sa(us))" {
+		t.Fatalf("current_filter signature = %s, want (sa(us))", sig)
+	}
+
+	options = map[string]dbus.Variant{}
+	addPortalFilters(options, nil)
+	if len(options) != 0 {
+		t.Fatalf("addPortalFilters(nil) set %v", options)
 	}
 }

@@ -1,0 +1,6 @@
+- Support printing messages and threads
+- Move compose to side navigation
+- Make Meron Light the default theme
+- List all senders on thread cards
+- Refine unread badges across views
+- Refine palette search and quick settings

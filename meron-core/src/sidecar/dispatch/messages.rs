@@ -55,18 +55,21 @@ pub(crate) async fn dispatch(
                     }
                 }
             }
+            let limit = u32::from(req_u16(p, "limit").unwrap_or(50));
             let mut pages = Vec::with_capacity(folders.len());
             for (account, folder) in folders {
+                let from = cursors.get(&account).cloned().unwrap_or_default();
                 let mut params = json!({
                     "account": account.clone(),
                     "folder": folder,
                     "query": req_str(p, "query").unwrap_or_default(),
                     "filter": req_str(p, "filter").unwrap_or_default(),
-                    "limit": req_u16(p, "limit").unwrap_or(50),
+                    "attachments": p.get("attachments").and_then(Value::as_bool).unwrap_or(false),
+                    "limit": from.fetch_limit(limit),
                     "refresh": p.get("refresh").and_then(Value::as_bool).unwrap_or(true),
                     "group": true,
                 });
-                if let Some(cursor) = cursors.get(&account) {
+                if let Some(cursor) = &from.cursor {
                     params["before_cursor"] = Value::String(cursor.clone());
                 }
                 let request = Request {
@@ -77,104 +80,36 @@ pub(crate) async fn dispatch(
                 let result = Box::pin(dispatch(engine, &request, out))
                     .await
                     .map_err(|err| format!("{err:#}"));
-                pages.push((account, result));
+                pages.push(unified::AccountPage {
+                    account_id: account,
+                    from,
+                    result,
+                });
             }
-            Ok(unified::merge_pages(pages, "threads"))
+            Ok(unified::merge_pages(pages, "threads", limit))
         }
 
         // RSS returns final thread Message JSON under "threads"; mail returns raw
         // rows under "messages" the bridge groups into threads.
         "messages.recent" => {
-            let account = req_str(p, "account")?;
-            let request = thread_list::ThreadListQuery::from_params(p, "folder");
-            let refresh = p.get("refresh").and_then(Value::as_bool).unwrap_or(true);
-            if is_rss(engine, &account)? {
-                let page = thread_list::rss_page(&engine.db.lock().unwrap(), &account, &request)?;
-                if refresh {
-                    spawn_rss_sync(engine.clone(), out.clone(), account);
-                }
-                return Ok(page);
-            }
-            let folder = request.folder.clone();
-            let limit = request.limit;
-            // Capture this before spawning the background refresh. The returned
-            // page was read from the pre-refresh cache, so its empty-state
-            // metadata must describe that same snapshot.
-            let folder_synced_before =
-                store::get_folder_state(&engine.db.lock().unwrap(), &account, &folder)?.is_some();
-            // Desktop starred reads are online-first. Search first paints the
-            // local index with refresh=false, then repeats with refresh=true;
-            // snapshot-backed later pages are local even though they travel
-            // through the shared search engine.
-            let (messages, next_cursor) = match request.source() {
-                thread_list::MailSource::Starred => {
-                    let folders = starred_search_folders(engine, &account, &folder).await;
-                    (
-                        search_starred_mail_messages(engine, &account, &folders, limit, refresh)
-                            .await?,
-                        None,
-                    )
-                }
-                thread_list::MailSource::Recent { unread_only } => store::get_recent_page(
-                    &engine.db.lock().unwrap(),
-                    &account,
-                    &folder,
-                    limit,
-                    request.before_cursor,
-                    unread_only,
-                )?,
-                thread_list::MailSource::Search => {
-                    // Chat-view search spans the selected folder plus Sent, so a
-                    // lookup surfaces both received and self-sent mail (and old
-                    // messages filed under Sent), not just the current mailbox.
-                    let folders = search_folders(&engine.db.lock().unwrap(), &account, &folder);
-                    if refresh || request.search_before_cursor.as_ref().is_some() {
-                        let page = search_mail_messages(
-                            engine,
-                            &account,
-                            &folders,
-                            &request.query,
-                            limit,
-                            request.search_before_cursor.as_ref(),
-                        )
-                        .await?;
-                        (page.messages, page.next_cursor)
-                    } else {
-                        let messages = store::search_messages_in_folders(
-                            &engine.db.lock().unwrap(),
-                            &account,
-                            &folders,
-                            &request.query,
-                            limit,
-                            None,
-                        )?;
-                        let next_cursor = store::search_next_cursor(&messages, limit, 0);
-                        (messages, next_cursor)
+            // The attachments toggle narrows a page after it is read (search,
+            // starred and feed pages cannot ask for it up front), so a page can
+            // come back empty while older matches remain. Read on through a few
+            // such pages rather than hand back an empty list — which would show
+            // the empty state and no way to page on.
+            let mut params = p.clone();
+            let mut hops = 0;
+            loop {
+                let page = messages_recent(engine, &params, out).await?;
+                let request = thread_list::ThreadListQuery::from_params(&params, "folder");
+                match request.next_attachment_cursor(&page, hops) {
+                    Some(cursor) => {
+                        params["before_cursor"] = Value::String(cursor);
+                        hops += 1;
                     }
+                    None => return Ok(page),
                 }
-            };
-            if refresh && request.wants_background_sync() {
-                spawn_message_sync(
-                    engine.clone(),
-                    out.clone(),
-                    account.clone(),
-                    folder.clone(),
-                    limit,
-                );
             }
-            let mut page = thread_list::mail_page(
-                &engine.db.lock().unwrap(),
-                &account,
-                &folder,
-                messages,
-                next_cursor,
-                p.get("group").and_then(Value::as_bool).unwrap_or(false),
-            )?;
-            page.as_object_mut().unwrap().insert(
-                "folder_synced".to_string(),
-                Value::Bool(folder_synced_before),
-            );
-            Ok(page)
         }
 
         // Every starred item across all accounts, local cache only (the
@@ -190,6 +125,9 @@ pub(crate) async fn dispatch(
                 items,
                 &req_str(p, "query").unwrap_or_default(),
                 &req_str(p, "filter").unwrap_or_else(|_| "all".to_string()),
+                p.get("attachments")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 limit as usize,
                 p.get("before_cursor").and_then(Value::as_str),
             ))
@@ -233,11 +171,29 @@ pub(crate) async fn dispatch(
                 canon_folder(&req_str(p, "folder").unwrap_or_else(|_| "INBOX".to_string()));
             let uid = req_u32(p, "uid")?;
 
-            let message = read_cached_or_fetch(engine, &account, &folder, uid).await?;
+            let mut message = read_cached_or_fetch(engine, &account, &folder, uid).await?;
             let (mine, ours) = {
                 let db = engine.db.lock().unwrap();
                 (store::self_addrs(&db, &account), store::all_self_addrs(&db))
             };
+            // Shaped like the thread read's, without the calendar text.
+            let invite = message
+                .invite
+                .take()
+                .or_else(|| {
+                    meron_core::calendar::invite_from_attachments(
+                        &parse::media_root(),
+                        &message.attachments,
+                    )
+                })
+                .map(|invite| {
+                    meron_core::calendar::invite_json_for(
+                        &engine.db.lock().unwrap(),
+                        &account,
+                        &invite,
+                        &mine,
+                    )
+                });
             let outgoing =
                 store::is_outgoing(&mine, &folder, &message.from_addr, message.delivered);
             // The same reply rule the thread read ships with every message, so a
@@ -255,6 +211,7 @@ pub(crate) async fn dispatch(
             Ok(json!({
                 "outgoing": outgoing,
                 "reply": reply,
+                "invite": invite,
                 "message": serde_json::to_value(message)?
             }))
         }
@@ -316,7 +273,6 @@ pub(crate) async fn dispatch(
                     for_print: p.get("for_print").and_then(Value::as_bool).unwrap_or(false),
                     before_cursor,
                     media_root: parse::media_root(),
-                    bake_html_policy: true,
                 },
                 Some(on_bodies_fetched),
             )
@@ -353,4 +309,106 @@ pub(crate) async fn dispatch(
 
         other => Err(anyhow::anyhow!("unknown method: {other}")),
     }
+}
+
+/// One `messages.recent` page: a mailbox view's cards, from the cache or a live
+/// search, narrowed by the request's filters.
+async fn messages_recent(engine: &Arc<Engine>, p: &Value, out: &Writer) -> anyhow::Result<Value> {
+    let account = req_str(p, "account")?;
+    let request = thread_list::ThreadListQuery::from_params(p, "folder");
+    let refresh = p.get("refresh").and_then(Value::as_bool).unwrap_or(true);
+    if is_rss(engine, &account)? {
+        let page = thread_list::rss_page(&engine.db.lock().unwrap(), &account, &request)?;
+        if refresh {
+            spawn_rss_sync(engine.clone(), out.clone(), account);
+        }
+        return Ok(page);
+    }
+    let folder = request.folder.clone();
+    let limit = request.limit;
+    // Capture this before spawning the background refresh. The returned
+    // page was read from the pre-refresh cache, so its empty-state
+    // metadata must describe that same snapshot.
+    let folder_synced_before =
+        store::get_folder_state(&engine.db.lock().unwrap(), &account, &folder)?.is_some();
+    // Desktop starred reads are online-first. Search first paints the
+    // local index with refresh=false, then repeats with refresh=true;
+    // snapshot-backed later pages are local even though they travel
+    // through the shared search engine.
+    let mut search_incomplete = false;
+    let (messages, next_cursor) = match request.source() {
+        thread_list::MailSource::Starred => {
+            let folders = starred_search_folders(engine, &account, &folder).await;
+            (
+                search_starred_mail_messages(engine, &account, &folders, limit, refresh).await?,
+                None,
+            )
+        }
+        thread_list::MailSource::Recent { filter } => store::get_recent_page(
+            &engine.db.lock().unwrap(),
+            &account,
+            &folder,
+            limit,
+            request.before_cursor,
+            filter,
+        )?,
+        thread_list::MailSource::Search => {
+            // Chat-view search spans the selected folder plus Sent, so a
+            // lookup surfaces both received and self-sent mail (and old
+            // messages filed under Sent), not just the current mailbox.
+            let folders = search_folders(&engine.db.lock().unwrap(), &account, &folder);
+            if refresh || request.search_before_cursor.as_ref().is_some() {
+                let page = search_mail_messages(
+                    engine,
+                    &account,
+                    &folders,
+                    &request.query,
+                    limit,
+                    request.search_before_cursor.as_ref(),
+                )
+                .await?;
+                search_incomplete = page.incomplete;
+                (page.messages, page.next_cursor)
+            } else {
+                let messages = store::search_messages_in_folders(
+                    &engine.db.lock().unwrap(),
+                    &account,
+                    &folders,
+                    &request.query,
+                    limit,
+                    None,
+                )?;
+                let next_cursor = store::search_next_cursor(&messages, limit, 0);
+                (messages, next_cursor)
+            }
+        }
+    };
+    if refresh && request.wants_background_sync() {
+        spawn_message_sync(
+            engine.clone(),
+            out.clone(),
+            account.clone(),
+            folder.clone(),
+            limit,
+        );
+    }
+    let mut page = thread_list::mail_page(
+        &engine.db.lock().unwrap(),
+        &account,
+        &folder,
+        messages,
+        next_cursor,
+        p.get("group").and_then(Value::as_bool).unwrap_or(false),
+    )?;
+    page.as_object_mut().unwrap().insert(
+        "folder_synced".to_string(),
+        Value::Bool(folder_synced_before),
+    );
+    if search_incomplete {
+        page.as_object_mut()
+            .unwrap()
+            .insert("search_incomplete".to_string(), Value::Bool(true));
+    }
+    request.retain_attachment_threads(&mut page);
+    Ok(page)
 }

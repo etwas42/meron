@@ -40,13 +40,15 @@ internal fun saveAppStringSet(
 ) = prefs.putStringSet(key, value.filter { it.isNotBlank() }.toSet())
 
 /**
- * Restore the last top-level screen the user was on (Mail/Kanban only).
+ * Restore the last top-level screen the user was on (Mail/Kanban/Tasks/Calendar only).
  * Transient screens (Thread/Compose/AddAccount/Settings) are never persisted, so a
  * cold start always lands on a navigable top-level screen.
  */
 internal fun loadLastTopScreen(prefs: AppPreferences): Screen =
     when (prefs.getString(LAST_TOP_SCREEN_PREF, "mail")) {
         "kanban" -> Screen.Kanban
+        "tasks" -> Screen.Tasks
+        "calendar" -> Screen.Calendar
         else -> Screen.Mail
     }
 
@@ -57,33 +59,100 @@ internal fun saveLastTopScreen(
     LAST_TOP_SCREEN_PREF,
     when (screen) {
         Screen.Kanban -> "kanban"
+        Screen.Tasks -> "tasks"
+        Screen.Calendar -> "calendar"
         else -> "mail"
     },
 )
 
 internal fun loadLastMailAccountId(prefs: AppPreferences): String = prefs.getString(LAST_MAIL_ACCOUNT_PREF, UNIFIED_ACCOUNT_ID).ifBlank { UNIFIED_ACCOUNT_ID }
 
-internal fun loadLastMailFolder(prefs: AppPreferences): String = prefs.getString(LAST_MAIL_FOLDER_PREF, INBOX_FOLDER).ifBlank { INBOX_FOLDER }
+private fun accountMailFolderKey(accountId: String): String = "last_mail_folder_by_account_v1_${accountId.ifBlank { UNIFIED_ACCOUNT_ID }}"
+
+internal fun migrateLegacyMailFolder(prefs: AppPreferences) {
+    val legacyFolder = prefs.getString(LAST_MAIL_FOLDER_PREF, "")
+    if (legacyFolder.isNotBlank()) {
+        val legacyKey = accountMailFolderKey(loadLastMailAccountId(prefs))
+        if (prefs.getString(legacyKey, "").isBlank()) prefs.putString(legacyKey, legacyFolder)
+        prefs.remove(LAST_MAIL_FOLDER_PREF)
+    }
+}
+
+internal fun loadMailFolderForAccount(
+    prefs: AppPreferences,
+    accountId: String,
+): String {
+    val stored = prefs.getString(accountMailFolderKey(accountId), "")
+    if (stored.isNotBlank()) return stored
+    return if (accountId.ifBlank { UNIFIED_ACCOUNT_ID } == loadLastMailAccountId(prefs)) {
+        prefs.getString(LAST_MAIL_FOLDER_PREF, INBOX_FOLDER).ifBlank { INBOX_FOLDER }
+    } else {
+        INBOX_FOLDER
+    }
+}
+
+internal fun loadLastMailFolder(prefs: AppPreferences): String = loadMailFolderForAccount(prefs, loadLastMailAccountId(prefs))
 
 internal fun saveLastMailLocation(
     prefs: AppPreferences,
     accountId: String,
     folder: String,
 ) {
+    migrateLegacyMailFolder(prefs)
+    prefs.putString(accountMailFolderKey(accountId), folder.ifBlank { INBOX_FOLDER })
     prefs.putString(LAST_MAIL_ACCOUNT_PREF, accountId.ifBlank { UNIFIED_ACCOUNT_ID })
-    prefs.putString(LAST_MAIL_FOLDER_PREF, folder.ifBlank { INBOX_FOLDER })
 }
 
-fun loadAppearanceMode(prefs: AppPreferences): AppAppearanceMode {
-    val stored = prefs.getString(APPEARANCE_MODE_PREF, AppAppearanceMode.Light.storageValue)
-    return AppAppearanceMode.entries.firstOrNull { it.storageValue == stored && it != AppAppearanceMode.System }
-        ?: AppAppearanceMode.Light
-}
-
-fun saveAppearanceMode(
+internal fun clearMailFolderForAccount(
     prefs: AppPreferences,
-    mode: AppAppearanceMode,
-) = prefs.putString(APPEARANCE_MODE_PREF, mode.storageValue)
+    accountId: String,
+) {
+    migrateLegacyMailFolder(prefs)
+    prefs.remove(accountMailFolderKey(accountId))
+}
+
+private fun loadAppTheme(
+    prefs: AppPreferences,
+    key: String,
+    defaultValue: AppTheme,
+    customThemes: List<CustomTheme>,
+): AppTheme {
+    val stored = prefs.getString(key, defaultValue.storageValue)
+    return AppAppearanceMode.entries.firstOrNull { it.storageValue == stored }
+        ?: customThemes.firstOrNull { it.storageValue == stored }
+        ?: defaultValue
+}
+
+fun loadThemeChoice(
+    prefs: AppPreferences,
+    customThemes: List<CustomTheme> = emptyList(),
+): ThemeChoice {
+    val defaults = ThemeChoice()
+    return ThemeChoice(
+        fixed = loadAppTheme(prefs, APPEARANCE_MODE_PREF, defaults.fixed, customThemes),
+        followSystem = prefs.getBoolean(THEME_FOLLOW_SYSTEM_PREF, defaults.followSystem),
+        // A pick stored under the wrong appearance would never show; use the default.
+        light = loadAppTheme(prefs, LIGHT_THEME_PREF, defaults.light, customThemes).takeUnless { it.isDark } ?: defaults.light,
+        dark = loadAppTheme(prefs, DARK_THEME_PREF, defaults.dark, customThemes).takeIf { it.isDark } ?: defaults.dark,
+    )
+}
+
+fun loadCustomThemes(prefs: AppPreferences): List<CustomTheme> = parseCustomThemes(prefs.getString(CUSTOM_THEMES_PREF, ""))
+
+fun saveCustomThemes(
+    prefs: AppPreferences,
+    themes: List<CustomTheme>,
+) = prefs.putString(CUSTOM_THEMES_PREF, serializeCustomThemes(themes))
+
+fun saveThemeChoice(
+    prefs: AppPreferences,
+    choice: ThemeChoice,
+) {
+    prefs.putString(APPEARANCE_MODE_PREF, choice.fixed.storageValue)
+    prefs.putBoolean(THEME_FOLLOW_SYSTEM_PREF, choice.followSystem)
+    prefs.putString(LIGHT_THEME_PREF, choice.light.storageValue)
+    prefs.putString(DARK_THEME_PREF, choice.dark.storageValue)
+}
 
 internal fun loadSendShortcutMode(prefs: AppPreferences): SendShortcutMode =
     when (prefs.getString(SEND_SHORTCUT_PREF, "mod_enter")) {

@@ -1,0 +1,3 @@
+- Render HTML content sent in plain text parts instead of showing raw tags
+- Fix dark mode message bodies on emails with a light background
+- Ship core binary inside the Windows package instead of extracting at runtime

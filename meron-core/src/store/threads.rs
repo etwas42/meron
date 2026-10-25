@@ -389,6 +389,53 @@ pub(super) fn collect_root_candidates(
     Ok(())
 }
 
+/// One attachment a thread card names, as the `files` column stores it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CardFile {
+    pub filename: String,
+    pub mime: String,
+}
+
+/// The real attachments behind each of `card_keys`, in thread order, keyed by
+/// card key; cards with none are absent. Scoped and deduplicated exactly like
+/// [`card_message_counts`], so the chips speak for the same messages the reader
+/// opens. Header sync supplies names from BODYSTRUCTURE; a cached body refines
+/// them using the HTML references to exclude inline images.
+pub fn card_attachments(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    card_keys: &[String],
+) -> Result<std::collections::HashMap<String, Vec<CardFile>>> {
+    use std::collections::HashMap;
+
+    let mut roots: Vec<String> = card_keys
+        .iter()
+        .map(|key| split_thread_key(key).0)
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let (uid_roots, threaded_roots): (Vec<String>, Vec<String>) =
+        roots.into_iter().partition(|root| root.starts_with("uid:"));
+
+    let mut rows: HashMap<String, Vec<(i64, Vec<CardFile>)>> = HashMap::new();
+    let mut collect = |key: String, row: CardRow| {
+        if !row.files.is_empty() {
+            rows.entry(key).or_default().push((row.date, row.files));
+        }
+    };
+    for_each_card_row(conn, account, Some(folder), &uid_roots, &mut collect)?;
+    for_each_card_row(conn, account, None, &threaded_roots, &mut collect)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(key, mut rows)| {
+            rows.sort_by_key(|(date, _)| *date);
+            (key, rows.into_iter().flat_map(|(_, files)| files).collect())
+        })
+        .collect())
+}
+
 /// Tally the cached rows of `roots` into `counts`, one card key at a time.
 /// `folder` scopes the query to a single mailbox; `None` spans the account.
 pub(super) fn count_card_rows(
@@ -547,12 +594,17 @@ pub(super) struct CardRow {
     from_name: String,
     from_addr: String,
     date: i64,
+    files: Vec<CardFile>,
+    files_authoritative: bool,
 }
 
 /// Visit every cached message behind `roots` once, with the card key it belongs
 /// to. `folder` scopes the scan (for `uid:` roots); Message-ID copies across
 /// folders are folded, so a self-sent message cached in Inbox and Sent is one
 /// visit.
+///
+/// The first copy supplies identity. Attachment metadata prefers a cached body
+/// over header-only copies, even when its refined list is empty.
 fn for_each_card_row(
     conn: &Connection,
     account: &str,
@@ -560,13 +612,14 @@ fn for_each_card_row(
     roots: &[String],
     mut visit: impl FnMut(String, CardRow),
 ) -> Result<()> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, hash_map::Entry};
 
     // Message-ID duplicates are folded in Rust rather than with the correlated
     // NOT EXISTS that reading a single thread uses: with a page of keys and no
     // index on thread_key, that subquery would re-scan the account's messages
     // once per row, where one pass plus a set of seen ids is linear.
-    let mut seen_ids: HashSet<(String, String)> = HashSet::new();
+    let mut seen_ids: HashMap<(String, String), usize> = HashMap::new();
+    let mut visits: Vec<(String, CardRow)> = Vec::new();
     // SQLite caps bound parameters per statement; a page of cards stays well
     // under it, but chunk anyway so an unpaginated caller cannot overrun it.
     for chunk in roots.chunks(100) {
@@ -583,7 +636,7 @@ fn for_each_card_row(
         let mut stmt = conn.prepare(&format!(
             "SELECT COALESCE(NULLIF(thread_key, ''), 'uid:' || uid), subject,
                     COALESCE(json_extract(json, '$.message_id'), ''),
-                    folder, COALESCE(from_name, ''), COALESCE(from_addr, ''), date
+                    folder, COALESCE(from_name, ''), COALESCE(from_addr, ''), date, files, body IS NOT NULL
              FROM messages
              WHERE account = ?1 AND {folder_clause}uid <> 0
                AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) IN ({placeholders})"
@@ -601,6 +654,11 @@ fn for_each_card_row(
                     from_name: row.get(4)?,
                     from_addr: row.get(5)?,
                     date: row.get(6)?,
+                    files_authoritative: row.get(8)?,
+                    files: row
+                        .get::<_, Option<String>>(7)?
+                        .and_then(|files| serde_json::from_str(&files).ok())
+                        .unwrap_or_default(),
                 },
             ))
         })?;
@@ -613,11 +671,28 @@ fn for_each_card_row(
             };
             // A row with no Message-ID cannot be matched to a copy, so it counts
             // on its own — same call the thread reader makes.
-            if !message_id.is_empty() && !seen_ids.insert((key.clone(), message_id)) {
-                continue;
+            if !message_id.is_empty() {
+                match seen_ids.entry((key.clone(), message_id)) {
+                    Entry::Occupied(kept) => {
+                        let kept = &mut visits[*kept.get()].1;
+                        if (card_row.files_authoritative && !kept.files_authoritative)
+                            || (!kept.files_authoritative && kept.files.is_empty())
+                        {
+                            kept.files = card_row.files;
+                            kept.files_authoritative = card_row.files_authoritative;
+                        }
+                        continue;
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(visits.len());
+                    }
+                }
             }
-            visit(key, card_row);
+            visits.push((key, card_row));
         }
+    }
+    for (key, card_row) in visits {
+        visit(key, card_row);
     }
     Ok(())
 }

@@ -19,10 +19,16 @@ pub fn upsert_messages(
     messages: &[MessageHeader],
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    let removed = removed_uids_in(&tx, account, folder)?;
     // The Message-IDs this batch cached: the only ids whose arrival can hand a
     // canonical thread key down to rows already in the cache.
     let mut upserted_ids: HashSet<String> = HashSet::new();
     for m in messages {
+        // A move or delete already dropped this UID. A sync that fetched it
+        // beforehand must not put the row back into the folder it left.
+        if removed.contains(&m.uid) {
+            continue;
+        }
         // Store recipient lists as JSON. Skip empty lists so a later flag-only
         // resync (which carries no envelope) can't clobber recipients we already
         // cached with NULLs.
@@ -42,15 +48,20 @@ pub fn upsert_messages(
         if !m.in_reply_to.is_empty() {
             extra.insert("in_reply_to".to_string(), json!(m.in_reply_to));
         }
+        if m.files.is_some() {
+            extra.insert("attachment_metadata".to_string(), json!(true));
+        }
         let extra_json = Value::Object(extra).to_string();
         let thread_key = resolve_message_thread_key(&tx, account, &m.thread_key)?;
         let message_id = m.message_id.trim().to_lowercase();
         if !message_id.is_empty() {
             upserted_ids.insert(message_id);
         }
-        tx.execute(
-            "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date, seen, starred, thread_key, json, recipients)
-             VALUES(?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        // Cached: the statement carries every trigger it may fire (FTS,
+        // contacts), so compiling it per message dominated a large sync.
+        tx.prepare_cached(
+            "INSERT INTO messages(account, folder, msg_id, uid, subject, from_name, from_addr, date, seen, starred, thread_key, json, recipients, files)
+             VALUES(?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(account, folder, msg_id) DO UPDATE SET
                subject    = excluded.subject,
                from_name  = excluded.from_name,
@@ -62,8 +73,12 @@ pub fn upsert_messages(
                json       = json_patch(messages.json, excluded.json),
                -- Same rule as the recipient lists in `json`: a flag-only resync
                -- carries no envelope, so it must not blank what we already indexed.
-               recipients = COALESCE(excluded.recipients, messages.recipients)",
-            params![
+               recipients = COALESCE(excluded.recipients, messages.recipients),
+               -- A fetched body is authoritative, especially for inline images.
+               files = CASE WHEN messages.body IS NOT NULL OR ?14 = 0
+                            THEN messages.files ELSE excluded.files END",
+        )?
+        .execute(params![
                 account,
                 folder,
                 m.uid,
@@ -75,9 +90,10 @@ pub fn upsert_messages(
                 m.starred as i64,
                 thread_key,
                 extra_json,
-                recipients_index_text(&m.to, &m.cc)
-            ],
-        )?;
+                recipients_index_text(&m.to, &m.cc),
+                m.files.as_ref().filter(|files| !files.is_empty()).map(|files| json!(files).to_string()),
+                m.files.is_some() as i64
+        ])?;
     }
     reconcile_thread_keys_from(&tx, account, upserted_ids)?;
     tx.commit()?;
@@ -181,13 +197,65 @@ pub(super) fn reconcile_thread_keys_from(
     Ok(())
 }
 
+/// Older header-only rows from before BODYSTRUCTURE was indexed. Bound each
+/// sync's catch-up work; later syncs continue after the rows marked complete.
+pub fn missing_attachment_metadata_uids(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    limit: u32,
+) -> Result<Vec<u32>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid FROM messages WHERE account = ?1 AND folder = ?2 AND body IS NULL
+         AND COALESCE(json_extract(json, '$.attachment_metadata'), 0) = 0
+         AND COALESCE(json_extract(json, '$.attachment_metadata_attempted'), 0) = 0
+         ORDER BY date DESC, uid DESC LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![account, folder, limit], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Mark bounded catch-up work even when a server omitted BODYSTRUCTURE or a
+/// malformed response was isolated. Fresh header sync can still supply metadata.
+pub fn mark_attachment_metadata_attempted(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for uid in uids {
+        tx.execute(
+            "UPDATE messages SET json = json_set(json, '$.attachment_metadata_attempted', 1)
+                    WHERE account = ?1 AND folder = ?2 AND uid = ?3",
+            params![account, folder, uid],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Which cached rows a newest-first page keeps. The two narrowings combine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecentFilter {
+    pub unread_only: bool,
+    /// Messages whose *thread* has a cached message with a real attachment —
+    /// thread-wide, like the card's paperclip, so an unread plain reply to a
+    /// read message that carried the file still lists its thread under
+    /// "unread with attachments". A subject-branched thread shares one key, so
+    /// this is a superset; the card-level narrowing
+    /// (`ThreadListQuery::retain_attachment_threads`) trims it to the branch.
+    /// Header sync supplies BODYSTRUCTURE metadata even before a body is cached.
+    pub attachments_only: bool,
+}
+
 pub fn get_recent_page(
     conn: &Connection,
     account: &str,
     folder: &str,
     limit: u32,
     before_cursor: Option<(i64, u32)>,
-    unread_only: bool,
+    filter: RecentFilter,
 ) -> Result<(Vec<MessageHeader>, Option<String>)> {
     let probe = limit.saturating_add(1);
     // Newest-first by send time. The cursor is the (date, uid) of the last row of
@@ -198,6 +266,12 @@ pub fn get_recent_page(
                 json_extract(json, '$.to') FROM messages
          WHERE account = ?1 AND folder = ?2
            AND (?6 = 0 OR seen = 0)
+           AND (?7 = 0 OR files IS NOT NULL
+                OR (COALESCE(thread_key, '') <> '' AND EXISTS (
+                      SELECT 1 FROM messages t
+                      WHERE t.account = messages.account
+                        AND lower(COALESCE(t.thread_key, '')) = lower(COALESCE(messages.thread_key, ''))
+                        AND t.files IS NOT NULL)))
            AND (?3 IS NULL
                 OR date < ?3
                 OR (date = ?3 AND uid < ?4))
@@ -212,7 +286,8 @@ pub fn get_recent_page(
             cursor_date,
             cursor_uid,
             probe as i64,
-            unread_only as i64
+            filter.unread_only as i64,
+            filter.attachments_only as i64
         ],
         |row| {
             let uid = row.get(0)?;
@@ -310,13 +385,26 @@ pub(super) fn record_observed_mail_identities(
     Ok(new_identities)
 }
 
-/// Unread INBOX messages in the UID range that appeared during the last sync,
-/// newest first. Returns the whole batch rather than just its latest message so
-/// notifications can post one entry per arrival; `None` when nothing new and
-/// unread landed.
+/// [`classify_arrivals`] for INBOX.
 pub fn classify_inbox_arrivals(
     conn: &Connection,
     account: &str,
+    before: u32,
+    after: u32,
+    messages: &[MessageHeader],
+) -> Result<Vec<MessageHeader>> {
+    classify_arrivals(conn, account, "INBOX", before, after, messages)
+}
+
+/// Unread messages in `folder` in the UID range that appeared during the last
+/// sync, newest first. Returns the whole batch rather than just its latest
+/// message so notifications can post one entry per arrival; empty when nothing
+/// new and unread landed. A message already observed anywhere in the account
+/// (one the user filed here from INBOX, say) is not an arrival.
+pub fn classify_arrivals(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
     before: u32,
     after: u32,
     messages: &[MessageHeader],
@@ -332,7 +420,7 @@ pub fn classify_inbox_arrivals(
         if message.seen || message.uid < before || message.uid >= after {
             continue;
         }
-        let identity = message_identity(message, "INBOX");
+        let identity = message_identity(message, folder);
         if stmt
             .query_row(params![account, &identity], |_| Ok(()))
             .optional()?
@@ -559,6 +647,52 @@ pub fn newest_thread_uids(
     Ok(newest.map(|header| header.uid).into_iter().collect())
 }
 
+/// A thread's messages grouped by mailbox, for a whole-thread "mark read".
+/// Covers every folder the reader shows the thread from (see `thread_read`),
+/// not just the card's own, so an unread copy filed elsewhere is not left
+/// behind a card that now reads as read. A synthetic `uid:N` key stays
+/// folder-local: UIDs are only unique within one mailbox.
+///
+/// `unseen_only` narrows it to messages the store still has unread. Only a
+/// caller that updates the store after the server write may use it: one that
+/// marks the store first would leave a retry of a failed write nothing to send.
+pub fn thread_uids_by_folder(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    thread_key: &str,
+    subject_filter: Option<&str>,
+    unseen_only: bool,
+) -> Result<std::collections::BTreeMap<String, Vec<u32>>> {
+    let only_folder = thread_key.starts_with("uid:").then_some(folder);
+    let mut stmt = conn.prepare(
+        "SELECT folder, uid, subject FROM messages
+         WHERE account = ?1 AND uid <> 0 AND (?4 = 0 OR seen = 0)
+           AND COALESCE(NULLIF(thread_key, ''), 'uid:' || uid) = ?2
+           AND (?3 IS NULL OR folder = ?3)
+         ORDER BY folder, uid",
+    )?;
+    let rows = stmt.query_map(
+        params![account, thread_key, only_folder, unseen_only],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        },
+    )?;
+    let mut by_folder = std::collections::BTreeMap::<String, Vec<u32>>::new();
+    for row in rows {
+        let (folder, uid, subject) = row?;
+        if subject_filter.is_some_and(|filter| thread_grouping_subject(&subject) != filter) {
+            continue;
+        }
+        by_folder.entry(folder).or_default().push(uid);
+    }
+    Ok(by_folder)
+}
+
 /// Which of the account's threads have a draft waiting in them — the keys the
 /// list's Draft badge is decided by. Only real thread keys: a draft with no
 /// threading headers falls back to `uid:<its own uid>`, which says nothing about
@@ -627,21 +761,155 @@ pub fn prune_missing_messages(
     drop(stmt);
 
     let mut removed = 0usize;
+    let mut gone = Vec::new();
     for uid in local_uids {
         if !server_uids.contains(&uid) {
             conn.execute(
                 "DELETE FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3",
                 params![account, folder, uid],
             )?;
+            gone.push(uid);
             removed += 1;
         }
     }
+    remember_removed_uids(conn, account, folder, &gone)?;
     Ok(removed)
+}
+
+/// Epoch of the latest UID removal. A folder sync reads this before it talks
+/// to the server; removals that happen while that fetch is in flight get a
+/// higher epoch and stay hidden from that snapshot.
+pub fn removed_message_epoch(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'removed_uid_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Forget removals at or before `fetched_at_epoch` for these UIDs. The sync
+/// that passes the epoch it read before fetching may store a UID only when
+/// nothing removed it afterwards — the snapshot and the removal agree.
+pub fn release_removed_messages(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+    fetched_at_epoch: i64,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM removed_message_uids
+         WHERE account = ?1 AND folder = ?2 AND uid = ?3 AND epoch <= ?4",
+    )?;
+    for uid in uids {
+        stmt.execute(params![account, folder, *uid, fetched_at_epoch])?;
+    }
+    Ok(())
+}
+
+/// Names this process in `active_message_syncs`. Rows carrying another name
+/// were left by a process that died mid-sync.
+fn message_sync_owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Register a folder sync before network I/O. The registry is an ordinary
+/// table because engines in one process each hold their own connection (the
+/// mobile foreground engine and a transient background one), and a removal on
+/// one must stay hidden from a snapshot another is still fetching.
+/// Registration and cleanup run under the engine's database lock.
+pub fn begin_message_sync(conn: &Connection) -> Result<(i64, i64)> {
+    // Take the write lock before reading the epoch. A deferred transaction that
+    // reads first fails with SQLITE_BUSY_SNAPSHOT when another connection
+    // commits in between, and the busy timeout cannot wait that out.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let epoch = removed_message_epoch(&tx)?;
+    tx.execute(
+        "INSERT INTO active_message_syncs(epoch, owner) VALUES(?1, ?2)",
+        params![epoch, message_sync_owner()],
+    )?;
+    let id = tx.last_insert_rowid();
+    prune_removed_message_markers(&tx)?;
+    tx.commit()?;
+    Ok((id, epoch))
+}
+
+/// A finished, failed or cancelled sync no longer needs its removal markers.
+pub fn end_message_sync(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM active_message_syncs WHERE id = ?1",
+        params![id],
+    )?;
+    prune_removed_message_markers(conn)
+}
+
+fn prune_removed_message_markers(conn: &Connection) -> Result<()> {
+    // Abandoned snapshots must not survive a restart and pin markers forever.
+    conn.execute(
+        "DELETE FROM active_message_syncs WHERE owner != ?1",
+        params![message_sync_owner()],
+    )?;
+    // A snapshot begun at E cannot contain a UID removed before or at E.
+    // Keep all later removals until the oldest active snapshot has finished.
+    conn.execute(
+        "DELETE FROM removed_message_uids
+         WHERE epoch <= COALESCE((SELECT MIN(epoch) FROM active_message_syncs), ?1)",
+        params![removed_message_epoch(conn)?],
+    )?;
+    Ok(())
+}
+
+fn removed_uids_in(conn: &Connection, account: &str, folder: &str) -> Result<HashSet<u32>> {
+    let mut stmt =
+        conn.prepare("SELECT uid FROM removed_message_uids WHERE account = ?1 AND folder = ?2")?;
+    let rows = stmt.query_map(params![account, folder], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
+}
+
+pub(crate) fn remember_removed_uids(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+) -> Result<()> {
+    let uids: Vec<u32> = uids.iter().copied().filter(|uid| *uid != 0).collect();
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let epoch = removed_message_epoch(conn)? + 1;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('removed_uid_epoch', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![epoch.to_string()],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO removed_message_uids(account, folder, uid, epoch)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(account, folder, uid) DO UPDATE SET epoch = excluded.epoch",
+    )?;
+    for uid in uids {
+        stmt.execute(params![account, folder, uid, epoch])?;
+    }
+    Ok(())
 }
 
 pub fn clear_folder_messages(conn: &Connection, account: &str, folder: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM messages WHERE account = ?1 AND folder = ?2",
+        params![account, folder],
+    )?;
+    conn.execute(
+        "DELETE FROM uncached_unseen WHERE account = ?1 AND folder = ?2",
+        params![account, folder],
+    )?;
+    // UIDVALIDITY changed: these UID numbers no longer name the messages that
+    // were removed, so they must not block the folder's new contents.
+    conn.execute(
+        "DELETE FROM removed_message_uids WHERE account = ?1 AND folder = ?2",
         params![account, folder],
     )?;
     Ok(())
@@ -786,9 +1054,70 @@ pub fn get_cached_message(
         body,
         body_html,
         body_is_rendered: extra["body_is_rendered"].as_bool().unwrap_or(false),
+        invite: extra
+            .get("invite")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
         preview: String::new(),
         attachments,
     }))
+}
+
+/// The `files` column for `message`: its real attachments as the list cards
+/// name them, or NULL when there are none (see the v11 migration).
+fn files_json(message: &Message) -> Option<String> {
+    let files: Vec<Value> = message
+        .file_attachments()
+        .map(|attachment| json!({ "filename": attachment.filename, "mime": attachment.mime }))
+        .collect();
+    (!files.is_empty()).then(|| Value::Array(files).to_string())
+}
+
+/// Progress of [`backfill_files_batch`] in `meta`: the last `messages.id`
+/// done, or `done`.
+const FILES_BACKFILL_KEY: &str = "files_backfill";
+
+/// Fill `messages.files` for up to `batch` rows cached before the column
+/// existed (see the v11 migration), resuming where the last call stopped.
+/// Returns true once every row has been visited. Each call is one short
+/// transaction, so the caller can release the store between batches.
+///
+/// Mirrors [`Message::file_attachments`] in SQL: an attachment counts unless the
+/// stored HTML shows it inline.
+pub fn backfill_files_batch(conn: &Connection, batch: u32) -> Result<bool> {
+    let cursor = match super::db::meta_get(conn, FILES_BACKFILL_KEY)?.as_deref() {
+        Some("done") => return Ok(true),
+        Some(id) => id.parse::<i64>().unwrap_or(0),
+        None => 0,
+    };
+    let tx = conn.unchecked_transaction()?;
+    let last: Option<i64> = tx.query_row(
+        "SELECT max(id) FROM (SELECT id FROM messages WHERE id > ?1 ORDER BY id LIMIT ?2)",
+        params![cursor, batch],
+        |row| row.get(0),
+    )?;
+    let Some(last) = last else {
+        super::db::meta_set(&tx, FILES_BACKFILL_KEY, "done")?;
+        tx.commit()?;
+        return Ok(true);
+    };
+    tx.execute(
+        "UPDATE messages SET files = (
+           SELECT CASE WHEN count(*) = 0 THEN NULL ELSE json_group_array(json_object(
+             'filename', json_extract(attachment.value, '$.filename'),
+             'mime', json_extract(attachment.value, '$.mime'))) END
+           FROM json_each(messages.json, '$.attachments') AS attachment
+           WHERE json_extract(attachment.value, '$.key') IS NULL
+              OR instr(COALESCE(json_extract(messages.json, '$.body_html'), ''),
+                       '/media/' || json_extract(attachment.value, '$.key')) = 0
+         )
+         WHERE id > ?1 AND id <= ?2 AND uid <> 0
+           AND json_extract(json, '$.attachments') IS NOT NULL",
+        params![cursor, last],
+    )?;
+    super::db::meta_set(&tx, FILES_BACKFILL_KEY, &last.to_string())?;
+    tx.commit()?;
+    Ok(false)
 }
 
 pub fn save_cached_message(
@@ -811,19 +1140,27 @@ pub fn save_cached_message(
         "body_html": message.body_html,
         "body_is_rendered": message.body_is_rendered,
         "attachments": attachments_json,
+        "invite": message.invite,
     })
     .to_string();
 
     conn.execute(
-        "INSERT INTO messages (account, folder, msg_id, uid, subject, from_name, from_addr, date, body, json)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO messages (account, folder, msg_id, uid, subject, from_name, from_addr, date, body, json, files)
+         SELECT ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+         WHERE NOT EXISTS (
+           SELECT 1 FROM removed_message_uids
+           WHERE account = ?1 AND folder = ?2 AND uid = ?3
+         )
          ON CONFLICT(account, folder, msg_id) DO UPDATE SET
            subject = excluded.subject,
            from_name = excluded.from_name,
            from_addr = excluded.from_addr,
-           date = excluded.date,
+           -- A body whose Date header didn't parse must not undo the header
+           -- sync's INTERNALDATE fallback.
+           date = CASE WHEN excluded.date = 0 THEN messages.date ELSE excluded.date END,
            body = excluded.body,
-           json = json_patch(messages.json, excluded.json)",
+           json = json_patch(messages.json, excluded.json),
+           files = excluded.files",
         params![
             account,
             folder,
@@ -833,9 +1170,23 @@ pub fn save_cached_message(
             message.from_addr,
             message.date,
             message.body,
-            extra_json
+            extra_json,
+            files_json(message)
         ],
     )?;
+
+    // Every body fetch lands here, so an organizer's update reaches the
+    // calendar whichever path read it. A calendar failure must not lose the
+    // message.
+    if let Some(invite) = &message.invite {
+        let _ = crate::calendar::events::apply_invite_update(
+            conn,
+            account,
+            &message.from_addr,
+            &message.message_id,
+            invite,
+        );
+    }
 
     Ok(())
 }

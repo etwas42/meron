@@ -63,4 +63,15 @@ class MailWebViewLinkTest {
         assertNull(webViewLinkUrl(WebView.HitTestResult.ANCHOR_TYPE, "  "))
         assertNull(webViewLinkUrl(WebView.HitTestResult.ANCHOR_TYPE, null))
     }
+
+    @Test
+    fun zoomedPageKeepsSidewaysDrags() {
+        assertEquals(true, ownsDrag(dx = 40f, dy = 10f, touchSlop = 16, canPan = true))
+        assertEquals(true, ownsDrag(dx = -40f, dy = 10f, touchSlop = 16, canPan = true))
+        // Nothing to pan to: unzoomed, or already at that edge.
+        assertEquals(false, ownsDrag(dx = 40f, dy = 10f, touchSlop = 16, canPan = false))
+        // Scrolling the conversation, and a finger that has barely moved.
+        assertEquals(false, ownsDrag(dx = 20f, dy = 60f, touchSlop = 16, canPan = true))
+        assertEquals(false, ownsDrag(dx = 8f, dy = 0f, touchSlop = 16, canPan = true))
+    }
 }

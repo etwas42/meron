@@ -5,11 +5,13 @@ import jp.nonbili.meron.shared.AccountSummary
 import jp.nonbili.meron.shared.FolderSummary
 import jp.nonbili.meron.shared.ThreadSummary
 
-internal enum class Screen { Mail, Kanban, Thread, Compose, AddAccount, Settings }
+internal enum class Screen { Mail, Kanban, Tasks, Calendar, Thread, Compose, AddAccount, Settings }
 
 internal object AppRoutes {
     const val Mail = "mail"
     const val Kanban = "kanban"
+    const val Tasks = "tasks"
+    const val Calendar = "calendar"
     const val Thread = "thread"
     const val Compose = "compose"
     const val AddAccount = "add-account"
@@ -20,6 +22,8 @@ internal fun Screen.route(): String =
     when (this) {
         Screen.Mail -> AppRoutes.Mail
         Screen.Kanban -> AppRoutes.Kanban
+        Screen.Tasks -> AppRoutes.Tasks
+        Screen.Calendar -> AppRoutes.Calendar
         Screen.Thread -> AppRoutes.Thread
         Screen.Compose -> AppRoutes.Compose
         Screen.AddAccount -> AppRoutes.AddAccount
@@ -30,6 +34,8 @@ internal fun appRouteToScreen(route: String?): Screen? =
     when (route?.substringBefore("?")) {
         AppRoutes.Mail -> Screen.Mail
         AppRoutes.Kanban -> Screen.Kanban
+        AppRoutes.Tasks -> Screen.Tasks
+        AppRoutes.Calendar -> Screen.Calendar
         AppRoutes.Thread -> Screen.Thread
         AppRoutes.Compose -> Screen.Compose
         AppRoutes.AddAccount -> Screen.AddAccount
@@ -119,13 +125,44 @@ internal const val KANBAN_PREFS = "kanban"
 internal const val KANBAN_BOARDS_PREF = "kanban_boards_v1"
 internal const val ACTIVE_KANBAN_BOARD_PREF = "active_kanban_board_id_v1"
 internal const val KANBAN_FILTER_PREF = "kanban_filter_v1"
+internal const val KANBAN_ATTACHMENTS_PREF = "kanban_attachments_only_v1"
 internal const val KANBAN_SEARCH_PREF = "kanban_search_v1"
 internal const val KANBAN_SEARCH_SCOPE_PREF = "kanban_search_scope_v1"
 internal const val APP_PREFS = "meron_app_prefs"
 internal const val APPEARANCE_MODE_PREF = "appearance_mode_v1"
+internal const val THEME_FOLLOW_SYSTEM_PREF = "theme_follow_system_v1"
+internal const val LIGHT_THEME_PREF = "light_theme_v1"
+internal const val DARK_THEME_PREF = "dark_theme_v1"
+internal const val CUSTOM_THEMES_PREF = "custom_themes_v1"
 internal const val SHOW_UNREAD_BADGES_PREF = "show_unread_badges_v1"
 internal const val SHOW_UNIFIED_INBOX_PREF = "show_unified_inbox_v1"
+
+/** Whether the optional Tasks screen is offered. Off until the user asks for it. */
+internal const val TASKS_ENABLED_PREF = "tasks_enabled_v1"
+
+/** Whether the optional Calendar screen is offered, like Tasks. */
+internal const val CALENDAR_ENABLED_PREF = "calendar_enabled_v1"
 internal const val SHOW_SENDER_IMAGES_PREF = "show_sender_images_v1"
+
+/** Whether HTML mail bodies are darkened under a dark theme. Off by default:
+ *  the sender's own colors are what the mail was designed in. */
+internal const val DARK_MAIL_BODIES_PREF = "dark_mail_bodies_v1"
+
+/** Whether conversation bubbles shrink over-wide HTML mail to fit, the way the
+ *  full-screen reader always does. Off by default. */
+internal const val AUTO_FIT_MESSAGES_PREF = "auto_fit_messages_v1"
+
+/** Whether chat bubbles grow to fit long bodies instead of scrolling inside a
+ *  capped box, so only the conversation scrolls. Off by default. */
+internal const val CHAT_FULL_MESSAGES_PREF = "chat_full_messages_v1"
+
+/** Whether the message reader puts reply, forward and delete in a bottom bar
+ *  where they are easier to reach, instead of only in the top overflow menu. */
+internal const val READER_BOTTOM_ACTIONS_PREF = "reader_bottom_actions_v1"
+
+/** Whether replies carry the message they answer, quoted under the reply text.
+ *  Off by default: replies read as chat messages. */
+internal const val QUOTE_REPLIES_PREF = "quote_replies_v1"
 internal const val NOTIFICATION_BANNER_DISMISSED_PREF = "notification_banner_dismissed_v1"
 internal const val LIVE_MAIL_PUSH_PREF = "live_mail_push_v1"
 internal const val BACKGROUND_SYNC_ENABLED_PREF = "background_sync_enabled_v1"
@@ -166,6 +203,7 @@ internal data class MailboxLoadResult(
     val nextCursor: String = "",
     val accountCursors: Map<String, String> = emptyMap(),
     val folderSynced: Boolean? = null,
+    val searchIncomplete: Boolean = false,
     // Per-account header depth these threads were read at. Cached with the
     // mailbox so switching away and back keeps the pages the user paged in.
     // Loaders leave it at the default; the mailbox sets it when caching.
@@ -177,6 +215,7 @@ internal data class MailboxCacheKey(
     val folderId: String,
     val query: String,
     val filter: FilterMode,
+    val attachmentsOnly: Boolean = false,
 )
 
 /** See `MeronMobileState.deferredMailboxReload`. `refreshSearch` is kept so a
@@ -190,6 +229,8 @@ internal data class DeferredMailboxReload(
 internal data class KanbanColumnSpec(
     val accountId: String,
     val folderId: String,
+    /** Set on a saved search column: it always lists this folder's matches. */
+    val query: String = "",
 )
 
 /** A Trash or Junk folder awaiting "empty folder" confirmation. [column] is set
@@ -231,6 +272,19 @@ internal data class KanbanColumnState(
     val error: String? = null,
     val nextCursor: String = "",
     val accountCursors: Map<String, String> = emptyMap(),
+    // The search and filters the cursors were issued for: the next page must be
+    // asked for with these, not whatever the board shows by then.
+    val cursorView: KanbanColumnView = KanbanColumnView(),
+    // The limit the listing has been read with so far, page by page. The core's
+    // limit counts message headers, which group into fewer threads, so a reload
+    // re-reads this many rather than the number of cards shown.
+    val readDepth: Int = MAILBOX_PAGE_SIZE,
+)
+
+internal data class KanbanColumnView(
+    val query: String = "",
+    val filter: FilterMode = FilterMode.All,
+    val attachmentsOnly: Boolean = false,
 )
 
 internal data class ConversationParticipant(

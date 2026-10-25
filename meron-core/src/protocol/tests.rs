@@ -1020,7 +1020,8 @@ fn mobile_new_messages_detail_summarizes_new_unread_inbox_mail() {
     drop(conn);
     let dir = data_dir.to_str().unwrap();
 
-    let detail = crate::ffi::mobile_new_messages_detail(dir, "me@example.com", &arrivals).unwrap();
+    let detail =
+        crate::ffi::mobile_new_messages_detail(dir, "me@example.com", "INBOX", &arrivals).unwrap();
     assert_eq!(detail["account"], "me@example.com");
     assert_eq!(detail["accountName"], "me@example.com");
     assert_eq!(detail["folder"], "inbox");
@@ -1118,6 +1119,46 @@ fn mobile_protocol_lists_folders_from_store() {
     assert_eq!(value["result"]["folders"][1]["id"], "INBOX");
     assert_eq!(value["result"]["folders"][1]["role"], "inbox");
     assert_eq!(value["result"]["folders"][1]["unread"], 1);
+    assert_eq!(value["result"]["folders"][0]["notify"], false);
+
+    // Opting a folder in answers with the refreshed list.
+    let value = invoke_mobile_protocol_json(
+        r#"{"id":64,"method":"mail.folderSetNotify","params":{"account_id":"me@example.com","folder_id":"Archive","enabled":true}}"#,
+        Some(data_dir.to_str().unwrap()),
+    );
+    assert_eq!(value["result"]["folders"][0]["id"], "Archive");
+    assert_eq!(value["result"]["folders"][0]["notify"], true);
+    assert_eq!(value["result"]["folders"][0]["notify_live"], true);
+    assert_eq!(value["result"]["folders"][1]["notify_live"], false);
+    assert_eq!(value["result"]["folders"][1]["notify"], false);
+    let missing = invoke_mobile_protocol_json(
+        r#"{"id":65,"method":"mail.folderSetNotify","params":{"account_id":"me@example.com","folder_id":"Nope","enabled":true}}"#,
+        Some(data_dir.to_str().unwrap()),
+    );
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Folder not found")
+    );
+
+    // Arrivals in the opted-in folder are described under its own name, with
+    // snippets read from that folder's cache.
+    let arrival = MessageHeader {
+        uid: 9,
+        subject: "Filed by a rule".to_string(),
+        thread_key: "rule".to_string(),
+        ..Default::default()
+    };
+    let detail = crate::ffi::mobile_new_messages_detail(
+        data_dir.to_str().unwrap(),
+        "me@example.com",
+        "Archive",
+        &[arrival],
+    )
+    .unwrap();
+    assert_eq!(detail["folder"], "Archive");
+    assert_eq!(detail["folderName"], "Archive");
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -1271,6 +1312,18 @@ fn mobile_protocol_move_requires_usable_account_secret() {
     assert_eq!(value["id"], 67);
     assert!(
         value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("account needs reconnect")
+    );
+
+    // INBOX in another account must not be mistaken for the source INBOX.
+    let cross_account = invoke_mobile_protocol_json(
+        r#"{"id":69,"method":"mail.move","params":{"thread_id":"me@example.com#INBOX#t.dG9waWM","target_account_id":"other@example.com","target_folder_id":"INBOX"}}"#,
+        Some(data_dir.to_str().unwrap()),
+    );
+    assert!(
+        cross_account["error"]["message"]
             .as_str()
             .unwrap()
             .contains("account needs reconnect")
@@ -1902,7 +1955,13 @@ fn mobile_protocol_reads_cached_thread_messages_from_store() {
     assert_eq!(first["references"], "root");
     assert_eq!(first["subject"], "Cached subject");
     assert_eq!(first["body"], "Hello from cache");
-    assert_eq!(first["body_html"], "<p>Hello from cache</p>");
+    // Prepared by the core, like the desktop's: sanitized, quote-marked, CSP baked in.
+    let body_html = first["body_html"].as_str().unwrap();
+    assert!(
+        body_html.contains("<body><p>Hello from cache</p></body>"),
+        "{body_html}"
+    );
+    assert!(body_html.contains("Content-Security-Policy"), "{body_html}");
     assert_eq!(first["unread"], true);
     assert_eq!(first["starred"], true);
 
@@ -2042,7 +2101,7 @@ fn mobile_protocol_thread_read_includes_cached_draft_reply() {
 }
 
 #[test]
-fn mobile_protocol_mark_read_persists_locally_before_server_sync() {
+fn mobile_protocol_flag_actions_leave_the_store_alone_when_the_server_write_fails() {
     let data_dir = unique_data_dir("thread-actions");
     seed_mobile_account(&data_dir, "me@example.com");
     let conn = store::open_at(data_dir.join("meron.db")).unwrap();
@@ -2102,7 +2161,12 @@ fn mobile_protocol_mark_read_persists_locally_before_server_sync() {
         Some(data_dir.to_str().unwrap()),
     );
     assert_eq!(mark_all["id"], 72);
-    assert_eq!(mark_all["result"]["ok"], true);
+    assert!(
+        mark_all["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("account needs reconnect")
+    );
 
     // Emptying is gated on the folder role, before any account/network work:
     // INBOX is refused outright, while Trash gets as far as the creds check.
@@ -2139,21 +2203,22 @@ fn mobile_protocol_mark_read_persists_locally_before_server_sync() {
         first["thread_id"],
         "me@example.com#INBOX#t.dG9waWMjU2Vjb25k"
     );
-    assert_eq!(first["unread"], false);
-    assert_eq!(first["unread_count"], 0);
+    // None of the writes reached the server, so none reached the store.
+    assert_eq!(first["unread"], true);
+    assert_eq!(first["unread_count"], 1);
     assert_eq!(first["starred"], false);
 
     let unread = invoke_mobile_protocol_json(
         r#"{"id":71,"method":"mail.threadList","params":{"account_id":"me@example.com","folder_id":"INBOX","filter":"unread"}}"#,
         Some(data_dir.to_str().unwrap()),
     );
-    assert_eq!(unread["result"]["threads"].as_array().unwrap().len(), 0);
+    assert_eq!(unread["result"]["threads"].as_array().unwrap().len(), 2);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
 #[test]
-fn mobile_protocol_marks_uid_thread_read_locally_before_server_sync() {
+fn mobile_protocol_keeps_uid_thread_unread_when_server_write_fails() {
     let data_dir = unique_data_dir("uid-thread-actions");
     seed_mobile_account(&data_dir, "me@example.com");
     let conn = store::open_at(data_dir.join("meron.db")).unwrap();
@@ -2189,7 +2254,8 @@ fn mobile_protocol_marks_uid_thread_read_locally_before_server_sync() {
         r#"{"id":73,"method":"mail.threadRead","params":{"thread_id":"me@example.com#Drafts#4"}}"#,
         Some(data_dir.to_str().unwrap()),
     );
-    assert_eq!(read["result"]["messages"][0]["unread"], false);
+    // The server never took the change, so the store must not claim it did.
+    assert_eq!(read["result"]["messages"][0]["unread"], true);
 
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -2458,9 +2524,10 @@ fn mobile_protocol_routes_rss_accounts_through_mail_shapes() {
         "rss-account#rss#feed-a#item-new"
     );
     assert_eq!(read["result"]["messages"][0]["subject"], "New item");
+    assert_eq!(read["result"]["messages"][0]["body"], "Body for New item");
     assert_eq!(
-        read["result"]["messages"][0]["body"],
-        "Body for New item\n\nSource: https://example.com/item-new"
+        read["result"]["messages"][0]["link"],
+        "https://example.com/item-new"
     );
     assert_eq!(read["result"]["messages"][0]["unread"], true);
     assert_eq!(read["result"]["next_cursor"], "ts:200:item-new");
@@ -2996,6 +3063,7 @@ fn seed_mobile_account(data_dir: &std::path::Path, email: &str) {
         proxy: crate::proxy::ProxyChoice::Global,
         cert_pin: None,
         smtp_cert_pin: None,
+        rejected_grant: None,
     };
     let meta = AccountMeta {
         engine: "mail".to_string(),
@@ -3590,4 +3658,137 @@ fn mobile_protocol_round_trips_an_encrypted_backup_with_secrets() {
 
     let _ = std::fs::remove_dir_all(source_dir);
     let _ = std::fs::remove_dir_all(target_dir);
+}
+
+#[test]
+fn mobile_protocol_serves_the_tasks_surface() {
+    let data_dir = unique_data_dir("tasks");
+    let dir = data_dir.to_str().unwrap().to_string();
+
+    // Reading lists on a fresh install bootstraps one, so the screen is never
+    // an empty shell with nowhere to type.
+    let lists = invoke_mobile_protocol_json(
+        r#"{"id":300,"method":"tasks.lists","params":{}}"#,
+        Some(&dir),
+    );
+    assert_eq!(lists["id"], 300);
+    let list_id = lists["result"]["default_list_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!list_id.is_empty(), "{lists}");
+    assert_eq!(lists["result"]["lists"].as_array().unwrap().len(), 1);
+
+    let created = invoke_mobile_protocol_json(
+        &format!(
+            r#"{{"id":301,"method":"tasks.create","params":{{"list_id":"{list_id}","title":"Book the flight","thread_id":"acct#t1","account":"acct"}}}}"#
+        ),
+        Some(&dir),
+    );
+    let task_id = created["result"]["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(created["result"]["task"]["title"], "Book the flight");
+    assert_eq!(created["result"]["task"]["done"], false);
+
+    let linked = invoke_mobile_protocol_json(
+        r#"{"id":302,"method":"tasks.forThread","params":{"thread_id":"acct#t1"}}"#,
+        Some(&dir),
+    );
+    assert_eq!(linked["result"]["tasks"][0]["id"], task_id.as_str());
+
+    let done = invoke_mobile_protocol_json(
+        &format!(
+            r#"{{"id":303,"method":"tasks.setDone","params":{{"task_id":"{task_id}","done":true}}}}"#
+        ),
+        Some(&dir),
+    );
+    assert_eq!(done["result"]["task"]["done"], true);
+
+    // Completed tasks are hidden by default and visible on request.
+    let active = invoke_mobile_protocol_json(
+        &format!(r#"{{"id":304,"method":"tasks.items","params":{{"list_id":"{list_id}"}}}}"#),
+        Some(&dir),
+    );
+    assert!(
+        active["result"]["tasks"].as_array().unwrap().is_empty(),
+        "{active}"
+    );
+    let all = invoke_mobile_protocol_json(
+        &format!(
+            r#"{{"id":305,"method":"tasks.items","params":{{"list_id":"{list_id}","include_completed":true}}}}"#
+        ),
+        Some(&dir),
+    );
+    assert_eq!(all["result"]["tasks"].as_array().unwrap().len(), 1);
+
+    let cleared = invoke_mobile_protocol_json(
+        &format!(
+            r#"{{"id":306,"method":"tasks.clearCompleted","params":{{"list_id":"{list_id}"}}}}"#
+        ),
+        Some(&dir),
+    );
+    assert_eq!(cleared["result"]["removed"], 1);
+
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[test]
+fn mobile_protocol_reports_missing_task_parameters() {
+    let data_dir = unique_data_dir("tasks-invalid");
+    let dir = data_dir.to_str().unwrap().to_string();
+    let value = invoke_mobile_protocol_json(
+        r#"{"id":310,"method":"tasks.items","params":{}}"#,
+        Some(&dir),
+    );
+    assert_eq!(value["error"]["message"], "list_id required", "{value}");
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+/// Before a data dir is bound the stub table answers, so a host that polls the
+/// core during startup gets an empty surface rather than "unknown method".
+#[test]
+fn protocol_stub_answers_tasks_without_a_data_dir() {
+    let value = invoke_protocol_json(r#"{"id":311,"method":"tasks.lists","params":{}}"#);
+    assert_eq!(
+        value["result"],
+        json!({ "lists": [], "default_list_id": "" })
+    );
+    let unknown = invoke_protocol_json(r#"{"id":312,"method":"tasks.nope","params":{}}"#);
+    assert_eq!(unknown["error"]["message"], "unknown method: tasks.nope");
+}
+
+#[test]
+fn mobile_protocol_move_honors_explicit_message_ids() {
+    // An undo moves back the copies an archive reported, by UID. Those rows
+    // need not be cached in the archive folder, and a uid: thread key names
+    // nothing there at all — so the explicit ids must be used as given rather
+    // than resolved through the cached thread.
+    let data_dir = unique_data_dir("move-explicit-ids");
+    seed_mobile_account(&data_dir, "me@example.com");
+    let conn = store::open_at(data_dir.join("meron.db")).unwrap();
+    store::ensure_folder(&conn, "me@example.com", "Archive").unwrap();
+    drop(conn);
+
+    let without_ids = invoke_mobile_protocol_json(
+        r#"{"id":68,"method":"mail.move","params":{"thread_id":"me@example.com#Archive#t.dG9waWM","target_folder_id":"INBOX"}}"#,
+        Some(data_dir.to_str().unwrap()),
+    );
+    assert_eq!(without_ids["result"]["moved"], 0);
+
+    // Past UID resolution to the server write, which this account can't make.
+    let with_ids = invoke_mobile_protocol_json(
+        r#"{"id":69,"method":"mail.move","params":{"thread_id":"me@example.com#Archive#t.dG9waWM","target_folder_id":"INBOX","message_ids":["42"]}}"#,
+        Some(data_dir.to_str().unwrap()),
+    );
+    assert!(
+        with_ids["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("account needs reconnect"),
+        "{with_ids}"
+    );
+
+    let _ = std::fs::remove_dir_all(data_dir);
 }
